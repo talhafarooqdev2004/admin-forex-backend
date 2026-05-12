@@ -1,0 +1,10 @@
+import express from 'express';
+import * as tradingAlertController from '../controllers/v1/admin/tradingAlert.controller.js';
+import { apiLimiter, readLimiter } from '../middlewares/rateLimiter.middleware.js';
+const router = express.Router();
+router.get('/', readLimiter, tradingAlertController.getAllAlerts);
+router.get('/:id', readLimiter, tradingAlertController.getAlertById);
+router.post('/', apiLimiter, tradingAlertController.createAlert);
+router.put('/:id', apiLimiter, tradingAlertController.updateAlert);
+router.delete('/:id', apiLimiter, tradingAlertController.deleteAlert);
+export default router;

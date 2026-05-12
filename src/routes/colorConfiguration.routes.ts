@@ -1,0 +1,10 @@
+import express from 'express';
+import * as colorConfigController from '../controllers/v1/admin/colorConfiguration.controller.js';
+import { apiLimiter, readLimiter } from '../middlewares/rateLimiter.middleware.js';
+const router = express.Router();
+router.get('/', readLimiter, colorConfigController.getAllColorConfigurations);
+router.post('/', apiLimiter, colorConfigController.createColorConfiguration);
+router.post('/bulk-update', apiLimiter, colorConfigController.bulkUpdateColorConfigurations);
+router.put('/:id', apiLimiter, colorConfigController.updateColorConfiguration);
+router.delete('/:id', apiLimiter, colorConfigController.deleteColorConfiguration);
+export default router;

@@ -1,0 +1,530 @@
+generator client {
+  provider   = "prisma-client-js"
+  engineType = "binary"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Gender {
+  male
+  female
+  other
+}
+
+enum UserRole {
+  user
+  admin
+}
+
+enum PageContentType {
+  text
+  rich_text
+  html
+}
+
+enum PaymentTransactionStatus {
+  pending
+  completed
+  failed
+  refunded
+  cancelled
+}
+
+enum UserSubscriptionStatus {
+  active
+  expired
+  cancelled
+}
+
+enum TradingDirection {
+  buy
+  sell
+}
+
+enum TradingAlertType {
+  Swing
+  Scalp
+}
+
+enum TradingAlertStatus {
+  completed
+  open
+  stopped
+}
+
+model User {
+  id            BigInt               @id @default(autoincrement()) @db.BigInt
+  first_name    String               @db.VarChar(255)
+  last_name     String               @db.VarChar(255)
+  email         String               @unique @db.VarChar(255)
+  password      String?              @db.VarChar(255)
+  gender        Gender?
+  google_id     String?              @unique @db.VarChar(255)
+  facebook_id   String?              @unique @db.VarChar(255)
+  apple_id      String?              @unique @db.VarChar(255)
+  role          UserRole             @default(user)
+  phone         String?              @db.VarChar(20)
+  image         String?              @db.Text
+  created_at    DateTime             @default(now())
+  updated_at    DateTime             @updatedAt
+  subscriptions UserSubscription[]
+  transactions  PaymentTransaction[]
+  table_rows    TableRow[]
+  table_cells   TableCell[]
+
+  @@map("users")
+}
+
+model SubscriptionPackage {
+  id                   BigInt                           @id @default(autoincrement()) @db.BigInt
+  price                Decimal                          @db.Decimal(8, 2)
+  duration_hours       Int
+  free_trial_hours     Int?
+  additional_discounts Json?
+  campaigns            Json?
+  publish              Boolean                          @default(false)
+  created_at           DateTime                         @default(now())
+  updated_at           DateTime                         @updatedAt
+  translations         SubscriptionPackageTranslation[]
+  subscriptions        UserSubscription[]
+  payment_transactions PaymentTransaction[]
+
+  @@map("subscription_packages")
+}
+
+model SubscriptionPackageTranslation {
+  id                      BigInt              @id @default(autoincrement()) @db.BigInt
+  subscription_package_id BigInt              @db.BigInt
+  locale                  String              @db.VarChar(5)
+  name                    String              @db.VarChar(255)
+  detail                  String              @db.Text
+  created_at              DateTime            @default(now())
+  updated_at              DateTime            @updatedAt
+  package                 SubscriptionPackage @relation(fields: [subscription_package_id], references: [id], onDelete: Cascade)
+
+  @@unique([subscription_package_id, locale], map: "unique_subscription_package_locale")
+  @@map("subscription_package_translations")
+}
+
+model Education {
+  id           BigInt                 @id @default(autoincrement()) @db.BigInt
+  slug         String                 @db.VarChar(255)
+  publish      Boolean                @default(false)
+  created_at   DateTime               @default(now())
+  updated_at   DateTime               @updatedAt
+  translations EducationTranslation[]
+
+  @@map("educations")
+}
+
+model EducationTranslation {
+  id           BigInt    @id @default(autoincrement()) @db.BigInt
+  education_id BigInt    @db.BigInt
+  locale       String    @db.VarChar(255)
+  title        String    @db.VarChar(255)
+  content      String    @db.Text
+  created_at   DateTime  @default(now())
+  updated_at   DateTime  @updatedAt
+  education    Education @relation(fields: [education_id], references: [id], onDelete: Cascade)
+
+  @@unique([education_id, locale], map: "unique_educations_locale")
+  @@map("education_translations")
+}
+
+model PageContent {
+  id              BigInt                   @id @default(autoincrement()) @db.BigInt
+  page_identifier String                   @db.VarChar(255)
+  section_key     String                   @db.VarChar(255)
+  content_type    PageContentType          @default(text)
+  display_order   Int                      @default(0)
+  is_active       Boolean                  @default(true)
+  created_at      DateTime                 @default(now())
+  updated_at      DateTime                 @updatedAt
+  translations    PageContentTranslation[]
+
+  @@unique([page_identifier, section_key])
+  @@index([page_identifier])
+  @@index([section_key])
+  @@map("page_contents")
+}
+
+model PageContentTranslation {
+  id              BigInt      @id @default(autoincrement()) @db.BigInt
+  page_content_id BigInt      @db.BigInt
+  locale          String      @db.VarChar(255)
+  content_value   String      @db.Text
+  created_at      DateTime    @default(now())
+  updated_at      DateTime    @updatedAt
+  page_content    PageContent @relation(fields: [page_content_id], references: [id], onDelete: Cascade)
+
+  @@unique([page_content_id, locale], map: "unique_page_content_locale")
+  @@map("page_content_translations")
+}
+
+model PaymentGateway {
+  id            BigInt               @id @default(autoincrement()) @db.BigInt
+  name          String               @unique @db.VarChar(255)
+  display_name  String               @db.VarChar(255)
+  description   String?              @db.Text
+  is_active     Boolean              @default(false)
+  credentials   Json?
+  settings      Json?
+  display_order Int                  @default(0)
+  icon          String?              @db.VarChar(255)
+  created_at    DateTime             @default(now())
+  updated_at    DateTime             @updatedAt
+  transactions  PaymentTransaction[]
+
+  @@index([is_active])
+  @@map("payment_gateways")
+}
+
+model PaymentTransaction {
+  id                 BigInt                   @id @default(autoincrement()) @db.BigInt
+  user_id            BigInt                   @db.BigInt
+  package_id         BigInt                   @db.BigInt
+  payment_gateway_id BigInt                   @db.BigInt
+  transaction_id     String                   @unique @db.VarChar(255)
+  amount             Decimal                  @db.Decimal(10, 2)
+  currency           String                   @default("USD") @db.VarChar(3)
+  status             PaymentTransactionStatus @default(pending)
+  gateway_response   Json?
+  failure_reason     String?                  @db.Text
+  completed_at       DateTime?
+  created_at         DateTime                 @default(now())
+  updated_at         DateTime                 @updatedAt
+  user               User                     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  package            SubscriptionPackage      @relation(fields: [package_id], references: [id], onDelete: Cascade)
+  gateway            PaymentGateway           @relation(fields: [payment_gateway_id], references: [id], onDelete: Cascade)
+  subscriptions      UserSubscription[]
+
+  @@index([user_id])
+  @@index([package_id])
+  @@index([payment_gateway_id])
+  @@index([status])
+  @@index([transaction_id])
+  @@map("payment_transactions")
+}
+
+model UserSubscription {
+  id                     BigInt                 @id @default(autoincrement()) @db.BigInt
+  user_id                BigInt                 @db.BigInt
+  package_id             BigInt                 @db.BigInt
+  payment_transaction_id BigInt?                @db.BigInt
+  start_date             DateTime
+  end_date               DateTime
+  status                 UserSubscriptionStatus @default(active)
+  cancelled_at           DateTime?
+  cancellation_reason    String?                @db.Text
+  created_at             DateTime               @default(now())
+  updated_at             DateTime               @updatedAt
+  user                   User                   @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  package                SubscriptionPackage    @relation(fields: [package_id], references: [id], onDelete: Cascade)
+  transaction            PaymentTransaction?    @relation(fields: [payment_transaction_id], references: [id], onDelete: SetNull)
+
+  @@index([user_id])
+  @@index([package_id])
+  @@index([status])
+  @@index([user_id, status])
+  @@index([end_date])
+  @@map("user_subscriptions")
+}
+
+model CurrencyPair {
+  id                BigInt            @id @default(autoincrement()) @db.BigInt
+  code              String            @unique @db.VarChar(10)
+  base_currency     String            @db.VarChar(3)
+  quote_currency    String            @db.VarChar(3)
+  is_active         Boolean           @default(true)
+  display_order     Int               @default(0)
+  created_at        DateTime          @default(now())
+  updated_at        DateTime          @updatedAt
+  table_rows        TableRow[]
+  score_dashboard   ScoreDashboard[]
+  fx_analyzer_cache FxAnalyzerCache[]
+
+  @@map("currency_pairs")
+}
+
+model DynamicTable {
+  id             BigInt        @id @default(autoincrement()) @db.BigInt
+  name           String        @db.VarChar(255)
+  identifier     String        @unique @db.VarChar(255)
+  description    String?       @db.Text
+  table_metadata Json?
+  is_active      Boolean       @default(true)
+  created_at     DateTime      @default(now())
+  updated_at     DateTime      @updatedAt
+  rows           TableRow[]
+  columns        TableColumn[]
+
+  @@map("dynamic_tables")
+}
+
+model TableRow {
+  id               BigInt        @id @default(autoincrement()) @db.BigInt
+  dynamic_table_id BigInt        @db.BigInt
+  currency_pair_id BigInt?       @db.BigInt
+  row_index        Int
+  user_id          BigInt?       @db.BigInt
+  row_metadata     Json?
+  created_at       DateTime      @default(now())
+  updated_at       DateTime      @updatedAt
+  table            DynamicTable  @relation(fields: [dynamic_table_id], references: [id], onDelete: Cascade)
+  currencyPair     CurrencyPair? @relation(fields: [currency_pair_id], references: [id], onDelete: SetNull)
+  user             User?         @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  cells            TableCell[]
+
+  @@unique([dynamic_table_id, row_index, user_id])
+  @@index([dynamic_table_id, row_index])
+  @@index([user_id])
+  @@map("table_rows")
+}
+
+model TableColumn {
+  id               BigInt       @id @default(autoincrement()) @db.BigInt
+  dynamic_table_id BigInt       @db.BigInt
+  header           String       @db.VarChar(255)
+  key              String?      @db.VarChar(255)
+  column_index     Int
+  column_metadata  Json?
+  created_at       DateTime     @default(now())
+  updated_at       DateTime     @updatedAt
+  table            DynamicTable @relation(fields: [dynamic_table_id], references: [id], onDelete: Cascade)
+  cells            TableCell[]
+
+  @@unique([dynamic_table_id, column_index])
+  @@index([dynamic_table_id, column_index])
+  @@map("table_columns")
+}
+
+model TableCell {
+  id              BigInt      @id @default(autoincrement()) @db.BigInt
+  table_row_id    BigInt      @db.BigInt
+  table_column_id BigInt      @db.BigInt
+  user_id         BigInt?     @db.BigInt
+  value           String?     @db.Text
+  formula         String?     @db.Text
+  data_type       String      @default("text") @db.VarChar(255)
+  cell_metadata   Json?
+  created_at      DateTime    @default(now())
+  updated_at      DateTime    @updatedAt
+  row             TableRow    @relation(fields: [table_row_id], references: [id], onDelete: Cascade)
+  column          TableColumn @relation(fields: [table_column_id], references: [id], onDelete: Cascade)
+  user            User?       @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@unique([table_row_id, table_column_id, user_id])
+  @@index([table_row_id, table_column_id])
+  @@index([user_id])
+  @@map("table_cells")
+}
+
+model TradingAlert {
+  id              BigInt             @id @default(autoincrement()) @db.BigInt
+  trade_id        String?            @unique @db.VarChar(255)
+  pair            String?            @db.VarChar(255)
+  direction       TradingDirection?
+  entry_level     Decimal?           @db.Decimal(10, 5)
+  stop_loss       Decimal?           @db.Decimal(10, 5)
+  tp1             Decimal?           @db.Decimal(10, 5)
+  tp2             Decimal?           @db.Decimal(10, 5)
+  image_path      String?            @db.VarChar(255)
+  trade_follow_up String?            @db.Text
+  type            TradingAlertType?
+  result          Decimal            @default(0) @db.Decimal(10, 2)
+  status          TradingAlertStatus @default(open)
+  comment         String?            @db.Text
+  date            DateTime?          @db.Date
+  created_at      DateTime           @default(now())
+  updated_at      DateTime           @updatedAt
+
+  @@index([date])
+  @@index([status])
+  @@index([pair])
+  @@map("trading_alerts")
+}
+
+model ColorConfiguration {
+  id            BigInt   @id @default(autoincrement()) @db.BigInt
+  type          String   @db.VarChar(255)
+  name          String   @db.VarChar(255)
+  min_value     Float
+  max_value     Float
+  color         String   @db.VarChar(255)
+  display_order Int      @default(0)
+  is_active     Boolean  @default(true)
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+
+  @@index([type, is_active])
+  @@map("color_configurations")
+}
+
+model RiskModeScore {
+  id         BigInt   @id @default(autoincrement()) @db.BigInt
+  score      Decimal  @default(0) @db.Decimal(8, 2)
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  @@map("risk_mode_scores")
+}
+
+model ScoreDashboard {
+  id                BigInt       @id @default(autoincrement()) @db.BigInt
+  currency_pair_id  BigInt       @unique @db.BigInt
+  net_score         Decimal?     @db.Decimal(10, 2)
+  net_bias          String?      @db.VarChar(255)
+  trend_score       Decimal?     @db.Decimal(10, 2)
+  momentum_score    Decimal?     @db.Decimal(10, 2)
+  volatility_score  Decimal?     @db.Decimal(10, 2)
+  sentiment_score   Decimal?     @db.Decimal(10, 2)
+  seasonal_score    Decimal?     @db.Decimal(10, 2)
+  cot_score         Decimal?     @db.Decimal(10, 2)
+  fundamental_score Decimal?     @db.Decimal(10, 2)
+  additional_scores Json?
+  calculated_at     DateTime?
+  created_at        DateTime     @default(now())
+  updated_at        DateTime     @updatedAt
+  currencyPair      CurrencyPair @relation(fields: [currency_pair_id], references: [id], onDelete: Cascade)
+
+  @@index([currency_pair_id])
+  @@map("score_dashboard")
+}
+
+model AppConfig {
+  id          BigInt   @id @default(autoincrement()) @db.BigInt
+  key         String   @unique @db.VarChar(255)
+  value       String?  @db.Text
+  description String?  @db.Text
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  @@index([key])
+  @@map("app_configs")
+}
+
+model FxAnalyzerCache {
+  id               BigInt        @id @default(autoincrement()) @db.BigInt
+  pair             String        @unique @db.VarChar(255)
+  currency_pair_id BigInt?       @db.BigInt
+  complete_data    String        @db.Text
+  last_updated     DateTime      @default(now())
+  created_at       DateTime      @default(now())
+  updated_at       DateTime      @updatedAt
+  currencyPair     CurrencyPair? @relation(fields: [currency_pair_id], references: [id], onDelete: Cascade)
+
+  @@index([currency_pair_id])
+  @@index([last_updated])
+  @@map("fx_analyzer_cache")
+}
+
+model ForumRule {
+  id           Int                     @id @default(autoincrement())
+  active       Boolean                 @default(true)
+  created_at   DateTime                @default(now())
+  updated_at   DateTime                @updatedAt
+  translations ForumRulesTranslation[]
+
+  @@map("forum_rules")
+}
+
+model ForumRulesTranslation {
+  id             Int       @id @default(autoincrement())
+  locale         locales
+  title          String    @db.VarChar(255)
+  description    String    @db.Text
+  tags           Json?
+  forumRules     ForumRule @relation(fields: [forum_rules_id], references: [id], onDelete: Cascade)
+  forum_rules_id Int
+  created_at     DateTime  @default(now())
+  updated_at     DateTime  @updatedAt
+
+  @@unique([title, description, forum_rules_id, locale], map: "unique_forum_rules_id_locale")
+  @@map("forum_rules_translations")
+}
+
+model ForumAnnouncement {
+  id              Int                           @id @default(autoincrement())
+  active          Boolean                       @default(true)
+  created_at      DateTime                      @default(now())
+  updated_at      DateTime                      @updatedAt
+  translations    ForumAnnouncementsTranslation[]
+
+  @@map("forum_announcements")
+}
+
+model ForumAnnouncementsTranslation {
+  id                    Int       @id @default(autoincrement())
+  locale                locales
+  title                 String    @db.VarChar(255)
+  description           String    @db.Text
+  tags                  Json?
+  forumAnnouncements    ForumAnnouncement @relation(fields: [forum_announcements_id], references: [id], onDelete: Cascade)
+  forum_announcements_id Int
+  created_at            DateTime  @default(now())
+  updated_at            DateTime  @updatedAt
+
+  @@unique([title, description, forum_announcements_id, locale], map: "unique_forum_announcements_id_locale")
+  @@map("forum_announcements_translations")
+}
+
+model ForumPost {
+  id          Int              @id @default(autoincrement())
+  active      Boolean          @default(true)
+  category    String           @db.VarChar(50)
+  author_name String           @default("Forum Team") @db.VarChar(255)
+  title       String           @db.VarChar(255)
+  content     String           @db.Text
+  image_path  String?          @db.Text
+  view_count  Int              @default(0)
+  tags        Json?
+  created_at  DateTime         @default(now())
+  updated_at  DateTime         @updatedAt
+  replies     ForumPostReply[]
+
+  @@index([category])
+  @@map("forum_posts")
+}
+
+model ForumPostReply {
+  id           Int       @id @default(autoincrement())
+  forum_post_id Int
+  author_name  String    @default("Forum Team") @db.VarChar(255)
+  message      String    @db.Text
+  created_at   DateTime  @default(now())
+  updated_at   DateTime  @updatedAt
+  post         ForumPost @relation(fields: [forum_post_id], references: [id], onDelete: Cascade)
+
+  @@index([forum_post_id])
+  @@map("forum_post_replies")
+}
+
+enum VisitorGeoStatus {
+  pending
+  resolved
+  failed
+}
+
+model VisitorGeo {
+  id            BigInt           @id @default(autoincrement()) @db.BigInt
+  ip_address    String           @unique @db.VarChar(45)
+  country_code  String?          @db.VarChar(8)
+  country_name  String?          @db.VarChar(255)
+  region_name   String?          @db.VarChar(255)
+  status        VisitorGeoStatus @default(pending)
+  last_error    String?          @db.VarChar(500)
+  created_at    DateTime         @default(now())
+  updated_at    DateTime         @updatedAt
+
+  @@map("visitor_geo")
+}
+
+enum locales {
+  en
+  ru
+  de
+  fr
+  zh
+}
