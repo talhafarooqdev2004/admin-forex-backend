@@ -2,7 +2,8 @@ import { DynamicTableRepository } from '../repositories/dynamicTable.repository.
 import { logger } from '../utils/logger.util.js';
 
 const TMV_HISTORY_META_KEY = 'tmv_history';
-const TMV_HISTORY_MAX_BARS = 22;
+/** 40 × 15 min = 10 hours (must match dashboard `TMV_HISTORY_BAR_COUNT` in `tmvHistoryConfig.ts`). */
+const TMV_HISTORY_MAX_BARS = 40;
 const TMV_HISTORY_SLOT_MS = 15 * 60 * 1000;
 const TMV_SCORE_MIN = -2.5;
 const TMV_SCORE_MAX = 2.5;
@@ -128,8 +129,8 @@ function existingSlots(meta: unknown): TmvSnapshot[] {
 /**
  * Append rules (caller must only invoke on a **new** 15m `slotStartMs` vs last bar; see `appendSnapshotFromTechnicalDashboard`):
  * - Same slot as last: replace last (defensive; normally skipped before DB write).
- * - New slot and 22 bars already: roll window — keep only this snapshot.
- * - New slot and fewer than 22 bars: append.
+ * - New slot and window full: **reset** — clear all bars and store only this snapshot (cycle restarts at bar 0).
+ * - New slot and room left: append.
  */
 function nextHistoryMeta(previousMeta: unknown, snapshot: TmvSnapshot): TmvHistoryMeta {
     const slots = existingSlots(previousMeta);

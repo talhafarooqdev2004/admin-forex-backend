@@ -170,6 +170,26 @@ class GoogleSheetsService {
             throw error;
         }
     }
+    async getRangesBySheetName(sheetName, ranges) {
+        await this.ensureInitialized();
+        if (!ranges.length) {
+            return [];
+        }
+        try {
+            const fullRanges = ranges.map((range) => this.a1Range(sheetName, range));
+            const response = await this.sheets.spreadsheets.values.batchGet({
+                spreadsheetId: this.spreadsheetId,
+                ranges: fullRanges,
+                valueRenderOption: 'FORMATTED_VALUE',
+            });
+            const valueRanges = response.data.valueRanges ?? [];
+            return valueRanges.map((vr) => vr.values ?? []);
+        }
+        catch (error) {
+            logger.error(`Error batch-getting ranges from sheet ${sheetName}:`, error);
+            throw error;
+        }
+    }
     async getCell(tableId, cell) {
         const values = await this.getRange(tableId, cell);
         return values[0]?.[0] || null;

@@ -6,6 +6,7 @@ import {
     buildSyntheticColumnDefs,
     buildTableRowsAllDataNoHeader,
     buildTableRowsFromSheetValues,
+    mergeSheetBlocksHorizontally,
     replaceDynamicTableFromSheetGrid,
 } from './sheetGridDynamicTable.util.js';
 
@@ -19,20 +20,25 @@ const COT_SENTIMENT_NET_SCORE_COLUMN_COUNT = 3;
 export class CotDataAnalysisSheetSyncService {
     async syncCurrencyPairSentimentFromSheet(
         sheetName = ENV.COT_DATA_ANALYSIS_SHEET_NAME,
-        range = ENV.COT_CURRENCY_PAIR_SENTIMENT_RANGE,
+        ranges = ENV.COT_CURRENCY_PAIR_SENTIMENT_RANGES,
     ) {
-        logger.info(`[CotDataAnalysisSync] Currency Pair Sentiment ${sheetName}!${range}`);
-        const sheetValues = await googleSheetsService.getRangeBySheetName(sheetName, range);
-        if (!sheetValues?.length) {
-            throw new Error(`Empty range ${sheetName}!${range}`);
+        const rangeLabel = ranges.join(' + ');
+        logger.info(`[CotDataAnalysisSync] Currency Pair Sentiment ${sheetName}!(${rangeLabel})`);
+        const blocks = await googleSheetsService.getRangesBySheetName(sheetName, ranges);
+        if (!blocks.length || blocks.every((b) => !b?.length)) {
+            throw new Error(`Empty Currency Pair Sentiment ranges on ${sheetName}: ${rangeLabel}`);
+        }
+        const sheetValues = mergeSheetBlocksHorizontally(blocks);
+        if (!sheetValues.length) {
+            throw new Error(`Empty merged grid for ${sheetName}: ${rangeLabel}`);
         }
         const columnDefs = buildColumnDefsFromHeaderRow(sheetValues[0]!);
-        const tableRows = buildTableRowsFromSheetValues(sheetValues, sheetName, range, columnDefs);
+        const tableRows = buildTableRowsFromSheetValues(sheetValues, sheetName, rangeLabel, columnDefs);
         return replaceDynamicTableFromSheetGrid(
             COT_CURRENCY_PAIR_SENTIMENT_ID,
             'Currency Pair Sentiment',
             sheetName,
-            range,
+            rangeLabel,
             columnDefs,
             tableRows,
         );

@@ -102,7 +102,15 @@ export const ENV = {
     EDGE_TECHNICAL_DASHBOARD_RANGE: process.env.EDGE_TECHNICAL_DASHBOARD_RANGE || 'A1:AK29',
     /** COT Data & Analysis — `RECENT COT DATA 4A`: Currency Pair Sentiment (row 1 = header). */
     COT_DATA_ANALYSIS_SHEET_NAME: process.env.COT_DATA_ANALYSIS_SHEET_NAME || 'RECENT COT DATA 4A',
-    COT_CURRENCY_PAIR_SENTIMENT_RANGE: process.env.COT_CURRENCY_PAIR_SENTIMENT_RANGE || 'T1:AA18',
+    /** Comma-separated A1 ranges merged left-to-right (skips AC–AE between AB and AF). */
+    COT_CURRENCY_PAIR_SENTIMENT_RANGES: (
+        process.env.COT_CURRENCY_PAIR_SENTIMENT_RANGES ||
+        process.env.COT_CURRENCY_PAIR_SENTIMENT_RANGE ||
+        'T1:AA18,AB1:AB18,AF1:AF18,AG1:AG18'
+    )
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
     /** Same tab — rows 24–51, all data (no header row in sheet). */
     COT_SENTIMENT_NET_SCORE_RANGE: process.env.COT_SENTIMENT_NET_SCORE_RANGE || 'A24:C51',
     /** Same tab — row 72 = header. */

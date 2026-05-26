@@ -144,6 +144,33 @@ export async function replaceDynamicTableFromSheetGrid(
     return { identifier, table: syncedTable, rowsSynced: syncedTable.rows?.length || 0 };
 }
 
+/** Concatenate sheet blocks left-to-right (same row index); used for non-contiguous column ranges. */
+export function mergeSheetBlocksHorizontally(blocks: unknown[][][]): unknown[][] {
+    if (blocks.length === 0) return [];
+    const maxRows = Math.max(...blocks.map((b) => b.length));
+    const merged: unknown[][] = [];
+
+    for (let r = 0; r < maxRows; r++) {
+        const row: unknown[] = [];
+        for (const block of blocks) {
+            const blockRow = block[r];
+            if (blockRow === undefined || blockRow === null) {
+                continue;
+            }
+            if (Array.isArray(blockRow)) {
+                for (const cell of blockRow) {
+                    row.push(cell);
+                }
+            } else {
+                row.push(blockRow);
+            }
+        }
+        merged.push(row);
+    }
+
+    return merged;
+}
+
 export function buildColumnDefsFromHeaderRow(headerRow: unknown[]): SheetGridColumnDef[] {
     const row = Array.isArray(headerRow) ? headerRow : [];
     let width = row.length;
