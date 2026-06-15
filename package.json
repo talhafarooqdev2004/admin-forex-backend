@@ -14,7 +14,8 @@
     "populate-cache": "tsx populate-fx-analyzer-cache.ts",
     "check-pairs": "tsx check-currency-pairs.ts",
     "migrate": "prisma migrate deploy",
-    "prisma:generate": "prisma generate"
+    "prisma:generate": "prisma generate",
+    "test:alerts": "tsx test-alerts.ts"
   },
   "keywords": [
     "forex",

@@ -330,9 +330,26 @@ model TradingAlert {
   stop_loss       Decimal?           @db.Decimal(10, 5)
   tp1             Decimal?           @db.Decimal(10, 5)
   tp2             Decimal?           @db.Decimal(10, 5)
+  tp3             Decimal?           @db.Decimal(10, 5)
   image_path      String?            @db.VarChar(255)
   trade_follow_up String?            @db.Text
-  type            TradingAlertType?
+  type            String?            @db.VarChar(20)
+  direction_type  String?            @db.VarChar(20)
+  session         String?            @db.VarChar(20)
+  risk            String?            @db.VarChar(20)
+  exit_price      Decimal?           @db.Decimal(10, 5)
+  outcome         String?            @db.VarChar(20)
+  pips            Decimal?           @db.Decimal(10, 2)
+  close_reason    String?            @db.VarChar(40)
+  tsl_enabled     Boolean            @default(false)
+  breakeven_enabled Boolean          @default(false)
+  activated       Boolean            @default(true)
+  activation_side String?            @db.VarChar(8)
+  max_tp_hit      Int                @default(0)
+  breakeven_done  Boolean            @default(false)
+  tsl_active      Boolean            @default(false)
+  last_tsl_sl     Decimal?           @db.Decimal(10, 5)
+  last_alert_event String?           @db.VarChar(20)
   result          Decimal            @default(0) @db.Decimal(10, 2)
   status          TradingAlertStatus @default(open)
   comment         String?            @db.Text
@@ -403,6 +420,19 @@ model AppConfig {
 
   @@index([key])
   @@map("app_configs")
+}
+
+model TradeAlertPair {
+  id            BigInt   @id @default(autoincrement()) @db.BigInt
+  name          String   @unique @db.VarChar(50)
+  scalping_sl   Int?
+  swing_sl      Int?
+  display_order Int      @default(0)
+  is_active     Boolean  @default(true)
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+
+  @@map("trade_alert_pairs")
 }
 
 model FxAnalyzerCache {

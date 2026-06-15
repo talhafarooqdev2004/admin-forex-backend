@@ -2,25 +2,35 @@ import { TradingAlertRepository } from '../../../repositories/tradingAlert.repos
 import { successResponse } from '../../../utils/response.util.js';
 import { HTTP_STATUS, SUCCESS_MESSAGES } from '../../../config/constants.js';
 import { ApiError } from '../../../exceptions/ApiError.js';
+import { notifyTradeCreated, notifyTradeEvent } from '../../../services/tradeAlertNotification.service.js';
+import { getCurrentPrice } from '../../../services/livePrice.service.js';
 const tradingAlertRepository = new TradingAlertRepository();
+const DECIMAL_FIELDS = ['entry_level', 'stop_loss', 'tp1', 'tp2', 'tp3', 'exit_price', 'pips', 'result'];
+
+/** Fields persisted on TradingAlert — strips notification-only keys like current_price. */
+const ALERT_CREATE_FIELDS = [
+    'trade_id', 'pair', 'direction', 'entry_level', 'stop_loss', 'tp1', 'tp2', 'tp3',
+    'image_path', 'trade_follow_up', 'type', 'direction_type', 'session', 'risk',
+    'exit_price', 'outcome', 'pips', 'close_reason', 'tsl_enabled', 'breakeven_enabled',
+    'activated', 'activation_side', 'max_tp_hit', 'breakeven_done', 'tsl_active',
+    'last_tsl_sl', 'last_alert_event', 'result', 'status', 'comment', 'date',
+] as const;
+
+function pickAlertCreateData(body: Record<string, unknown>, extra: Record<string, unknown> = {}) {
+    const data: Record<string, unknown> = { ...extra };
+    for (const key of ALERT_CREATE_FIELDS) {
+        if (body[key] !== undefined) data[key] = body[key];
+    }
+    return data;
+}
 const parseDecimalFields = (alert) => {
     if (!alert)
         return alert;
     const parsed = alert.toJSON ? alert.toJSON() : alert;
-    if (parsed.entry_level !== null && parsed.entry_level !== undefined) {
-        parsed.entry_level = parseFloat(parsed.entry_level);
-    }
-    if (parsed.stop_loss !== null && parsed.stop_loss !== undefined) {
-        parsed.stop_loss = parseFloat(parsed.stop_loss);
-    }
-    if (parsed.tp1 !== null && parsed.tp1 !== undefined) {
-        parsed.tp1 = parseFloat(parsed.tp1);
-    }
-    if (parsed.tp2 !== null && parsed.tp2 !== undefined) {
-        parsed.tp2 = parseFloat(parsed.tp2);
-    }
-    if (parsed.result !== null && parsed.result !== undefined) {
-        parsed.result = parseFloat(parsed.result);
+    for (const field of DECIMAL_FIELDS) {
+        if (parsed[field] !== null && parsed[field] !== undefined) {
+            parsed[field] = parseFloat(parsed[field]);
+        }
     }
     return parsed;
 };
@@ -48,10 +58,49 @@ export const getAlertById = async (req, res, next) => {
         next(error);
     }
 };
+const isPendingType = (directionType) => /limit|stop/i.test(String(directionType ?? ''));
+
+/**
+ * Pending orders wait until the live price reaches the entry from the side it started on:
+ *  - entry below current at creation  -> wait for a fall  (activate when price <= entry) -> side 'down'
+ *  - entry above current at creation  -> wait for a rise  (activate when price >= entry) -> side 'up'
+ *  - entry == current (or price unknown) -> open immediately
+ */
+const resolvePendingActivation = async (body) => {
+    if (!isPendingType(body?.direction_type)) return { activated: true, activation_side: null };
+    const entry = Number(body?.entry_level);
+    const current = await getCurrentPrice(body?.pair).catch(() => null);
+    if (Number.isFinite(entry) && current !== null) {
+        if (entry < current) return { activated: false, activation_side: 'down' };
+        if (entry > current) return { activated: false, activation_side: 'up' };
+        return { activated: true, activation_side: null }; // already at entry
+    }
+    // Fallback when the live price isn't known: infer the side from the order type.
+    const t = String(body?.direction_type).toLowerCase();
+    const side = t.includes('limit')
+        ? (t.startsWith('buy') ? 'down' : 'up')
+        : (t.startsWith('buy') ? 'up' : 'down');
+    return { activated: false, activation_side: side };
+};
+
 export const createAlert = async (req, res, next) => {
     try {
-        const alert = await tradingAlertRepository.create(req.body);
+        // Pending orders (Buy/Sell Limit/Stop) start inactive until price reaches entry from the creation side.
+        const { activated, activation_side } = await resolvePendingActivation(req.body);
+        const createData = pickAlertCreateData(req.body, { activated, activation_side });
+        const alert = await tradingAlertRepository.create(createData);
         const parsedAlert = parseDecimalFields(alert);
+        // Attach live/current price for limit-order alert copy (not stored on the row).
+        const currentFromBody = req.body?.current_price;
+        const currentPrice = currentFromBody !== null && currentFromBody !== undefined && currentFromBody !== ''
+            ? Number(currentFromBody)
+            : await getCurrentPrice(createData?.pair as string).catch(() => null);
+        const notifyPayload = {
+            ...parsedAlert,
+            current_price: Number.isFinite(currentPrice) ? currentPrice : null,
+        };
+        // Fire the "new trade" alert to the configured channels (non-blocking).
+        notifyTradeCreated(notifyPayload).catch(() => undefined);
         res.status(HTTP_STATUS.CREATED).json(successResponse(SUCCESS_MESSAGES.CREATED, parsedAlert));
     }
     catch (error) {
@@ -60,7 +109,7 @@ export const createAlert = async (req, res, next) => {
 };
 export const updateAlert = async (req, res, next) => {
     try {
-        const alert = await tradingAlertRepository.update(req.params.id, req.body);
+        const alert = await tradingAlertRepository.update(req.params.id, pickAlertCreateData(req.body));
         if (!alert) {
             throw new ApiError(HTTP_STATUS.NOT_FOUND, 'Trading alert not found');
         }
@@ -77,6 +126,29 @@ export const deleteAlert = async (req, res, next) => {
             throw new ApiError(HTTP_STATUS.NOT_FOUND, 'Trading alert not found');
         }
         res.status(HTTP_STATUS.NO_CONTENT).send();
+    }
+    catch (error) {
+        next(error);
+    }
+};
+const VALID_EVENTS = ['tp1', 'tp2', 'tp3', 'slHit', 'be', 'tsl', 'closed'];
+export const notifyAlertEvent = async (req, res, next) => {
+    try {
+        const event = (req.body?.event ?? '').toString();
+        if (!VALID_EVENTS.includes(event)) {
+            throw new ApiError(HTTP_STATUS.UNPROCESSABLE_ENTITY, 'Invalid alert event');
+        }
+        const alert = await tradingAlertRepository.findById(req.params.id);
+        if (!alert) {
+            throw new ApiError(HTTP_STATUS.NOT_FOUND, 'Trading alert not found');
+        }
+        // Atomic claim so the same event is delivered only once across clients.
+        const claimed = await tradingAlertRepository.claimAlertEvent(req.params.id, event);
+        let sent = false;
+        if (claimed) {
+            sent = await notifyTradeEvent(parseDecimalFields(alert), event);
+        }
+        res.status(HTTP_STATUS.OK).json(successResponse('Alert event processed', { claimed, sent }));
     }
     catch (error) {
         next(error);

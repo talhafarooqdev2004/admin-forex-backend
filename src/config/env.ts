@@ -124,4 +124,8 @@ export const ENV = {
      * only routable public IPs are recorded unless you set VISITOR_GEO_RECORD_NON_PUBLIC=true.
      */
     VISITOR_GEO_RECORD_NON_PUBLIC: parseEnvBool(process.env.VISITOR_GEO_RECORD_NON_PUBLIC, false),
+    /** Trade-alert delivery integrations (server-side only — never exposed to clients). */
+    DISCORD_WEBHOOK_URL: process.env.DISCORD_WEBHOOK_URL || '',
+    TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
+    TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '',
 };

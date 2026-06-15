@@ -5,6 +5,7 @@ const router = express.Router();
 router.get('/', readLimiter, tradingAlertController.getAllAlerts);
 router.get('/:id', readLimiter, tradingAlertController.getAlertById);
 router.post('/', apiLimiter, tradingAlertController.createAlert);
+router.post('/:id/notify', apiLimiter, tradingAlertController.notifyAlertEvent);
 router.put('/:id', apiLimiter, tradingAlertController.updateAlert);
 router.delete('/:id', apiLimiter, tradingAlertController.deleteAlert);
 export default router;

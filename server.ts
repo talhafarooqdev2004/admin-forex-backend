@@ -9,6 +9,7 @@ import { cronService } from './src/services/cron.service.js';
 import { scoreDashboardSheetSyncService } from './src/services/scoreDashboardSheetSync.service.js';
 import { requeuePendingVisitorGeoJobs } from './src/services/visitorGeo.service.js';
 import { startVisitorGeoWorker } from './src/workers/visitorGeo.worker.js';
+import { startTradeAlertEvaluator } from './src/workers/tradeAlertEvaluator.worker.js';
 
 const PORT = ENV.PORT || 5005;
 
@@ -40,6 +41,7 @@ httpServer.listen(PORT, async () => {
         logger.error('[VisitorGeo] Failed to re-queue pending jobs', e),
     );
     startVisitorGeoWorker();
+    startTradeAlertEvaluator();
 
     cronService.startJob('scoreDashboardSheetSync', '* * * * *', async () => {
         await runScoreDashboardSheetSyncJob();
