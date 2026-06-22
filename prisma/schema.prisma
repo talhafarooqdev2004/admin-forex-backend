@@ -73,8 +73,23 @@ model User {
   transactions  PaymentTransaction[]
   table_rows    TableRow[]
   table_cells   TableCell[]
+  preferences   UserPreference[]
 
   @@map("users")
+}
+
+model UserPreference {
+  id         BigInt   @id @default(autoincrement()) @db.BigInt
+  user_id    BigInt   @db.BigInt
+  key        String   @db.VarChar(255)
+  value      String?  @db.Text
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+  user       User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@unique([user_id, key])
+  @@index([user_id])
+  @@map("user_preferences")
 }
 
 model SubscriptionPackage {
@@ -350,17 +365,36 @@ model TradingAlert {
   tsl_active      Boolean            @default(false)
   last_tsl_sl     Decimal?           @db.Decimal(10, 5)
   last_alert_event String?           @db.VarChar(20)
+  accumulated_pips Decimal           @default(0) @db.Decimal(10, 2)
+  manual_partial_closed Boolean       @default(false)
   result          Decimal            @default(0) @db.Decimal(10, 2)
   status          TradingAlertStatus @default(open)
   comment         String?            @db.Text
   date            DateTime?          @db.Date
   created_at      DateTime           @default(now())
   updated_at      DateTime           @updatedAt
+  partial_closes  TradePartialClose[]
 
   @@index([date])
   @@index([status])
   @@index([pair])
   @@map("trading_alerts")
+}
+
+model TradePartialClose {
+  id               BigInt       @id @default(autoincrement()) @db.BigInt
+  trading_alert_id BigInt       @db.BigInt
+  tp_level         Int
+  pips             Decimal      @db.Decimal(10, 2)
+  exit_price       Decimal?     @db.Decimal(10, 5)
+  outcome          String?      @db.VarChar(20)
+  close_reason     String?      @db.VarChar(80)
+  created_at       DateTime     @default(now())
+  trading_alert    TradingAlert @relation(fields: [trading_alert_id], references: [id], onDelete: Cascade)
+
+  @@index([trading_alert_id])
+  @@index([created_at])
+  @@map("trade_partial_closes")
 }
 
 model ColorConfiguration {

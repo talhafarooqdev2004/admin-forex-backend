@@ -126,6 +126,11 @@ export const ENV = {
     VISITOR_GEO_RECORD_NON_PUBLIC: parseEnvBool(process.env.VISITOR_GEO_RECORD_NON_PUBLIC, false),
     /** Trade-alert delivery integrations (server-side only — never exposed to clients). */
     DISCORD_WEBHOOK_URL: process.env.DISCORD_WEBHOOK_URL || '',
+    DISCORD_BRAND_NAME: process.env.DISCORD_BRAND_NAME || 'Forex Fundamental Edge',
+    DISCORD_BRAND_LOGO_URL:
+        process.env.DISCORD_BRAND_LOGO_URL || 'https://fxfundamentaltrend.com/images/brand-logo.png',
+    /** Optional absolute path to brand logo file (defaults to dashboard `public/images/brand-logo.png`). */
+    DISCORD_BRAND_LOGO_PATH: process.env.DISCORD_BRAND_LOGO_PATH || '',
     TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
     TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '',
 };

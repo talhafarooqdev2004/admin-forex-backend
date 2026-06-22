@@ -1,11 +1,39 @@
 import { TradingAlertRepository } from '../../../repositories/tradingAlert.repository.js';
+import { AppConfigRepository } from '../../../repositories/appConfig.repository.js';
 import { successResponse } from '../../../utils/response.util.js';
 import { HTTP_STATUS, SUCCESS_MESSAGES } from '../../../config/constants.js';
 import { ApiError } from '../../../exceptions/ApiError.js';
-import { notifyTradeCreated, notifyTradeEvent } from '../../../services/tradeAlertNotification.service.js';
+import { notifyTradeCreated, notifyTradeEvent, notifyTradeLevelUpdated, detectTradeLevelChanges } from '../../../services/tradeAlertNotification.service.js';
+import { applyBreakeven } from '../../../services/tradeBreakeven.service.js';
+import { applyTsl } from '../../../services/tradeTsl.service.js';
 import { getCurrentPrice } from '../../../services/livePrice.service.js';
+import {
+    executeManualFullClose,
+    executeManualPartialClose,
+    listTradePartialCloses,
+} from '../../../services/tradeManualClose.service.js';
+import { serializePrisma } from '../../../utils/prisma.util.js';
 const tradingAlertRepository = new TradingAlertRepository();
-const DECIMAL_FIELDS = ['entry_level', 'stop_loss', 'tp1', 'tp2', 'tp3', 'exit_price', 'pips', 'result'];
+const appConfigRepository = new AppConfigRepository();
+
+async function readActiveTradesSettings() {
+    try {
+        const cfg = (await appConfigRepository.findByKey('active_trades_settings')) as { value?: string | null } | null;
+        return cfg?.value ? JSON.parse(cfg.value) : null;
+    } catch {
+        return null;
+    }
+}
+
+async function readTradeAlertSettings() {
+    try {
+        const cfg = (await appConfigRepository.findByKey('trade_alert_settings')) as { value?: string | null } | null;
+        return cfg?.value ? JSON.parse(cfg.value) : null;
+    } catch {
+        return null;
+    }
+}
+const DECIMAL_FIELDS = ['entry_level', 'stop_loss', 'tp1', 'tp2', 'tp3', 'exit_price', 'pips', 'result', 'accumulated_pips'];
 
 /** Fields persisted on TradingAlert — strips notification-only keys like current_price. */
 const ALERT_CREATE_FIELDS = [
@@ -13,6 +41,7 @@ const ALERT_CREATE_FIELDS = [
     'image_path', 'trade_follow_up', 'type', 'direction_type', 'session', 'risk',
     'exit_price', 'outcome', 'pips', 'close_reason', 'tsl_enabled', 'breakeven_enabled',
     'activated', 'activation_side', 'max_tp_hit', 'breakeven_done', 'tsl_active',
+    'accumulated_pips', 'manual_partial_closed',
     'last_tsl_sl', 'last_alert_event', 'result', 'status', 'comment', 'date',
 ] as const;
 
@@ -109,10 +138,41 @@ export const createAlert = async (req, res, next) => {
 };
 export const updateAlert = async (req, res, next) => {
     try {
-        const alert = await tradingAlertRepository.update(req.params.id, pickAlertCreateData(req.body));
+        const existing = await tradingAlertRepository.findById(req.params.id);
+        if (!existing) {
+            throw new ApiError(HTTP_STATUS.NOT_FOUND, 'Trading alert not found');
+        }
+
+        const enablingBe = req.body?.breakeven_enabled === true && !existing.breakeven_enabled;
+        const enablingTsl = req.body?.tsl_enabled === true && !existing.tsl_enabled;
+        const parsedExisting = parseDecimalFields(existing);
+        const updateData = pickAlertCreateData(req.body);
+        const levelChanges = detectTradeLevelChanges(parsedExisting, updateData);
+        const alert = await tradingAlertRepository.update(req.params.id, updateData);
         if (!alert) {
             throw new ApiError(HTTP_STATUS.NOT_FOUND, 'Trading alert not found');
         }
+
+        const parsedAlert = parseDecimalFields(alert);
+        for (const field of levelChanges) {
+            const previous = parsedExisting[field] as number | null | undefined;
+            const prevNum =
+                previous !== null && previous !== undefined && Number.isFinite(Number(previous))
+                    ? Number(previous)
+                    : null;
+            notifyTradeLevelUpdated(parsedAlert, field, prevNum).catch(() => undefined);
+        }
+
+        if (enablingBe && alert.status === 'open' && !alert.breakeven_done) {
+            const activeSettings = await readActiveTradesSettings();
+            await applyBreakeven(parsedAlert, activeSettings).catch(() => undefined);
+        }
+
+        if (enablingTsl && alert.status === 'open') {
+            const tradeSettings = await readTradeAlertSettings();
+            await applyTsl(parsedAlert, tradeSettings).catch(() => undefined);
+        }
+
         res.status(HTTP_STATUS.NO_CONTENT).send();
     }
     catch (error) {
@@ -131,6 +191,50 @@ export const deleteAlert = async (req, res, next) => {
         next(error);
     }
 };
+
+function mapManualCloseError(error: unknown): ApiError {
+    if (error instanceof ApiError) return error;
+    const code = error instanceof Error ? error.message : '';
+    if (code === 'TRADE_NOT_FOUND') return new ApiError(HTTP_STATUS.NOT_FOUND, 'Trading alert not found');
+    if (code === 'TRADE_NOT_OPEN') return new ApiError(HTTP_STATUS.CONFLICT, 'Trade is not open');
+    if (code === 'PARTIAL_ALREADY_DONE') return new ApiError(HTTP_STATUS.CONFLICT, 'A partial close was already recorded for this TP level');
+    if (code === 'PRICE_UNAVAILABLE') return new ApiError(HTTP_STATUS.SERVICE_UNAVAILABLE, 'Live price is unavailable for this pair');
+    return error instanceof ApiError ? error : new ApiError(HTTP_STATUS.INTERNAL_SERVER_ERROR, 'Close action failed');
+}
+
+export const listPartialCloses = async (req, res, next) => {
+    try {
+        const rows = await listTradePartialCloses();
+        res.status(HTTP_STATUS.OK).json(successResponse('Partial closes retrieved successfully', serializePrisma(rows)));
+    } catch (error) {
+        next(error);
+    }
+};
+
+export const partialCloseAlert = async (req, res, next) => {
+    try {
+        const level = Number(req.body?.level);
+        if (![1, 2, 3].includes(level)) {
+            throw new ApiError(HTTP_STATUS.UNPROCESSABLE_ENTITY, 'level must be 1, 2, or 3');
+        }
+        const result = await executeManualPartialClose(req.params.id, level as 1 | 2 | 3);
+        res.status(HTTP_STATUS.OK).json(
+            successResponse('Partial close recorded', serializePrisma({ trade: result.trade, partial: result.partial })),
+        );
+    } catch (error) {
+        next(mapManualCloseError(error));
+    }
+};
+
+export const fullCloseAlert = async (req, res, next) => {
+    try {
+        const trade = await executeManualFullClose(req.params.id);
+        res.status(HTTP_STATUS.OK).json(successResponse('Trade fully closed', serializePrisma(trade)));
+    } catch (error) {
+        next(mapManualCloseError(error));
+    }
+};
+
 const VALID_EVENTS = ['tp1', 'tp2', 'tp3', 'slHit', 'be', 'tsl', 'closed'];
 export const notifyAlertEvent = async (req, res, next) => {
     try {

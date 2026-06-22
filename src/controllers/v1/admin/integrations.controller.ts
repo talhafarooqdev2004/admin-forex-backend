@@ -1,4 +1,4 @@
-import { getTelegramChats, saveTelegramChatId, sendTelegram, sendDiscord } from '../../../services/tradeAlertNotification.service.js';
+import { getTelegramChats, saveTelegramChatId, sendTelegram, sendDiscordTestEmbed } from '../../../services/tradeAlertNotification.service.js';
 import { successResponse } from '../../../utils/response.util.js';
 import { HTTP_STATUS } from '../../../config/constants.js';
 import { ApiError } from '../../../exceptions/ApiError.js';
@@ -41,7 +41,7 @@ export const detectTelegramChat = async (req, res, next) => {
 export const sendTestAlert = async (req, res, next) => {
     try {
         const text = '🔔 Test alert from Forex Fundamental Edge — integration is working.';
-        const [telegram, discord] = await Promise.all([sendTelegram(text), sendDiscord(text)]);
+        const [telegram, discord] = await Promise.all([sendTelegram(text), sendDiscordTestEmbed()]);
         if (!telegram && !discord) {
             throw new ApiError(HTTP_STATUS.BAD_REQUEST, 'No channel delivered. Check token/webhook/chat id.');
         }

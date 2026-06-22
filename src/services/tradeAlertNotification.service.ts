@@ -1,7 +1,28 @@
 import { ENV } from '../config/env.js';
+import fs from 'node:fs';
 import { AppConfigRepository } from '../repositories/appConfig.repository.js';
 import { pipSize } from '../services/livePrice.service.js';
+import { slHitDisplayPips } from '../services/tradePips.service.js';
 import { logger } from '../utils/logger.util.js';
+import {
+    buildDiscordAutoPartialCloseEmbed,
+    buildDiscordCreatedEmbed,
+    buildDiscordEventEmbed,
+    buildDiscordLevelUpdatedEmbed,
+    buildDiscordManualFullCloseEmbed,
+    buildDiscordManualPartialEmbed,
+    buildDiscordTestEmbed,
+    isAutoPartialCloseConfigured,
+    partialClosePctFromSettings,
+    partialSecuredPips,
+    type DiscordEmbed,
+} from './discordTradeAlertEmbeds.js';
+import {
+    DISCORD_LOGO_FILENAME,
+    resolveDiscordLogoFilePath,
+    shouldAttachDiscordLogo,
+    withDiscordLogoAttachment,
+} from './discordBrandLogo.js';
 
 const appConfigRepository = new AppConfigRepository();
 
@@ -53,17 +74,40 @@ export async function sendTelegram(text: string): Promise<boolean> {
 }
 
 export async function sendDiscord(text: string): Promise<boolean> {
+    return sendDiscordPayload({ content: text.slice(0, 1900) });
+}
+
+export async function sendDiscordPayload(payload: { content?: string; embeds?: DiscordEmbed[] }): Promise<boolean> {
     const webhook = ENV.DISCORD_WEBHOOK_URL;
     if (!webhook) {
         logger.warn('Discord alert skipped: missing webhook url');
         return false;
     }
     try {
-        const res = await fetch(webhook, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content: text.slice(0, 1900) }),
-        });
+        const body: Record<string, unknown> = {};
+        if (payload.content) body.content = payload.content.slice(0, 1900);
+        if (payload.embeds?.length) body.embeds = payload.embeds.slice(0, 10);
+        if (!body.content && !body.embeds) return false;
+
+        const attachLogo = Array.isArray(body.embeds) && body.embeds.length > 0 && shouldAttachDiscordLogo();
+        const logoPath = attachLogo ? resolveDiscordLogoFilePath() : null;
+
+        let res: Response;
+        if (attachLogo && logoPath) {
+            const embeds = (body.embeds as DiscordEmbed[]).map((embed) => withDiscordLogoAttachment(embed));
+            const form = new FormData();
+            form.append('payload_json', JSON.stringify({ ...body, embeds }));
+            const fileBuffer = await fs.promises.readFile(logoPath);
+            form.append('files[0]', new Blob([fileBuffer], { type: 'image/png' }), DISCORD_LOGO_FILENAME);
+            res = await fetch(webhook, { method: 'POST', body: form });
+        } else {
+            res = await fetch(webhook, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+        }
+
         if (!res.ok && res.status !== 204) {
             logger.error(`Discord send failed: ${res.status} ${await res.text()}`);
             return false;
@@ -75,10 +119,18 @@ export async function sendDiscord(text: string): Promise<boolean> {
     }
 }
 
-async function deliver(text: string, channels: Channels): Promise<void> {
+export async function sendDiscordEmbed(embed: DiscordEmbed): Promise<boolean> {
+    return sendDiscordPayload({ embeds: [embed] });
+}
+
+export async function sendDiscordTestEmbed(): Promise<boolean> {
+    return sendDiscordEmbed(buildDiscordTestEmbed());
+}
+
+async function deliver(telegramText: string, discordEmbed: DiscordEmbed | null, channels: Channels): Promise<void> {
     const tasks: Promise<boolean>[] = [];
-    if (channels.telegram) tasks.push(sendTelegram(text));
-    if (channels.discord) tasks.push(sendDiscord(text));
+    if (channels.telegram && telegramText) tasks.push(sendTelegram(telegramText));
+    if (channels.discord && discordEmbed) tasks.push(sendDiscordEmbed(discordEmbed));
     await Promise.allSettled(tasks);
 }
 
@@ -177,6 +229,51 @@ function formatPipsCell(pips: number | null): string {
     return `${pips >= 0 ? '+' : ''}${pips.toFixed(1)}`;
 }
 
+export const TRADE_LEVEL_FIELDS = ['stop_loss', 'tp1', 'tp2', 'tp3'] as const;
+export type TradeLevelField = (typeof TRADE_LEVEL_FIELDS)[number];
+
+const LEVEL_LABELS: Record<TradeLevelField, string> = {
+    stop_loss: 'Stop Loss',
+    tp1: 'TP1',
+    tp2: 'TP2',
+    tp3: 'TP3',
+};
+
+const LEVEL_STATUS: Record<TradeLevelField, string> = {
+    stop_loss: 'SL UPDATED',
+    tp1: 'TP1 UPDATED',
+    tp2: 'TP2 UPDATED',
+    tp3: 'TP3 UPDATED',
+};
+
+function decimalsDiffer(a: unknown, b: unknown): boolean {
+    const x = num(a);
+    const y = num(b);
+    if (x === null && y === null) return false;
+    if (x === null || y === null) return true;
+    return Math.abs(x - y) > 1e-9;
+}
+
+/** Fields in `body` whose SL/TP values differ from the existing trade. */
+export function detectTradeLevelChanges(
+    existing: Record<string, unknown>,
+    body: Record<string, unknown>,
+): TradeLevelField[] {
+    const changed: TradeLevelField[] = [];
+    for (const key of TRADE_LEVEL_FIELDS) {
+        if (body[key] === undefined) continue;
+        if (decimalsDiffer(existing[key], body[key])) changed.push(key);
+    }
+    return changed;
+}
+
+function partialCloseOrdinal(level: 1 | 2 | 3): string {
+    if (level === 1) return '1st';
+    if (level === 2) return '2nd';
+    return '3rd';
+}
+
+
 /** Initial trade alert — full detail card. */
 function buildInitialMessage(trade: any): string {
     const lines = [
@@ -239,6 +336,10 @@ function buildPendingMessage(trade: any): string {
     ].join('\n');
 }
 
+function isTrailingStopLossTrade(trade: any): boolean {
+    return Boolean(trade.tsl_active || trade.tsl_enabled);
+}
+
 function eventStatus(event: string, trade: any, newSl?: number | null): string {
     switch (event) {
         case 'opened':
@@ -252,13 +353,19 @@ function eventStatus(event: string, trade: any, newSl?: number | null): string {
         case 'tp3':
             return 'CLOSED WIN';
         case 'slHit':
-            return 'STOP LOSS HIT';
+            return isTrailingStopLossTrade(trade) ? 'Trailing Stop Loss Hit' : 'STOP LOSS HIT';
         case 'be':
             return 'TSL TO ENTRY / BE';
         case 'tsl':
             return `TSL MOVED / TSL TO ${fmt(newSl ?? trade.stop_loss)}`;
         case 'closed':
             return trade.outcome === 'Loss' ? 'CLOSED LOSS' : 'CLOSED WIN';
+        case 'partialTp1':
+            return 'PARTIAL CLOSE TP1';
+        case 'partialTp2':
+            return 'PARTIAL CLOSE TP2';
+        case 'partialTp3':
+            return 'PARTIAL CLOSE TP3';
         default:
             return event.toUpperCase();
     }
@@ -276,13 +383,17 @@ function eventPips(event: string, trade: any, newSl?: number | null): number | n
         case 'tp3':
             return num(trade.pips) ?? calcPips(trade, num(trade.tp3));
         case 'slHit':
-            return num(trade.pips) ?? calcPips(trade, num(trade.stop_loss));
+            return slHitDisplayPips(trade);
         case 'be':
             return calcPips(trade, num(trade.entry_level));
         case 'tsl':
             return calcPips(trade, newSl ?? num(trade.stop_loss));
         case 'closed':
             return num(trade.pips);
+        case 'partialTp1':
+        case 'partialTp2':
+        case 'partialTp3':
+            return num(trade.partial_pips) ?? num(trade.pips);
         default:
             return null;
     }
@@ -299,8 +410,66 @@ function buildFollowUpRow(trade: any, event: string, newSl?: number | null): str
     return `${id} | ${pair} | ${style} | ${dir} | ${status} | ${pips}`;
 }
 
-function buildFollowUpMessage(trade: any, event: string, newSl?: number | null): string {
-    return [directionWithArrow(trade), '', buildFollowUpRow(trade, event, newSl)].join('\n');
+function buildFollowUpMessage(
+    trade: any,
+    event: string,
+    newSl?: number | null,
+): string {
+    const lines = [directionWithArrow(trade), '', buildFollowUpRow(trade, event, newSl)];
+    return lines.join('\n');
+}
+
+function buildAutoPartialCloseTelegram(
+    trade: any,
+    level: 1 | 2 | 3,
+    settings: Record<string, unknown> | null,
+): string | null {
+    if (!isAutoPartialCloseConfigured(settings, level)) return null;
+
+    const secured = partialSecuredPips(trade, level, settings);
+    const pct = partialClosePctFromSettings(settings, level);
+    const ordinal = partialCloseOrdinal(level);
+    const remaining = (() => {
+        const n = parseFloat(pct);
+        return Number.isFinite(n) ? `${Math.max(0, 100 - n)}%` : '—';
+    })();
+
+    const lines = [
+        directionWithArrow(trade),
+        '',
+        `🟠 ${pairDirFromTrade(trade)} — PARTIAL CLOSE`,
+        '',
+        `Partial Close: ${pct} — ${ordinal} partial close executed at TP${level}`,
+        `📤 Close: ${pct} of position`,
+        `🟢 Secured: ${formatPipsCell(secured)}`,
+    ];
+    if (trade.breakeven_done) {
+        lines.push(`🛡️ SL moved to breakeven: ${fmt(trade.stop_loss)}`);
+    }
+    lines.push(`📌 Remaining position: ${remaining}`);
+    lines.push('', `🆔 ID: ${trade.trade_id ?? '—'}`, `🕒 Time: ${formatNowTime()}`);
+    return lines.join('\n');
+}
+
+function pairDirFromTrade(trade: any): string {
+    return `${trade.pair ?? '—'} ${directionShort(trade)}`;
+}
+
+function formatNowTime(): string {
+    const d = new Date();
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+async function notifyAutoPartialCloseAfterTp(
+    trade: any,
+    level: 1 | 2 | 3,
+    settings: Record<string, unknown> | null,
+    channels: Channels,
+): Promise<void> {
+    const telegramText = buildAutoPartialCloseTelegram(trade, level, settings);
+    const discordEmbed = buildDiscordAutoPartialCloseEmbed(trade, level, settings);
+    if (!telegramText && !discordEmbed) return;
+    await deliver(telegramText ?? '', discordEmbed, channels);
 }
 
 /** Sends the creation alert if any channel is enabled. */
@@ -315,7 +484,8 @@ export async function notifyTradeCreated(trade: any): Promise<void> {
             ? buildPendingMessage(trade)
             : buildInitialMessage(trade);
 
-    await deliver(text, channels);
+    const discordEmbed = buildDiscordCreatedEmbed(trade);
+    await deliver(text, discordEmbed, channels);
 }
 
 /**
@@ -335,7 +505,108 @@ export async function notifyTradeEvent(
     const channels = channelsFromSettings(tradeSettings);
     if (!channels.telegram && !channels.discord) return false;
 
-    await deliver(buildFollowUpMessage(trade, event, opts.newSl), channels);
+    const telegramText = buildFollowUpMessage(trade, event, opts.newSl);
+    const discordEmbed = buildDiscordEventEmbed(trade, event, {
+        newSl: opts.newSl,
+        tradeSettings,
+    });
+    await deliver(telegramText, discordEmbed, channels);
+
+    const tpMatch = /^tp([123])$/.exec(event);
+    if (tpMatch) {
+        const level = Number(tpMatch[1]) as 1 | 2 | 3;
+        // Partial closes apply while the trade is still open (TP1/TP2). TP3 is a full close.
+        if (level < 3) {
+            await notifyAutoPartialCloseAfterTp(trade, level, tradeSettings, channels);
+        }
+    }
+
+    return true;
+}
+
+/** Admin edited SL or TP on an open trade — always delivered when channels are configured. */
+export async function notifyTradeLevelUpdated(
+    trade: Record<string, unknown>,
+    field: TradeLevelField,
+    previous: number | null,
+): Promise<boolean> {
+    const tradeSettings = await readJsonConfig(TRADE_ALERT_SETTINGS_KEY);
+    const channels = channelsFromSettings(tradeSettings);
+    if (!channels.telegram && !channels.discord) return false;
+
+    const label = LEVEL_LABELS[field];
+    const status = LEVEL_STATUS[field];
+    const id = trade.trade_id ?? '—';
+    const pair = trade.pair ?? '—';
+    const style = tradeStyle(trade);
+    const dir = directionWithArrow(trade);
+    const row = `${id} | ${pair} | ${style} | ${dir} | ${status} | —`;
+
+    const lines = [
+        directionWithArrow(trade),
+        '',
+        row,
+        '',
+        `${label} updated: ${fmt(previous)} → ${fmt(trade[field])}`,
+        `Entry: ${fmt(trade.entry_level)}`,
+        `SL: ${fmt(trade.stop_loss)}`,
+        `TP1: ${fmt(trade.tp1)} | TP2: ${fmt(trade.tp2)} | TP3: ${fmt(trade.tp3)}`,
+    ];
+    const discordEmbed = buildDiscordLevelUpdatedEmbed(trade, field, previous);
+    await deliver(lines.join('\n'), discordEmbed, channels);
+    return true;
+}
+
+/** Admin manual partial close — always delivered when channels are configured. */
+export async function notifyManualPartialClose(
+    trade: Record<string, unknown>,
+    level: 1 | 2 | 3,
+    pips: number,
+): Promise<boolean> {
+    const tradeSettings = await readJsonConfig(TRADE_ALERT_SETTINGS_KEY);
+    const channels = channelsFromSettings(tradeSettings);
+    if (!channels.telegram && !channels.discord) return false;
+
+    const pct = partialClosePctFromSettings(tradeSettings, level);
+    const lines = [
+        directionWithArrow(trade),
+        '',
+        buildFollowUpRow(trade, `partialTp${level}`, null),
+        '',
+        `Manual Partial Close TP${level}: ${pct}`,
+        `Pips recorded: ${formatPipsCell(pips)}`,
+        'Trade remains active for further management.',
+    ];
+    const discordEmbed = buildDiscordManualPartialEmbed(trade, level, pips, tradeSettings);
+    await deliver(lines.join('\n'), discordEmbed, channels);
+    return true;
+}
+
+/** Admin manual full close — always delivered when channels are configured. */
+export async function notifyManualFullClose(
+    trade: Record<string, unknown>,
+    accumulated: number,
+    remaining: number,
+    total: number,
+): Promise<boolean> {
+    const tradeSettings = await readJsonConfig(TRADE_ALERT_SETTINGS_KEY);
+    const channels = channelsFromSettings(tradeSettings);
+    if (!channels.telegram && !channels.discord) return false;
+
+    const lines = [
+        directionWithArrow(trade),
+        '',
+        buildFollowUpRow(trade, 'closed', null),
+        '',
+        accumulated > 0
+            ? `Full Close — trade finalized`
+            : `Full Close — trade moved to history`,
+        accumulated > 0
+            ? `Partial profit: ${formatPipsCell(accumulated)} | Remaining: ${formatPipsCell(remaining)} | Total: ${formatPipsCell(total)}`
+            : `Total pips: ${formatPipsCell(total)}`,
+    ];
+    const discordEmbed = buildDiscordManualFullCloseEmbed(trade, accumulated, remaining, total);
+    await deliver(lines.join('\n'), discordEmbed, channels);
     return true;
 }
 

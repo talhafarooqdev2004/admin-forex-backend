@@ -3,6 +3,9 @@ import { logger } from '../utils/logger.util.js';
 import { AppConfigRepository } from '../repositories/appConfig.repository.js';
 import { getLivePriceMap, pipSize } from '../services/livePrice.service.js';
 import { notifyTradeEvent } from '../services/tradeAlertNotification.service.js';
+import { computeBreakevenSl, shouldApplyBreakeven } from '../services/tradeBreakeven.service.js';
+import { evaluateTslTick, shouldRunTsl } from '../services/tradeTsl.service.js';
+import { computeTradeClosePips, pipsFromPrices } from '../services/tradePips.service.js';
 
 const appConfigRepository = new AppConfigRepository();
 const TICK_MS = 5000;
@@ -27,14 +30,6 @@ async function readJson(key) {
     }
 }
 
-function levelFromSetting(value) {
-    if (value === 'tp3') return 3;
-    if (value === 'tp2') return 2;
-    if (value === 'tp1' || value === 'manual') return 1;
-    return 0;
-}
-
-/** Number of TPs the price has reached (direction-aware, ordered tp1<tp2<tp3). */
 function reachedLevel(price, isBuy, tp1, tp2, tp3) {
     const hit = (tp) => tp !== null && (isBuy ? price >= tp : price <= tp);
     if (hit(tp3)) return 3;
@@ -80,52 +75,74 @@ async function evaluateTrade(trade, prices, tradeSettings, activeSettings) {
     const events: { event: string; newSl?: number }[] = [];
 
     let maxTp = trade.max_tp_hit ?? 0;
+    const manualPartialLevels = new Set(
+        (trade.partial_closes ?? []).map((row) => Number(row.tp_level)),
+    );
 
     // 1) TP progression alerts for newly-crossed levels 1 and 2 (3 is terminal below).
     for (let l = maxTp + 1; l <= Math.min(level, 2); l++) {
+        // Admin manual partial close at this level is messaging-only — do not treat it as a market TP hit.
+        if (manualPartialLevels.has(l)) continue;
         events.push({ event: `tp${l}` });
         maxTp = l;
         updates.max_tp_hit = l;
     }
 
-    // 2) Breakeven.
-    const beLevel = levelFromSetting(activeSettings?.moveSlAfter);
-    if (trade.breakeven_enabled && !trade.breakeven_done && beLevel > 0 && maxTp >= beLevel) {
-        const manualPips = n(activeSettings?.moveSlManualPips) ?? 0;
-        const beSl = activeSettings?.moveSlAfter === 'manual'
-            ? entry + (isBuy ? 1 : -1) * manualPips * pip
-            : entry;
-        sl = round(beSl);
+    // 2) Breakeven — instant when admin toggles per-trade BE, or auto after configured TP.
+    if (shouldApplyBreakeven(trade, activeSettings, maxTp)) {
+        const beSl = computeBreakevenSl(entry, pair, isBuy, activeSettings);
+        sl = beSl;
         updates.stop_loss = sl;
         updates.breakeven_done = true;
-        events.push({ event: 'be' });
+        events.push({ event: 'be', newSl: sl });
     }
 
-    // 3) Trailing stop.
-    const tslLevel = levelFromSetting(tradeSettings?.tslActivateAfter);
+    // 3) Trailing stop — interval steps only (full chase distance between SL moves).
     const chasePips = n(tradeSettings?.tslChaseDistance) ?? 0;
-    if (trade.tsl_enabled && tslLevel > 0 && maxTp >= tslLevel && chasePips > 0) {
-        updates.tsl_active = true;
-        const target = round(isBuy ? price - chasePips * pip : price + chasePips * pip);
-        const moreFavorable = isBuy ? target > sl : target < sl;
-        if (moreFavorable) {
-            sl = target;
-            updates.stop_loss = target;
-            updates.last_tsl_sl = target;
-            events.push({ event: 'tsl', newSl: target });
+    if (shouldRunTsl(trade, tradeSettings, maxTp) && chasePips > 0) {
+        const tick = evaluateTslTick(price, sl, pair, isBuy, chasePips, Boolean(trade.tsl_active));
+        if (tick) {
+            updates.tsl_active = true;
+            if (tick.newSl !== undefined) {
+                sl = tick.newSl;
+                updates.stop_loss = tick.newSl;
+                updates.last_tsl_sl = tick.newSl;
+                events.push({ event: 'tsl', newSl: tick.newSl });
+            }
         }
     }
 
     // 4) Terminal: TP3 reached, or price hit the (possibly moved) SL.
-    const hitTp3 = level >= 3;
+    // Once an admin has manually partial-closed the trade, final profit is handled
+    // by the explicit Full Close action so partial close cannot cascade into TP3 close.
+    const hitTp3 = !trade.manual_partial_closed && level >= 3;
     const hitSl = isBuy ? price <= sl : price >= sl;
     if (hitTp3 || hitSl) {
         const exit = hitTp3 ? (tp3 as number) : sl;
-        const pips = ((exit - entry) / pip) * (isBuy ? 1 : -1);
-        const outcome = pips >= 0 ? 'Profit' : 'Loss';
+        const finalMaxTp = hitTp3 ? 3 : maxTp;
+        let pips = computeTradeClosePips({
+            entry,
+            exitPrice: exit,
+            pair,
+            isBuy,
+            maxTpHit: finalMaxTp,
+            tp1,
+            tp2,
+            tp3,
+            closedAtTp3: hitTp3,
+        });
+        // Preserve manually-secured partial profit: once the parent completes, the partial
+        // rows are excluded from history/stats, so the accumulated pips must roll into the
+        // final result (mirrors the manual Full Close combine logic).
+        if (trade.manual_partial_closed) {
+            const accumulated = n(trade.accumulated_pips) ?? 0;
+            const remaining = pipsFromPrices(entry, exit, pair, isBuy);
+            pips = Number((accumulated + remaining).toFixed(2));
+        }
+        const outcome = (pips ?? 0) >= 0 ? 'Profit' : 'Loss';
         updates.status = 'completed';
         updates.exit_price = round(exit);
-        updates.pips = Number(pips.toFixed(2));
+        updates.pips = pips;
         updates.outcome = outcome;
         updates.close_reason = hitTp3 ? 'TP3 Achieved — Trade Close' : 'SL Hit — Trade Close';
         if (hitTp3) updates.max_tp_hit = 3;
@@ -147,7 +164,10 @@ async function tick() {
     if (running) return;
     running = true;
     try {
-        const open = await prisma.tradingAlert.findMany({ where: { status: 'open' } });
+        const open = await prisma.tradingAlert.findMany({
+            where: { status: 'open' },
+            include: { partial_closes: { select: { tp_level: true } } },
+        });
         if (open.length === 0) return;
         const [prices, tradeSettings, activeSettings] = await Promise.all([
             getLivePriceMap(),

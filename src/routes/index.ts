@@ -1,6 +1,7 @@
 import express from 'express';
 import publicRoutes from './public.routes.js';
 import authRoutes from './auth.routes.js';
+import userPreferenceRoutes from './userPreference.routes.js';
 import userRoutes from './user.routes.js';
 import packageRoutes from './package.routes.js';
 import educationRoutes from './education.routes.js';
@@ -32,6 +33,7 @@ const router = express.Router();
 
 router.use('/public', publicRoutes);
 router.use('/auth', authRoutes);
+router.use('/user-preferences', userPreferenceRoutes);
 router.use('/packages', packageRoutes);
 router.use('/admin/users', userRoutes);
 router.use('/admin/subscription-packages', packageRoutes);
