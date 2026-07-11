@@ -7,6 +7,7 @@ import { websocketService } from './src/services/websocket.service.js';
 import { googleSheetsService } from './src/services/googleSheets.service.js';
 import { cronService } from './src/services/cron.service.js';
 import { scoreDashboardSheetSyncService } from './src/services/scoreDashboardSheetSync.service.js';
+import { runUaeMidnightArchive } from './src/services/marketDriverBoard.service.js';
 import { requeuePendingVisitorGeoJobs } from './src/services/visitorGeo.service.js';
 import { startVisitorGeoWorker } from './src/workers/visitorGeo.worker.js';
 import { startTradeAlertEvaluator } from './src/workers/tradeAlertEvaluator.worker.js';
@@ -32,10 +33,28 @@ async function runScoreDashboardSheetSyncJob() {
     }
 }
 
+/**
+ * Doc §2 Daily Reset (Asia/Dubai midnight): finalize completed days into Historical Analysis.
+ * Live boards clear automatically — they only query today's `day_key`. Headlines stay in DB.
+ * (RSS fetch + economic calendar scrape live in forex-scraping and notify via webhooks.)
+ */
+async function runUaeMidnightArchiveTick() {
+    try {
+        const archived = await runUaeMidnightArchive();
+        if (archived > 0) {
+            websocketService.emitCalendarNewsUpdate('uae-day-archive');
+            logger.info(`[MarketDriverCron] UAE midnight archive finalized ${archived} day(s)`);
+        }
+    } catch (error) {
+        logger.error(`[MarketDriverCron] UAE archive failed: ${error instanceof Error ? error.message : error}`);
+    }
+}
+
 httpServer.listen(PORT, async () => {
     logger.info(`Forex Dashboard Backend running on port ${PORT} in ${ENV.NODE_ENV} mode`);
 
     void runScoreDashboardSheetSyncJob();
+    void runUaeMidnightArchiveTick();
 
     void requeuePendingVisitorGeoJobs().catch((e) =>
         logger.error('[VisitorGeo] Failed to re-queue pending jobs', e),
@@ -46,4 +65,21 @@ httpServer.listen(PORT, async () => {
     cronService.startJob('scoreDashboardSheetSync', '* * * * *', async () => {
         await runScoreDashboardSheetSyncJob();
     });
+
+    cronService.startJob(
+        'marketDriverUaeMidnightArchive',
+        '0 0 * * *',
+        async () => {
+            await runUaeMidnightArchiveTick();
+        },
+        { timezone: 'Asia/Dubai' },
+    );
+    cronService.startJob(
+        'marketDriverUaeArchiveCatchup',
+        '15 * * * *',
+        async () => {
+            await runUaeMidnightArchiveTick();
+        },
+        { timezone: 'Asia/Dubai' },
+    );
 });

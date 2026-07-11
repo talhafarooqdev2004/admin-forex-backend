@@ -73,6 +73,9 @@ export const ENV = {
     PAYPAL_CLIENT_SECRET: process.env.PAYPAL_CLIENT_SECRET,
     PAYPAL_MODE: process.env.PAYPAL_MODE || 'sandbox',
     CACHE_API_KEY: process.env.CACHE_API_KEY,
+    /** Groq LLM API key — classifies FinancialJuice headlines for the Market Driver Board. */
+    GROQ_API_KEY: process.env.GROQ_API_KEY,
+    GROQ_MODEL: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
     MAX_FILE_SIZE: parseInteger(process.env.MAX_FILE_SIZE, 10485760),
     UPLOAD_DIR: process.env.UPLOAD_DIR || './uploads',
     SMTP_HOST: process.env.SMTP_HOST || 'smtp.gmail.com',

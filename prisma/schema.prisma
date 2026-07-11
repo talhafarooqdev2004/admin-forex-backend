@@ -592,3 +592,49 @@ enum locales {
   fr
   zh
 }
+
+/// One classified FinancialJuice headline for the Market Driver Board.
+/// `day_key` is the Asia/Dubai (UAE) calendar day used for the daily live pool + reset;
+/// past days stay in the table and become the source for the Historical Analysis page.
+model MarketDriverNews {
+  id             String   @id @default(cuid())
+  /// RSS guid/link — hard dedup: the same feed item is never inserted twice.
+  guid           String   @unique @db.VarChar(500)
+  /// Normalized headline used for soft/semantic dedup within a day.
+  normalized     String   @db.VarChar(500)
+  day_key        String   @db.VarChar(10)
+  headline       String   @db.VarChar(1000)
+  source         String?  @db.VarChar(255)
+  /// ECONOMIC | DRIVER | GEOPOLITICAL | IRRELEVANT
+  category       String   @db.VarChar(20)
+  /// High | Medium | Low
+  impact         String   @db.VarChar(10)
+  summary        String?  @db.VarChar(500)
+  /// [{ asset, bias, score }] — tracked assets this headline affects.
+  assets         Json
+  /// Set when this item was folded into an earlier one (soft dedup); such rows don't score.
+  duplicate_of   String?  @db.VarChar(50)
+  published_at   DateTime?
+  created_at     DateTime @default(now())
+
+  @@index([day_key])
+  @@index([category])
+  @@map("market_driver_news")
+}
+
+/// Finalized UAE-day snapshot for Historical Analysis (doc §2).
+/// Written at Asia/Dubai midnight; live boards always read the current day_key only.
+model MarketDriverDayArchive {
+  id              String   @id @default(cuid())
+  day_key         String   @unique @db.VarChar(10)
+  /// Final per-asset catalyst board: [{ asset, bullishCount, bearishCount, driverScore }]
+  catalyst_board  Json
+  headline_count  Int      @default(0)
+  relevant_count  Int      @default(0)
+  duplicate_count Int      @default(0)
+  irrelevant_count Int     @default(0)
+  finalized_at    DateTime @default(now())
+  created_at      DateTime @default(now())
+
+  @@map("market_driver_day_archive")
+}

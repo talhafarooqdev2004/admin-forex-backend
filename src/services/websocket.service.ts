@@ -144,6 +144,29 @@ export class WebSocketService {
         logger.info(`Emitted table update for ${identifier} to ${this.clients.size} client(s)`);
     }
 
+    /**
+     * Calendar & News page live refresh — economic calendar scrape and/or market-driver board
+     * finished updating. Clients refetch public + admin calendar-news endpoints.
+     */
+    emitCalendarNewsUpdate(source = 'unknown') {
+        if (!this.io) {
+            logger.warn('WebSocket server not initialized, cannot emit calendar-news update');
+            return;
+        }
+
+        const payload = {
+            type: 'CALENDAR_NEWS_UPDATE',
+            data: {
+                source,
+                timestamp: new Date().toISOString(),
+            },
+        };
+
+        this.io.emit('calendarNewsUpdate', payload);
+
+        logger.info(`Emitted calendar-news update (${source}) to ${this.clients.size} client(s)`);
+    }
+
     broadcastTableUpdate(updateData) {
         if (!this.io) {
             logger.warn('WebSocket server not initialized, cannot broadcast table update');

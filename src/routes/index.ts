@@ -28,6 +28,7 @@ import forumPostsRoutes from "./forumPosts.routes.js";
 import webhookRoutes from './webhook.routes.js';
 
 import visitorAnalyticsRoutes from './visitorAnalytics.routes.js';
+import marketDriverNewsRoutes from './marketDriverNews.routes.js';
 
 const router = express.Router();
 
@@ -56,6 +57,7 @@ router.use('/admin/fx-analyzer-technical', fxAnalyzerTechnicalRoutes);
 router.use('/admin/edge-tools', edgeToolsSyncRoutes);
 router.use('/admin/cot-data-analysis', cotDataAnalysisSyncRoutes);
 router.use('/admin/analytics', visitorAnalyticsRoutes);
+router.use('/admin/market-driver-news', marketDriverNewsRoutes);
 router.use('/webhooks', webhookRoutes);
 
 router.post('/admin/cache/flush/users', (req, res) => {
