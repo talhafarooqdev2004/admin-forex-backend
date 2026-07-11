@@ -306,19 +306,39 @@ export async function ingestMarketDriverRssItems(rawItems: unknown[]): Promise<{
         return { received: 0, fresh: 0, stored: 0, changed: realigned > 0, realigned };
     }
 
-    // Hard dedup: drop feed items whose guid is already stored (any day).
+    // Hard dedup by guid (unique). Items already on *today* are skipped.
+    // Items stored on a *prior* UAE day but still present in the live feed are carried
+    // forward onto today's day_key so the live board isn't blank after the daily reset
+    // when FinancialJuice is still serving the same sticky headlines.
     const guids = items.map((i) => i.guid);
     const existing = await prisma.marketDriverNews.findMany({
         where: { guid: { in: guids } },
-        select: { guid: true },
+        select: { id: true, guid: true, day_key: true },
     });
+    const todayGuids = new Set(existing.filter((e) => e.day_key === dayKey).map((e) => e.guid));
+    const carryIds = existing.filter((e) => e.day_key < dayKey).map((e) => e.id);
+
+    let carried = 0;
+    if (carryIds.length > 0) {
+        const result = await prisma.marketDriverNews.updateMany({
+            where: { id: { in: carryIds } },
+            data: { day_key: dayKey },
+        });
+        carried = result.count;
+        if (carried > 0) {
+            logger.info(
+                `[MarketDriver] Carried ${carried} still-in-feed headline(s) from prior UAE day(s) → ${dayKey}`,
+            );
+        }
+    }
+
     const seenGuids = new Set(existing.map((e) => e.guid));
 
-    // In-batch guid dedup + cap.
+    // In-batch guid dedup + cap — only truly new guids go to Groq.
     const fresh: RssItem[] = [];
     const batchGuids = new Set<string>();
     for (const it of items) {
-        if (seenGuids.has(it.guid) || batchGuids.has(it.guid)) continue;
+        if (seenGuids.has(it.guid) || batchGuids.has(it.guid) || todayGuids.has(it.guid)) continue;
         batchGuids.add(it.guid);
         fresh.push(it);
         if (fresh.length >= MAX_CLASSIFY_PER_CYCLE) break;
@@ -328,7 +348,7 @@ export async function ingestMarketDriverRssItems(rawItems: unknown[]): Promise<{
             received: items.length,
             fresh: 0,
             stored: 0,
-            changed: realigned > 0,
+            changed: realigned > 0 || carried > 0,
             realigned,
         };
     }
