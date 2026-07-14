@@ -594,7 +594,7 @@ enum locales {
 }
 
 /// One classified FinancialJuice headline for the Market Driver Board.
-/// `day_key` is the Asia/Dubai (UAE) calendar day used for the daily live pool + reset;
+/// `day_key` is the Asia/Dubai (UAE) 01:00-to-01:00 market day used for the live pool + reset;
 /// past days stay in the table and become the source for the Historical Analysis page.
 model MarketDriverNews {
   id             String   @id @default(cuid())
@@ -614,16 +614,22 @@ model MarketDriverNews {
   assets         Json
   /// Set when this item was folded into an earlier one (soft dedup); such rows don't score.
   duplicate_of   String?  @db.VarChar(50)
+  /// Once a row is shown on the News Headline board it is LOCKED for the rest of the UAE market
+  /// day: this flag only ever flips false→true. Board display = locked rows; no later pass
+  /// (dedup, re-sanitize, re-key, heal) may un-show a locked row. Admission decisions happen
+  /// before locking; after locking a row is frozen for visibility. Doc §34 stability requirement.
+  board_locked   Boolean  @default(false)
   published_at   DateTime?
   created_at     DateTime @default(now())
 
   @@index([day_key])
   @@index([category])
+  @@index([day_key, board_locked])
   @@map("market_driver_news")
 }
 
 /// Finalized UAE-day snapshot for Historical Analysis (doc §2).
-/// Written at Asia/Dubai midnight; live boards always read the current day_key only.
+/// Written after the 01:00 Asia/Dubai rollover; live boards always read the current day_key only.
 model MarketDriverDayArchive {
   id              String   @id @default(cuid())
   day_key         String   @unique @db.VarChar(10)

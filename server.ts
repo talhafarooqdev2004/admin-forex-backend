@@ -8,6 +8,7 @@ import { googleSheetsService } from './src/services/googleSheets.service.js';
 import { cronService } from './src/services/cron.service.js';
 import { scoreDashboardSheetSyncService } from './src/services/scoreDashboardSheetSync.service.js';
 import { runUaeMidnightArchive } from './src/services/marketDriverBoard.service.js';
+import { runMarketDriverCoverageAudit } from './src/services/marketDriverCoverageAudit.service.js';
 import { requeuePendingVisitorGeoJobs } from './src/services/visitorGeo.service.js';
 import { startVisitorGeoWorker } from './src/workers/visitorGeo.worker.js';
 import { startTradeAlertEvaluator } from './src/workers/tradeAlertEvaluator.worker.js';
@@ -34,7 +35,7 @@ async function runScoreDashboardSheetSyncJob() {
 }
 
 /**
- * Doc §2 Daily Reset (Asia/Dubai midnight): finalize completed days into Historical Analysis.
+ * UAE market-day reset (01:00 Asia/Dubai): finalize completed days into Historical Analysis.
  * Live boards clear automatically — they only query today's `day_key`. Headlines stay in DB.
  * (RSS fetch + economic calendar scrape live in forex-scraping and notify via webhooks.)
  */
@@ -43,10 +44,27 @@ async function runUaeMidnightArchiveTick() {
         const archived = await runUaeMidnightArchive();
         if (archived > 0) {
             websocketService.emitCalendarNewsUpdate('uae-day-archive');
-            logger.info(`[MarketDriverCron] UAE midnight archive finalized ${archived} day(s)`);
+            logger.info(`[MarketDriverCron] UAE 01:00 archive finalized ${archived} day(s)`);
         }
     } catch (error) {
         logger.error(`[MarketDriverCron] UAE archive failed: ${error instanceof Error ? error.message : error}`);
+    }
+}
+
+/**
+ * Self-healing News Headline coverage audit: compares live FJ/FXStreet feeds against today's
+ * board and auto-fixes any rule-required item that is missing or hidden (misclassified /
+ * wrongly deduped). Replaces the manual daily feed-vs-board check entirely; a FAIL in the
+ * logs (or GET /admin/market-driver-news/coverage) is the only signal that needs a human.
+ */
+async function runCoverageAuditTick() {
+    try {
+        const result = await runMarketDriverCoverageAudit();
+        if (result.healedMissing + result.healedHidden > 0) {
+            websocketService.emitCalendarNewsUpdate('coverage-audit-heal');
+        }
+    } catch (error) {
+        logger.error(`[CoverageAudit] Audit tick failed: ${error instanceof Error ? error.message : error}`);
     }
 }
 
@@ -67,8 +85,8 @@ httpServer.listen(PORT, async () => {
     });
 
     cronService.startJob(
-        'marketDriverUaeMidnightArchive',
-        '0 0 * * *',
+        'marketDriverUaeDayArchive',
+        '0 1 * * *',
         async () => {
             await runUaeMidnightArchiveTick();
         },
@@ -82,4 +100,13 @@ httpServer.listen(PORT, async () => {
         },
         { timezone: 'Asia/Dubai' },
     );
+
+    // Offset from the :00/:10/... RSS ingest and the :15 archive catchup so feed hits spread out.
+    cronService.startJob('marketDriverCoverageAudit', '7,37 * * * *', async () => {
+        await runCoverageAuditTick();
+    });
+    // Boot-time audit, slightly delayed so the first webhook ingest (if due) lands first.
+    setTimeout(() => {
+        void runCoverageAuditTick();
+    }, 45000);
 });

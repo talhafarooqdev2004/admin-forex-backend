@@ -17,7 +17,11 @@
     "check-pairs": "tsx check-currency-pairs.ts",
     "migrate": "prisma migrate deploy",
     "prisma:generate": "prisma generate",
-    "test:alerts": "tsx test-alerts.ts"
+    "test:alerts": "tsx test-alerts.ts",
+    "test:compliance": "tsx --test test-client-compliance.ts",
+    "test:market-driver-rules": "tsx test-market-driver-classifier-rules.ts",
+    "test:market-driver-feed-coverage": "tsx test-market-driver-feed-coverage.ts",
+    "test:market-driver-board-lock": "tsx test-market-driver-board-lock.ts"
   },
   "keywords": [
     "forex",

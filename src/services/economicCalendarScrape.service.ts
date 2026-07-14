@@ -1,9 +1,11 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { logger } from '../utils/logger.util.js';
 
 /**
- * In-memory economic calendar snapshot.
- * Scraping runs in forex-scraping and is pushed here via webhook
- * POST /api/v1/webhooks/economic-calendar/ingest.
+ * Economic calendar snapshot — filled by forex-scraping webhook.
+ * Persisted to disk so admin restarts / deploys do not wipe the week and force
+ * the dashboard into fake STATIC rows (UK O-Orders for every currency).
  */
 
 export type EconomicCalendarEvent = {
@@ -23,6 +25,8 @@ export type EconomicCalendarEvent = {
 };
 
 type Snapshot = { data: EconomicCalendarEvent[]; scrapedAt: number };
+
+const SNAPSHOT_PATH = path.join(process.cwd(), 'data', 'economic-calendar-snapshot.json');
 
 let snapshot: Snapshot | null = null;
 
@@ -63,21 +67,85 @@ function normalizeEvent(raw: unknown): EconomicCalendarEvent | null {
     };
 }
 
-/** Replace the live snapshot with events pushed from forex-scraping. */
+function persistSnapshot(next: Snapshot): void {
+    try {
+        fs.mkdirSync(path.dirname(SNAPSHOT_PATH), { recursive: true });
+        fs.writeFileSync(SNAPSHOT_PATH, JSON.stringify(next), 'utf8');
+    } catch (err) {
+        logger.warn(
+            `[EconomicCalendar] Failed to persist snapshot: ${err instanceof Error ? err.message : String(err)}`,
+        );
+    }
+}
+
+function loadPersistedSnapshot(): Snapshot | null {
+    try {
+        if (!fs.existsSync(SNAPSHOT_PATH)) return null;
+        const raw = JSON.parse(fs.readFileSync(SNAPSHOT_PATH, 'utf8')) as {
+            data?: unknown[];
+            scrapedAt?: number;
+        };
+        if (!Array.isArray(raw?.data) || raw.data.length === 0) return null;
+        const data = raw.data.map(normalizeEvent).filter((e): e is EconomicCalendarEvent => e !== null);
+        if (data.length === 0) return null;
+        const scrapedAt = Number.isFinite(raw.scrapedAt) ? Number(raw.scrapedAt) : Date.now();
+        logger.info(`[EconomicCalendar] Restored persisted snapshot: ${data.length} event(s)`);
+        return { data, scrapedAt };
+    } catch (err) {
+        logger.warn(
+            `[EconomicCalendar] Failed to load persisted snapshot: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return null;
+    }
+}
+
+// Restore on process boot so GET /economic-calendar is never empty after deploy restart.
+snapshot = loadPersistedSnapshot();
+
+/**
+ * Replace the live snapshot with events pushed from forex-scraping.
+ * Refuses to wipe a good snapshot with an empty/failed scrape.
+ */
 export function applyEconomicCalendarSnapshot(
     events: unknown[],
     scrapedAt: number = Date.now(),
 ): EconomicCalendarEvent[] {
     const data = events.map(normalizeEvent).filter((e): e is EconomicCalendarEvent => e !== null);
+
+    if (data.length === 0) {
+        if (snapshot?.data?.length) {
+            logger.warn(
+                `[EconomicCalendar] Ignoring empty ingest — keeping existing ${snapshot.data.length} event(s)`,
+            );
+            return snapshot.data;
+        }
+        logger.warn('[EconomicCalendar] Empty ingest and no prior snapshot');
+        return [];
+    }
+
+    // Guard against truncated scrapes wiping a full week (e.g. only Monday rows).
+    const prevCount = snapshot?.data?.length ?? 0;
+    if (prevCount >= 40 && data.length < Math.floor(prevCount * 0.35)) {
+        logger.warn(
+            `[EconomicCalendar] Ignoring truncated ingest (${data.length} vs prior ${prevCount}) — keeping existing snapshot`,
+        );
+        return snapshot!.data;
+    }
+
     snapshot = {
         data,
         scrapedAt: Number.isFinite(scrapedAt) ? scrapedAt : Date.now(),
     };
+    persistSnapshot(snapshot);
     logger.info(`[EconomicCalendar] Applied webhook snapshot: ${data.length} event(s)`);
     return data;
 }
 
 /** Last scraped snapshot, if any — instant, never triggers a scrape. */
 export function getEconomicCalendarSnapshot(): Snapshot | null {
+    if (!snapshot?.data?.length) {
+        const restored = loadPersistedSnapshot();
+        if (restored) snapshot = restored;
+    }
     return snapshot;
 }

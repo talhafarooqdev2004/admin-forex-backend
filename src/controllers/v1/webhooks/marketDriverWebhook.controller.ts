@@ -9,9 +9,13 @@ import { websocketService } from '../../../services/websocket.service.js';
 
 const WEBHOOK_HEADER = 'x-scraper-webhook-key';
 
+/** Prevent overlapping full-feed classify runs (200+ headlines can take minutes). */
+let ingestInFlight: Promise<void> | null = null;
+
 /**
- * Receives raw FinancialJuice RSS items from forex-scraping.
- * Dedup / Groq classify / Prisma store remain on this backend.
+ * Receives raw FinancialJuice + FXStreet RSS items from forex-scraping.
+ * Accepts the full feed immediately, then classifies ALL fresh items in the background
+ * (Groq batches) so HTTP timeouts never truncate a large first scrape.
  */
 export const ingestMarketDriverRss = async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -27,16 +31,43 @@ export const ingestMarketDriverRss = async (req: Request, res: Response, next: N
             throw new ApiError(HTTP_STATUS.BAD_REQUEST, 'items array is required');
         }
 
-        const result = await ingestMarketDriverRssItems(items);
-        if (result.changed) {
-            websocketService.emitCalendarNewsUpdate('market-driver');
+        const received = items.length;
+        const alreadyRunning = Boolean(ingestInFlight);
+
+        if (!ingestInFlight) {
+            // Copy payload so the request body isn't relied on after the response is sent.
+            const payload = items.slice();
+            ingestInFlight = (async () => {
+                try {
+                    const result = await ingestMarketDriverRssItems(payload);
+                    if (result.changed) {
+                        websocketService.emitCalendarNewsUpdate('market-driver');
+                    }
+                    logger.info(
+                        `[MarketDriverWebhook] Full-feed ingest done: received=${result.received} fresh=${result.fresh} stored=${result.stored} changed=${result.changed}`,
+                    );
+                } catch (err) {
+                    logger.error(
+                        `[MarketDriverWebhook] Background ingest failed: ${err instanceof Error ? err.message : String(err)}`,
+                        err,
+                    );
+                } finally {
+                    ingestInFlight = null;
+                }
+            })();
+        } else {
+            logger.warn(
+                `[MarketDriverWebhook] Ingest already running — accepted ${received} item(s) but skipped overlapping classify`,
+            );
         }
 
-        logger.info(
-            `[MarketDriverWebhook] Ingested RSS batch: received=${result.received} fresh=${result.fresh} stored=${result.stored} changed=${result.changed}`,
+        res.status(HTTP_STATUS.OK).json(
+            successResponse('Market driver RSS accepted for full-feed classify', {
+                received,
+                processing: !alreadyRunning,
+                skippedOverlap: alreadyRunning,
+            }),
         );
-
-        res.status(HTTP_STATUS.OK).json(successResponse('Market driver RSS ingested successfully', result));
     } catch (error) {
         next(error);
     }

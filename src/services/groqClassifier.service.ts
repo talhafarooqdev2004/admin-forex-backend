@@ -35,53 +35,94 @@ export type ClassifiedHeadline = {
 };
 
 /**
- * Directional + asset + summary rules distilled from the automation-rules doc (§1, §3, §21–§25, §32, §34).
- * Dedup is reported as a SEPARATE sparse list (not a per-item pointer) — models otherwise anchor on index 0.
+ * Directional + asset + summary rules distilled from the automation-rules doc
+ * (§1, §3, §4, §21–§25, §32, §34) + families observed on FinancialJuice + FXStreet feeds.
+ *
+ * DESIGN: Groq is the primary classifier for ANY new wording. Sanitize is only a thin
+ * universal safety net. Do NOT add person/event-specific code when a new headline appears —
+ * improve this prompt / universal families instead.
  */
-const SYSTEM_PROMPT = `You are a forex Market Driver Board classifier for Forex Fundamental Edge.
+const SYSTEM_PROMPT = `You are the Market Driver Board classifier for Forex Fundamental Edge.
 
-TRACKED ASSETS ONLY (doc §1): USD, EUR, GBP, JPY, CHF, CAD, AUD, NZD, GOLD, OIL.
-OIL means Crude Oil / WTI / Brent / OPEC crude supply — NOT natural gas, diesel, gasoline, heating oil, or power.
+════════════════════════════════════════
+TRACKED ASSETS ONLY (doc §1) — nothing else goes on the News Headline board:
+USD, EUR, GBP, JPY, CHF, CAD, AUD, NZD, GOLD, OIL
+OIL = crude / WTI / Brent / OPEC crude / Hormuz crude shipping risk — NOT nat gas, diesel, gasoline, power.
+Silver/XAG, Bitcoin/crypto, SGD/MYR/TWD, single stocks, local politics without FX → IRRELEVANT.
+════════════════════════════════════════
 
-For each headline ("i. text") return:
-1) category:
-   - ECONOMIC = scheduled data releases (CPI, GDP, PMI, NFP, retail sales, unemployment)
-   - DRIVER = CB speeches/guidance, yields, intervention, risk-on/off, OPEC/crude supply, sanctions/tariffs, fiscal
-   - GEOPOLITICAL = war, strikes, ceasefire, Hormuz/energy-route risk, nuclear talks, military escalation
-   - IRRELEVANT = crypto, single stocks, pure technicals, sports, celebrity, local non-market news, OR no CLEAR direct effect on a tracked asset
-2) assets: ONLY assets DIRECTLY affected. Empty when IRRELEVANT. Do NOT invent a weak link.
-3) impact: High | Medium | Low (materiality for markets)
-4) For each asset: bias = Bullish | Bearish | Neutral | Mixed, and score MUST match impact:
-   - High + Bullish → +1; High + Bearish → -1
-   - Medium + Bullish → +0.5; Medium + Bearish → -0.5
-   - Low → score 0 + bias Neutral
-   - Neutral/Mixed bias → score 0
-5) summary: short REASON for the PRIMARY (highest-|score|) asset (<= 8 words). Must explain WHY for THAT asset, never a truncated headline.
-   If assets include OIL + GOLD + USD, write the reason for the strongest score (usually OIL on energy risk) — e.g. "Escalation raises oil risk", not a gold/USD line.
-   If CAD is tagged from crude, say how oil affects CAD: "Oil weakness weighs on CAD".
-   Good: "Escalation raises oil risk", "Talks ease Hormuz risk", "Hawkish Fed supports USD", "Brent settle confirms oil weakness"
-   Bad: "US demands Iran", "Iran tensions", "N Korea-China", "Fire in Iran", "Pakistan-Iran talks"
+Return for each headline ("i. text"):
+1) category — pick ONE using the FAMILY MAP below
+2) assets — only DIRECTLY affected tracked assets (empty if IRRELEVANT)
+3) impact — High | Medium | Low
+4) per asset: bias Bullish|Bearish|Neutral|Mixed + score matching impact
+   High± → ±1 · Medium± → ±0.5 · Low/Neutral/Mixed → 0
+5) summary — short WHY for the primary (highest |score|) asset (≤8 words). Not a truncated headline.
 
-ASSET RULES (strict — wrong asset is worse than IRRELEVANT):
-- Tag OIL only for crude/WTI/Brent price moves, OPEC, crude supply disruption, Hormuz/shipping crude risk, Iran energy escalation that affects crude, crude-linked sanctions.
-- Natural gas / diesel / gasoline / heating-oil futures alone → IRRELEVANT (not OIL).
-- A local industrial fire, routine political speech, or North Korea–China alliance with NO energy/oil/sanctions/supply angle → IRRELEVANT (do not force OIL).
-- Vague "leader will speak" / funeral messaging with no policy content → IRRELEVANT or Low Neutral — do NOT force USD.
-- Fed/macro reports that only mention Middle East as background → do NOT auto-tag OIL unless the headline is about crude/energy risk itself.
-- Risk-off fear → may be USD/JPY/CHF/GOLD. Risk-on relief → may be AUD/NZD/CAD.
-- Rising crude → OIL + CAD bullish. Falling crude → OIL + CAD bearish.
-- Russia / energy-buyer sanctions that threaten crude supply → BULLISH OIL (supply risk), not bearish.
-- Escalation (attack, carriers in missile range, military options, blockade, Hormuz threat) → bullish OIL/GOLD as relevant. Do NOT also tag USD/JPY/CHF unless the headline explicitly mentions risk-off, the dollar, Fed, or yields.
-- De-escalation (talks, ceasefire, restraint urges, mediation) → bearish OIL/GOLD, or Neutral 0 if no outcome yet. Same: no automatic USD tag.
-- Do not score bullish merely because a conflict zone is named — read escalation vs diplomacy.
-- Doc §21: do not assign a score to an asset unless the headline DIRECTLY affects it.
+════════════════════════════════════════
+FAMILY MAP (universal — works for any date / any official name)
+════════════════════════════════════════
 
-DEDUPLICATION (doc §3) — report separately. Same underlying event = one driver.
-Duplicates = same specific announcement/statement/release restated (including near-paraphrases from one briefing).
-NOT duplicates = same region/topic but different facts (e.g. Brent settle vs Iran nuclear demand).
+A) ECONOMIC (Currency Health calendar — NOT News Headline board)
+   Scheduled prints: Actual/Forecast/Previous, CPI/GDP/PMI/NFP/retail/jobless/confidence indexes with figures,
+   China trade surplus/exports/imports/customs shipment tonnage, Korea investment stats, capacity utilization prints.
+   → category ECONOMIC. May tag related FX for macro scoring, but this is NOT a Market Driver wrap.
+
+B) DRIVER — FX / policy market commentary (News Headline if impact High|Medium + assets)
+   • Forex Today wraps
+   • Pair headlines: EUR/USD, GBP/USD, USD/JPY, AUD/USD, NZD/USD, USD/CAD, USD/CNY, EUR/JPY, XAU/USD, DXY
+   • Named major currency moves: Euro/Yen/Yuan/Pound/Aussie/Kiwi/Loonie/US Dollar + gains/falls/climbs/rallies/weakens/consolidates/slides/buckles/posts/bounces
+   • Gold / WTI / Brent price forecast or spike/tumble/bounce wraps
+   • Any G10/PBOC/SNB central-bank speech, guidance, minutes, chief economist, governor quotes (ANY person name)
+   • PBOC / yuan midpoint / USD/CNY reference fixing
+   • Japan MoF / finance minister / GPIF portfolio / foreign-investment / asset-appeal comments that can move JPY
+     (status-quo "no change" / "no comment" alone → Low or IRRELEVANT)
+
+C) GEOPOLITICAL — conflict / energy-route risk (News Headline if High|Medium + assets)
+   CENTCOM, IRGC, Revolutionary Guards, missiles, strikes, tankers, Hormuz, blockade, airspace intercepts,
+   Trump/US–Iran military actions, troop deployments tied to Middle East conflict.
+   Default asset OIL (bullish on escalation). Add USD only if dollar/Fed/Trump FX angle is explicit.
+   Pure diplomacy/talks with no outcome → Neutral 0 / possible bearish OIL if clear de-escalation.
+
+D) IRRELEVANT — never board
+   Crypto coins, silver/XAG-only, SGD/MYR/TWD-only, India retail gold price, Nvidia/stocks, North Korea visits,
+   local sirens with no market link, Banu/odds noise, pure chart technicals with no macro driver.
+
+CRITICAL DISAMBIGUATION (common Groq mistakes — never repeat):
+- "Euro posts gains as traders await CPI" → DRIVER (FX wrap), NOT ECONOMIC
+- "Yen consolidates… Fed's Warsh" → DRIVER, NOT ECONOMIC
+- "RBNZ's X: inflation to return to 2%" → DRIVER NZD ≥ Medium, NOT ECONOMIC/IRRELEVANT/Low
+- "US CENTCOM… strikes on Iran" → GEOPOLITICAL OIL High, NOT IRRELEVANT
+- "China June trade surplus … billion" → ECONOMIC, NOT DRIVER
+- "Bitcoin / XRP / Silver XAG…" → IRRELEVANT
+- "Malaysian Ringgit / Singapore Dollar…" → IRRELEVANT (not tracked)
+
+FEW-SHOT (learn the pattern, generalize to new wording):
+1. "EUR/JPY Price Forecast: Gains ground to near 185.00" → DRIVER Medium · EUR (+JPY ok) · Positive pair momentum
+2. "New Zealand dollar climbs 0.51% to 0.5775" → DRIVER Medium · NZD Bullish
+3. "PBOC sets USD/CNY reference rate at 6.7990" → DRIVER Medium · USD Neutral/mild
+4. "RBNZ chief economist: additional easing probably needed" → DRIVER Medium · NZD (dovish → Bearish if clear)
+5. "Japan finance minister: GPIF portfolio review if environment shifts" → DRIVER Medium · JPY Neutral
+6. "US CENTCOM says forces complete new strikes on Iranian targets" → GEOPOLITICAL High · OIL Bullish
+7. "Iranian missiles hit two UAE tankers in Hormuz" → GEOPOLITICAL High · OIL Bullish
+8. "WTI spikes amid escalating Middle East tensions" → DRIVER or GEOPOLITICAL High/Medium · OIL Bullish
+9. "Forex Today: US Dollar surges as Hormuz tensions send Oil higher" → DRIVER High/Medium · USD + OIL as relevant
+10. "China Exports (YoY) Actual 27% (Forecast 18.2%)" → ECONOMIC Medium · not a News Driver wrap
+11. "Bitcoin holds at $62,000" → IRRELEVANT
+12. "Silver Price Forecast: XAG/USD dips…" → IRRELEVANT
+13. "Singapore Dollar: Upside risks – OCBC" → IRRELEVANT
+
+ASSET TAGGING STRICTNESS:
+- Wrong asset is worse than IRRELEVANT.
+- Do NOT auto-add CAD on every oil story unless Canada/CAD/loonie/BoC is named.
+- Do NOT auto-add USD/JPY/CHF safe-haven on every Iran headline unless risk-off/dollar/Fed is explicit.
+- Escalation → bullish OIL/GOLD as relevant. De-escalation/talks → bearish OIL/GOLD or Neutral 0.
+
+DEDUPLICATION (doc §3) — separate lists:
+Same specific announcement restated = duplicate. Same region but different facts = NOT duplicate.
 When unsure, do NOT mark duplicate.
-- duplicateGroups: [[principal, dup, ...], ...] within this batch (earliest/clearest index first). [] if none.
-- existingDuplicates: [{"i": batchIndex, "existingId": "id"}] only for same-event matches to EXISTING topics. [] if none.
+- duplicateGroups: [[principal, dup, ...], ...]
+- existingDuplicates: [{"i": batchIndex, "existingId": "id"}]
 
 Respond ONLY with JSON:
 {"results":[{"i":0,"category":"...","impact":"...","assets":[{"asset":"...","bias":"...","score":0}],"summary":"..."}],"duplicateGroups":[],"existingDuplicates":[]}
@@ -237,9 +278,14 @@ function jaccard(a: Set<string>, b: Set<string>): number {
     return union === 0 ? 0 : inter / union;
 }
 
-/** High-precision same-event fingerprints for common wire paraphrases (doc §3). */
-function eventFingerprint(headline: string): string | null {
-    const h = headline.toLowerCase();
+/**
+ * High-precision same-event fingerprints for common wire paraphrases (doc §3).
+ * Same fingerprint → one Market Catalyst count (and deterministic duplicate_of).
+ * Distinct facts / escalations get different keys so they still count separately.
+ */
+export function eventFingerprint(headline: string): string | null {
+    const h = headline.toLowerCase().replace(/\s+/g, ' ').trim();
+
     if (/\biran/.test(h) && /nuclear/.test(h) && /(deal|pact|agreement|no deal|no pact)/.test(h)) {
         return 'iran-nuclear-deal-officials';
     }
@@ -260,6 +306,64 @@ function eventFingerprint(headline: string): string | null {
     if (/north korea|n\.?\s*korea/.test(h) && /china/.test(h) && /(alliance|ties|commitment)/.test(h)) {
         return 'nkorea-china-ties';
     }
+
+    // Force-posture headlines are not the same event as strike waves.
+    if (
+        /\b(centcom|u\.?s\.|us)\b/.test(h) &&
+        /\b(troops?|deployed|presence)\b/.test(h) &&
+        /\b(middle east|iran|centcom)\b/.test(h) &&
+        !/\b(strike|strikes|targets? hit)\b/.test(h)
+    ) {
+        return 'us-me-force-posture';
+    }
+
+    // US / CENTCOM strike wave paraphrases on Iran (doc §3 restatements).
+    if (
+        /\biran/.test(h) &&
+        /\b(centcom|u\.?s\.?\s+forces|us forces|u\.?s\.?\s+hits|us hits|cnn reports)\b/.test(h) &&
+        /\b(strike|strikes|targets? hit|precision weapons|military (sites|targets)|coastal (defense|defence|surveillance)|missile and drone)\b/.test(
+            h,
+        )
+    ) {
+        return 'us-iran-military-strikes';
+    }
+
+    // Trump-on-Iran briefing bullets — split by distinct ask, collapse paraphrases of the same ask.
+    if (/\btrump on iran\b/.test(h) || (/\btrump\b/.test(h) && /\biran\b/.test(h) && /\b(planning|seeks|believes|dismantl|targeting)\b/.test(h))) {
+        if (/\b(strike|monday night|significant strike)\b/.test(h)) return 'trump-iran-strike-plan';
+        if (/\b(deal|achievable|negotiat)\b/.test(h)) return 'trump-iran-deal';
+        if (/\b(hormuz|compensation|shielding|toll|shipping)\b/.test(h)) return 'trump-iran-hormuz';
+        if (/\b(dismantl|offensive strength|capabilit)/.test(h)) return 'trump-iran-capability';
+        return 'trump-iran-remarks';
+    }
+
+    // Hormuz waterway / tanker / toll disruption cluster.
+    if (/\bhormuz\b/.test(h) && /\b(tankers?|shipping|waterway|reopening|strait|toll|irgc|missiles?)\b/.test(h)) {
+        return 'hormuz-shipping-disruption';
+    }
+
+    if (/\biran/.test(h) && /\bjordan/.test(h) && /\b(missiles?|ballistic|intercept|air ?base|airspace)\b/.test(h)) {
+        return 'iran-jordan-missile';
+    }
+
+    if (/\bbahrain\b/.test(h) && /\b(sirens?|radars?|c-ram|patriot|fifth fleet)\b/.test(h)) {
+        return 'bahrain-iran-alert';
+    }
+
+    // Broader Gulf spillover (missiles/sirens/airspace) when the specific keys above miss.
+    if (
+        /\biran/.test(h) &&
+        /\b(bahrain|jordan|uae|qatar|kuwait)\b/.test(h) &&
+        /\b(missiles?|sirens?|airspace|intercept|radars?|patriot|air ?base|tankers?)\b/.test(h)
+    ) {
+        return 'iran-gulf-spillover';
+    }
+
+    // WTI/Brent price reaction to the same ME supply shock — one catalyst, not every wire.
+    if (/\b(wti|brent|crude)\b/.test(h) && /\b(spike|spikes|advances?|forecast|four-week|near \$\d|middle east|hormuz)\b/.test(h)) {
+        return 'wti-me-price-move';
+    }
+
     return null;
 }
 
@@ -284,6 +388,31 @@ export function likelySameEvent(a: string, b: string): boolean {
     const filler = new Set(['senior', 'officials', 'official', 'says', 'said', 'news', 'post', 'citing']);
     const topicShared = shared.filter((t) => !filler.has(t));
     return jac >= 0.3 && topicShared.length >= 3;
+}
+
+/**
+ * Coarser OIL-only cluster for Market Catalyst (doc §3): many Iran/ME wires are
+ * distinct enough for News Headline, but must not each add +1 to OIL.
+ */
+export function oilCatalystCluster(headline: string): string | null {
+    const fp = eventFingerprint(headline);
+    if (fp) {
+        if (fp === 'iran-jordan-missile' || fp === 'bahrain-iran-alert' || fp === 'iran-gulf-spillover') {
+            return 'iran-gulf-spillover';
+        }
+        // Same Hormuz supply-risk thread (official ask + tanker/IRGC wires).
+        if (fp === 'trump-iran-hormuz' || fp === 'hormuz-shipping-disruption' || fp === 'iran-shipping-us-demands') {
+            return 'hormuz-shipping-disruption';
+        }
+        // One Trump Iran briefing → one OIL catalyst (strike plan stays separate as escalation).
+        if (fp === 'trump-iran-deal' || fp === 'trump-iran-capability' || fp === 'trump-iran-remarks') {
+            return 'trump-iran-briefing';
+        }
+        return fp;
+    }
+    const h = headline.toLowerCase();
+    if (/\b(ipsos|poll finds|% of americans)\b/.test(h) && /\biran/.test(h)) return 'iran-opinion-poll';
+    return null;
 }
 
 /**
@@ -367,6 +496,37 @@ export function stripWeakSafeHavenTags(headline: string, assets: ClassifiedAsset
     if (!headlineSupportsOil(headline)) return assets;
     if (headlineSupportsUsd(headline)) return assets;
     return assets.filter((a) => a.asset !== 'USD' && a.asset !== 'JPY' && a.asset !== 'CHF');
+}
+
+/** True when CAD is named / Canada policy is the story — not merely implied via crude. */
+export function headlineSupportsCad(headline: string): boolean {
+    return /\b(CAD|Canada|Canadian|loonie|BoC|Bank of Canada)\b/i.test(headline);
+}
+
+/**
+ * Keep Market Catalyst aligned with News Headline: oil/Hormuz wires show as OIL only,
+ * so do not mirror the same scores onto CAD unless Canada/CAD is in the headline.
+ */
+export function stripImpliedCadFromOil(headline: string, assets: ClassifiedAsset[]): ClassifiedAsset[] {
+    if (headlineSupportsCad(headline)) return assets;
+    return assets.filter((a) => a.asset !== 'CAD');
+}
+
+/**
+ * FX reaction wraps ("Pound buckles as…", "AUD weakens as US strikes…") are currency stories.
+ * Drop OIL so Market Catalyst does not stack every wrap onto OIL (doc §21 primary asset).
+ */
+export function stripOilFromFxReactionWrap(headline: string, assets: ClassifiedAsset[]): ClassifiedAsset[] {
+    const fxSubject =
+        /\b(british pound|pound sterling|\bgbp\b|euro|\beur\b|australian dollar|\baud\b|kiwi|\bnzd\b|new zealand dollar|yen|\bjpy\b|swiss franc|\bchf\b|loonie|\bcad\b|canadian dollar|u\.?s\.?\s*dollar|\busd\b|indian rupee|\binr\b)\b/i.test(
+            headline,
+        );
+    const reaction =
+        /\b(buckles?|weakens?|drifts?|falls?|slides?|drops?|rises?|gains?|jumps?|pressured|softens?|climbs?)\b/i.test(
+            headline,
+        );
+    if (!fxSubject || !reaction) return assets;
+    return assets.filter((a) => a.asset !== 'OIL');
 }
 
 /** Vague "will speak / funeral" headlines with no policy content should not force safe-haven tags. */
@@ -497,10 +657,23 @@ export function buildReasonSummary(
         return bullish ? `Risk-on supports ${asset}` : `Risk-on weighs on ${asset}`;
     }
 
-    // --- Directional generics tied to asset (still better than "Mild bullish driver") ---
+    // Neutral CB / fixing headlines — explain *why* bias is flat (not "unclear").
     if (neutral) {
+        if (/\b(inflation|cpi|price).{0,40}(return|back|toward|to)\b.{0,20}(2%|target|medium term)/i.test(h) ||
+            /\binflation expectations?.{0,20}(anchored|firm)/i.test(h)) {
+            return `Inflation on-target keeps ${asset} bias neutral`;
+        }
+        if (/\b(midpoint|fixing|reference rate)\b/i.test(h) && /\b(pboc|yuan|cny)\b/i.test(h)) {
+            return `Yuan fixing estimate leaves ${asset} bias neutral`;
+        }
+        if (/\b(rbnz|boe|ecb|fed|fomc|boc|rba|boj|pboc|conway|powell|waller|lagarde|bailey|ueda)\b/i.test(h)) {
+            if (/\b(not discussing|no vote|consensus|firmly anchored|medium term)\b/i.test(h)) {
+                return `Status-quo policy tone keeps ${asset} bias neutral`;
+            }
+            return `Policy comment keeps ${asset} bias neutral`;
+        }
         if (category === 'GEOPOLITICAL') return `Geopolitics leave ${asset} direction mixed`;
-        return `Headline leaves ${asset} direction unclear`;
+        return `No clear directional signal for ${asset}`;
     }
     if (asset === 'OIL' || asset === 'GOLD') {
         return bullish ? 'Escalation supports risk premium' : 'Relief pressure weighs on risk premium';
@@ -539,8 +712,190 @@ export function ensureReasonSummary(
     return buildReasonSummary(headline, impact, assets, category);
 }
 
+/** Scheduled print with actual/forecast figures — true ECONOMIC calendar row (doc §4 A). */
+function isScheduledDataReleaseHeadline(headline: string): boolean {
+    const h = headline.toLowerCase();
+    // Explicit Actual/Forecast release phrasing (FinancialJuice data alerts).
+    if (/\bactual\b/.test(h) && /\b(forecast|previous)\b/.test(h)) return true;
+    // China / customs trade surplus & shipment prints → calendar ECONOMIC, not FX wraps.
+    if (/\bchina\b/.test(h) && /\b(trade surplus|trade balance|exports|imports|customs)\b/.test(h)) return true;
+    // Classic named prints with a number, excluding FX market wraps / fixings.
+    if (
+        /\b(gdp|cpi|ppi|nfp|nonfarm|payrolls|pmi|retail sales|unemployment rate|jobless claims|interest rate decision|business confidence|business conditions|consumer confidence|capacity utilization|wholesale price)\b/.test(
+            h,
+        ) &&
+        /\d/.test(h) &&
+        !/\b(forex today|price forecast|consolidat|rallies|weakens|gains on|posts modest|surges as|slides as|reference rate|pboc sets)\b/.test(
+            h,
+        )
+    ) {
+        return true;
+    }
+    return false;
+}
+
 /**
- * Post-LLM sanitizer so stored rows match doc §1/§21/§22/§34 even when the model drifts.
+ * FX market commentary / pair wraps that appear on FinancialJuice Forex tab (FXStreet).
+ * These are Market Drivers (doc §4 B), not Currency Health economic releases.
+ */
+function isFxMarketCommentaryHeadline(headline: string): boolean {
+    const h = headline.toLowerCase();
+    if (/\bforex today\b/.test(h)) return true;
+    if (/\b(eur\/usd|gbp\/usd|usd\/jpy|aud\/usd|nzd\/usd|usd\/cad|usd\/cny|eur\/jpy|gbp\/jpy|xau\/usd)\b/.test(h)) return true;
+    if (
+        /\b(euro|yen|yuan|pound|sterling|loonie|kiwi|aussie|us dollar|canadian dollar|new zealand dollar|australian dollar|british pound|chinese yuan|gold|xau)\b/.test(
+            h,
+        ) &&
+        /\b(gains|falls|fell|rallies|rally|weakens|weaken|consolidat|surges|slides|buckles|posts|holds near|awaits?|look to|sharper drop|reference rate|climbs|rose|falls to|rises|bounces|tumbles|recovers)\b/.test(
+            h,
+        )
+    ) {
+        return true;
+    }
+    if (/\b(wti|brent)\b/.test(h) && /\b(spike|spikes|surge|tumble|jump|fall|gain|oil)\b/.test(h)) return true;
+    if (/\b(rbnz|boc|boe|ecb|fed|pboc|boj|rba)\b/.test(h) && /\b(dollar|yen|euro|pound|aussie|kiwi|loonie|yuan|cny)\b/.test(h)) {
+        return true;
+    }
+    // Spot FX print: "New Zealand dollar climbs 0.51% to 0.5775"
+    if (
+        /\b(us dollar|euro|yen|pound|aussie|kiwi|loonie|canadian dollar|australian dollar|new zealand dollar)\b/.test(h) &&
+        /\b(climbs|falls|rises|drops)\b/.test(h) &&
+        /\d/.test(h)
+    ) {
+        return true;
+    }
+    return false;
+}
+
+/** Doc §4 B / §21 — CB speeches & guidance are Market Drivers (not ECONOMIC prints). */
+function isCentralBankSpeechHeadline(headline: string): boolean {
+    const h = headline.toLowerCase();
+    const bank =
+        /\b(rbnz|boe|ecb|fed|fomc|boc|rba|boj|pboc|snb)\b/.test(h) ||
+        /\breserve bank of (nz|new zealand|australia|canada)\b/.test(h) ||
+        /\b(bank of england|bank of japan|european central bank|federal reserve|people'?s bank of china)\b/.test(h);
+    // Universal: bank + speech/guidance markers (any official). Person names are optional boosters only.
+    const speechCue =
+        /\b(says|said|speech|guidance|minutes|chief economist|governor|president)\b/.test(h) ||
+        /:/.test(h) ||
+        /\b(midpoint|fixing|reference rate)\b/.test(h);
+    return bank && speechCue && !isScheduledDataReleaseHeadline(headline);
+}
+
+function centralBankToAsset(headline: string): TrackedAsset | null {
+    const h = headline.toLowerCase();
+    if (/\b(rbnz|reserve bank of (nz|new zealand))\b/.test(h)) return 'NZD';
+    if (/\b(rba|reserve bank of australia)\b/.test(h)) return 'AUD';
+    if (/\b(boc|reserve bank of canada)\b/.test(h)) return 'CAD';
+    if (/\b(boe|bank of england)\b/.test(h)) return 'GBP';
+    if (/\b(ecb|european central bank)\b/.test(h)) return 'EUR';
+    if (/\b(boj|bank of japan)\b/.test(h)) return 'JPY';
+    if (/\b(fed|fomc|federal reserve)\b/.test(h)) return 'USD';
+    if (/\b(pboc|people'?s bank of china)\b/.test(h)) return 'USD';
+    if (/\bsnb\b/.test(h)) return 'CHF';
+    return null;
+}
+
+/** Doc §4 C — war/strikes/Hormuz/Iran military = Geopolitical. */
+function isGeopoliticalConflictHeadline(headline: string): boolean {
+    const h = headline.toLowerCase();
+    const conflict =
+        /\b(centcom|irgc|revolutionary guards|missile|missiles|ballistic|strike|strikes|hormuz|ceasefire|truce|patriot|airspace|tanker|tankers|blockade|sirens?)\b/.test(
+            h,
+        ) || /\biran/.test(h);
+    const actor =
+        /\b(us|u\.s\.|u\.s|trump|military|israel|jordan|bahrain|fleet|navy|war|troops|uae|iran|fars news)/.test(h);
+    return conflict && actor;
+}
+
+/** Doc §1 — crypto / non-tracked metals / Asia exotics alone are never board drivers. */
+function isDocIgnoredHeadline(headline: string): boolean {
+    const h = headline.toLowerCase();
+    if (/\b(bitcoin|ethereum|xrp|crypto|btc|eth|solana|dogecoin)\b/.test(h)) return true;
+    if (/\b(silver|xag)\b/.test(h) && !/\b(gold|xau)\b/.test(h)) return true;
+    if (
+        /\b(sgd|myr|twd|taiwan|singapore dollar|ringgit|malaysian)\b/.test(h) &&
+        !/\b(usd|eur|gbp|jpy|aud|nzd|cad|cny|oil|gold|xau|fed|ecb)\b/.test(h)
+    ) {
+        return true;
+    }
+    if (/\bindia gold price today\b/.test(h)) return true;
+    return false;
+}
+
+/**
+ * Universal: Japan MoF / GPIF / pension portfolio comments that can move JPY flows.
+ * Status-quo "no change/no comment" stays insignificant (Low).
+ */
+function isJapanPortfolioPolicyHeadline(headline: string): boolean {
+    const h = headline.toLowerCase();
+    if (!/\b(japan|japanese)\b/.test(h) && !/\bgpif\b/.test(h)) return false;
+    if (!/\b(finance minister|finmin|fin min|gpif|pension)\b/.test(h)) return false;
+    if (/\b(no change|no comment|follow rules set)\b/.test(h)) return false;
+    return /\b(portfolio|asset (management|allocation|appeal)|foreign invest|boosting appeal)\b/.test(h);
+}
+
+function trackedAssetHintsFromHeadline(headline: string): TrackedAsset[] {
+    const h = headline.toLowerCase();
+    const out: TrackedAsset[] = [];
+    const add = (a: TrackedAsset) => {
+        if (!out.includes(a)) out.push(a);
+    };
+    if (/\b(us dollar|u\.s\. dollar|\busd\b|dollar index|\bdxy\b|fed\b|fomc)\b/.test(h)) add('USD');
+    if (/\b(euro|eur\/usd|eur\/jpy|\beur\b|ecb)\b/.test(h)) add('EUR');
+    if (/\b(yen|usd\/jpy|eur\/jpy|gbp\/jpy|\bjpy\b|boj)\b/.test(h)) add('JPY');
+    if (/\b(pound|sterling|gbp\/usd|gbp\/jpy|\bgbp\b|boe)\b/.test(h)) add('GBP');
+    if (/\b(canadian dollar|loonie|usd\/cad|\bcad\b|boc)\b/.test(h)) add('CAD');
+    if (/\b(australian dollar|aussie|aud\/usd|\baud\b|rba|reserve bank of australia)\b/.test(h)) add('AUD');
+    if (/\b(new zealand dollar|kiwi|nzd\/usd|\bnzd\b|rbnz|reserve bank of (nz|new zealand))\b/.test(h)) add('NZD');
+    if (/\b(swiss|\bchf\b|snb)\b/.test(h)) add('CHF');
+    if (/\b(gold|xau)\b/.test(h)) add('GOLD');
+    if (/\b(wti|brent|crude|\boil\b|opec|hormuz)\b/.test(h) && !/\bheating oil|natural gas|gasoline\b/.test(h)) {
+        add('OIL');
+    }
+    // USD/CNY or yuan vs dollar still affects USD.
+    if (/\b(yuan|cny|pboc|usd\/cny)\b/.test(h)) add('USD');
+    return out;
+}
+
+function biasFromMoveLanguage(headline: string): AssetBias {
+    if (/\b(gains|rallies|surges|spikes|lifts|supports|climbs|rises|strengthens|advances)\b/i.test(headline)) {
+        return 'Bullish';
+    }
+    if (/\b(weakens|slides|falls|tumbles|buckles|weighs|drop|declines|tumbles)\b/i.test(headline)) {
+        return 'Bearish';
+    }
+    return 'Neutral';
+}
+
+function ensureAsset(
+    assets: ClassifiedAsset[],
+    asset: TrackedAsset,
+    impact: NewsImpact,
+    bias: AssetBias,
+): ClassifiedAsset[] {
+    if (assets.some((a) => a.asset === asset)) return assets;
+    const aligned = alignScoreToImpact(impact, bias, bias === 'Neutral' ? 0 : impact === 'High' ? 1 : 0.5);
+    return [...assets, { asset, bias: aligned.bias, score: aligned.score }].slice(0, 3);
+}
+
+/** Board visibility rule used by News Headline / Catalyst (doc §22/§34). */
+export function isBoardVisibleClassification(input: {
+    category: string;
+    impact: string;
+    assets: ClassifiedAsset[];
+    duplicateOf?: string | null;
+}): boolean {
+    if (input.duplicateOf) return false;
+    if (!['DRIVER', 'GEOPOLITICAL'].includes(String(input.category).toUpperCase())) return false;
+    if (!['High', 'Medium'].includes(input.impact)) return false;
+    return Array.isArray(input.assets) && input.assets.length > 0;
+}
+
+/**
+ * Post-LLM sanitizer — UNIVERSAL doc rules only.
+ * Recovers Groq drift so FJ/FXS headlines that belong on the board are not lost to
+ * ECONOMIC / IRRELEVANT / Low mislabels. Do not add person- or event-specific one-offs here.
  */
 export function sanitizeClassification(
     headline: string,
@@ -553,12 +908,12 @@ export function sanitizeClassification(
 ): Omit<ClassifiedHeadline, 'index' | 'duplicateOfExistingId' | 'duplicateOfBatchIndex'> {
     let { category, impact, assets, summary } = input;
 
-    if (isNonCrudeEnergyHeadline(headline)) {
+    if (isDocIgnoredHeadline(headline) || isNonCrudeEnergyHeadline(headline)) {
         return {
             category: 'IRRELEVANT',
             impact: 'Low',
             assets: [],
-            summary: 'Non-crude energy product ignored',
+            summary: isDocIgnoredHeadline(headline) ? 'Outside tracked-asset universe' : 'Non-crude energy product ignored',
         };
     }
 
@@ -571,6 +926,12 @@ export function sanitizeClassification(
         };
     }
 
+    // Doc §4 A: scheduled data prints belong on Economic Calendar, not News Headline.
+    if (isScheduledDataReleaseHeadline(headline) && !isFxMarketCommentaryHeadline(headline)) {
+        category = 'ECONOMIC';
+        // Keep whatever assets Groq assigned for Currency Health; board filters ECONOMIC out.
+    }
+
     // Drop OIL tags with no crude / ME-energy basis (stops N Korea→OIL, local fire→OIL, etc.).
     if (assets.some((a) => a.asset === 'OIL') && !headlineSupportsOil(headline)) {
         assets = assets.filter((a) => a.asset !== 'OIL');
@@ -578,6 +939,7 @@ export function sanitizeClassification(
 
     // Oil/Iran energy stories must not also credit USD/JPY/CHF unless the headline is a real USD driver.
     assets = stripWeakSafeHavenTags(headline, assets);
+    assets = stripImpliedCadFromOil(headline, assets);
 
     // Denied / unfounded talks with no outcome → Neutral (do not force de-escalation).
     if (/\b(unfounded|denied|denies|no talks|not request(ed)? negotiations)\b/i.test(headline) && /\b(talks?|negotiat)/i.test(headline)) {
@@ -596,15 +958,85 @@ export function sanitizeClassification(
         assets.push({ asset: 'OIL', bias: aligned.bias, score: aligned.score });
     }
 
+    // Universal §4 B: FX market wraps → DRIVER ≥ Medium with tracked assets.
+    if (
+        isFxMarketCommentaryHeadline(headline) &&
+        !isScheduledDataReleaseHeadline(headline)
+    ) {
+        const hints = trackedAssetHintsFromHeadline(headline);
+        if (hints.length > 0 || assets.length > 0) {
+            if (category === 'ECONOMIC' || category === 'IRRELEVANT') category = 'DRIVER';
+            if (impact === 'Low') impact = 'Medium';
+            if (assets.length === 0 && hints.length > 0) {
+                const bias = biasFromMoveLanguage(headline);
+                const aligned = alignScoreToImpact(impact, bias, bias === 'Neutral' ? 0 : 0.5);
+                assets = hints.slice(0, 2).map((asset) => ({ asset, bias: aligned.bias, score: aligned.score }));
+            }
+        }
+    }
+
+    // Universal §4 B: CB speech / fixing / guidance → DRIVER ≥ Medium.
+    if (isCentralBankSpeechHeadline(headline)) {
+        if (category === 'ECONOMIC' || category === 'IRRELEVANT') category = 'DRIVER';
+        if (impact === 'Low') impact = 'Medium';
+        const hints = trackedAssetHintsFromHeadline(headline);
+        if (assets.length === 0 && hints.length > 0) {
+            const aligned = alignScoreToImpact(impact, 'Neutral', 0);
+            assets = hints.slice(0, 2).map((asset) => ({ asset, bias: aligned.bias, score: aligned.score }));
+        }
+        if (assets.length === 0) {
+            const bankAsset = centralBankToAsset(headline);
+            if (bankAsset) {
+                const aligned = alignScoreToImpact(impact, 'Neutral', 0);
+                assets = [{ asset: bankAsset, bias: aligned.bias, score: aligned.score }];
+            }
+        }
+    }
+
+    // Universal §4 C: conflict / Hormuz / military → GEOPOLITICAL with OIL.
+    if (isGeopoliticalConflictHeadline(headline) && !isScheduledDataReleaseHeadline(headline)) {
+        if (category === 'IRRELEVANT' || category === 'ECONOMIC') category = 'GEOPOLITICAL';
+        else if (
+            category === 'DRIVER' &&
+            /\b(centcom|irgc|missile|strike|hormuz|tanker|airspace|patriot|blockade|troops)\b/i.test(headline)
+        ) {
+            category = 'GEOPOLITICAL';
+        }
+        if (impact === 'Low') {
+            impact = /\b(strike|centcom|missile|tanker|hormuz|blockade)\b/i.test(headline) ? 'High' : 'Medium';
+        }
+        if (assets.length === 0 || (category === 'GEOPOLITICAL' && !assets.some((a) => a.asset === 'OIL'))) {
+            const aligned = alignScoreToImpact(impact, 'Bullish', impact === 'High' ? 1 : 0.5);
+            assets = [...assets.filter((a) => a.asset !== 'OIL'), { asset: 'OIL', bias: aligned.bias, score: aligned.score }];
+            if (/\b(trump|dollar|fed)\b/i.test(headline)) {
+                assets = ensureAsset(assets, 'USD', impact === 'High' ? 'Medium' : impact, 'Bullish');
+            }
+            assets = assets.slice(0, 3);
+        }
+    }
+
+    // After geo can force OIL: currency reaction wraps stay on the FX subject (doc §21).
+    assets = stripOilFromFxReactionWrap(headline, assets);
+
+    // Universal: Japan MoF / GPIF portfolio policy → DRIVER JPY.
+    if (isJapanPortfolioPolicyHeadline(headline)) {
+        if (category === 'IRRELEVANT' || category === 'ECONOMIC') category = 'DRIVER';
+        if (impact === 'Low') impact = 'Medium';
+        const bias = /\b(boost|appeal|rise|attract)\b/i.test(headline) ? ('Bullish' as AssetBias) : ('Neutral' as AssetBias);
+        assets = ensureAsset(assets, 'JPY', impact, bias);
+    }
+
     assets = assets.map((a) => {
         const aligned = alignScoreToImpact(impact, a.bias, a.score);
         return { asset: a.asset, bias: aligned.bias, score: aligned.score };
     });
 
-    if (category === 'IRRELEVANT' || assets.length === 0) {
+    if (assets.length === 0) {
         category = 'IRRELEVANT';
-        assets = [];
         impact = 'Low';
+    } else if (category === 'IRRELEVANT') {
+        category = 'DRIVER';
+        if (impact === 'Low') impact = 'Medium';
     }
 
     summary = ensureReasonSummary(summary, headline, impact, assets, category);
@@ -638,10 +1070,10 @@ function coerceResult(
         const biasGuess: AssetBias = /bull/i.test(biasRaw)
             ? 'Bullish'
             : /bear/i.test(biasRaw)
-              ? 'Bearish'
-              : /mix/i.test(biasRaw)
-                ? 'Mixed'
-                : 'Neutral';
+                ? 'Bearish'
+                : /mix/i.test(biasRaw)
+                    ? 'Mixed'
+                    : 'Neutral';
 
         let rawScore = Number(o.score);
         if (!Number.isFinite(rawScore)) rawScore = 0;
@@ -684,7 +1116,7 @@ export async function classifyHeadlines(
 
     const existingBlock = existingTopics.length
         ? '\n\nEXISTING topics already stored today (id: text):\n' +
-          existingTopics.map((t) => `${t.id}: ${t.text.replace(/\s+/g, ' ').trim()}`).join('\n')
+        existingTopics.map((t) => `${t.id}: ${t.text.replace(/\s+/g, ' ').trim()}`).join('\n')
         : '\n\nEXISTING topics already stored today: (none yet)';
 
     const userContent =
