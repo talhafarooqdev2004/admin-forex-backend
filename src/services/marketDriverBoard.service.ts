@@ -4,7 +4,9 @@ import { logger } from '../utils/logger.util.js';
 import {
     classifyHeadlines,
     findBatchDuplicateMap,
+    groqDailyLimitRemainingMs,
     isBoardVisibleClassification,
+    isGroqDailyLimited,
     likelySameEvent,
     oilCatalystCluster,
     sanitizeClassification,
@@ -23,8 +25,8 @@ import {
  * (full feed — often 100–200+ items), so News Headline fills from one scrape.
  */
 const CLASSIFY_BATCH_SIZE = 12;
-/** Pause between Groq batches to stay under free-tier TPM. */
-const CLASSIFY_BATCH_GAP_MS = 6000;
+/** Free Groq TPM ~12k/min; each batch ≈4–5k tokens — 20s gap keeps most runs under TPM. */
+const CLASSIFY_BATCH_GAP_MS = 20000;
 
 /** Only DRIVER + GEOPOLITICAL headlines feed the board; ECONOMIC comes from the calendar, IRRELEVANT is dropped. */
 const BOARD_CATEGORIES = ['DRIVER', 'GEOPOLITICAL'];
@@ -463,6 +465,106 @@ export async function markTodaysDeterministicDuplicates(): Promise<number> {
     return marked;
 }
 
+/** Shared classify lock — webhook ingest + coverage-audit heal must never run Groq in parallel. */
+let marketDriverIngestInFlight = false;
+let lastMarketDriverIngestFinishedAtMs: number | null = null;
+
+/** Headlines left when TPD aborted mid-ingest — auto-resumed after Groq daily cooldown. */
+let deferredRssItems: Array<{ guid: string; title: string; source: string | null; pubDate: string }> = [];
+let deferredResumeTimer: ReturnType<typeof setTimeout> | null = null;
+
+export function isMarketDriverIngestRunning(): boolean {
+    return marketDriverIngestInFlight;
+}
+
+/** Ms since last ingest finished; `null` if one is running or none finished this process. */
+export function getMarketDriverIngestIdleMs(): number | null {
+    if (marketDriverIngestInFlight) return null;
+    if (lastMarketDriverIngestFinishedAtMs == null) return null;
+    return Date.now() - lastMarketDriverIngestFinishedAtMs;
+}
+
+export function getDeferredMarketDriverCount(): number {
+    return deferredRssItems.length;
+}
+
+function queueDeferredRssItems(
+    items: Array<{ guid: string; title: string; source: string | null; pubDate: string | null }>,
+): number {
+    const next = items
+        .filter((i) => i.pubDate)
+        .map((i) => ({
+            guid: i.guid,
+            title: i.title,
+            source: i.source,
+            pubDate: i.pubDate as string,
+        }));
+    if (next.length === 0) return 0;
+
+    const seen = new Set(deferredRssItems.map((d) => d.guid));
+    for (const item of next) {
+        if (seen.has(item.guid)) continue;
+        seen.add(item.guid);
+        deferredRssItems.push(item);
+    }
+    scheduleDeferredIngestResume();
+    return deferredRssItems.length;
+}
+
+function scheduleDeferredIngestResume(): void {
+    if (deferredRssItems.length === 0) return;
+    if (deferredResumeTimer) clearTimeout(deferredResumeTimer);
+
+    const waitMs = Math.max(groqDailyLimitRemainingMs() + 15_000, 30_000);
+    logger.warn(
+        `[MarketDriver] PARTIAL ingest — ${deferredRssItems.length} headline(s) queued; ` +
+            `auto-resume in ${Math.ceil(waitMs / 60000)}m (after Groq TPD cooldown). Board not final yet.`,
+    );
+    deferredResumeTimer = setTimeout(() => {
+        deferredResumeTimer = null;
+        void resumeDeferredMarketDriverIngest();
+    }, waitMs);
+}
+
+async function resumeDeferredMarketDriverIngest(): Promise<void> {
+    if (deferredRssItems.length === 0) return;
+    if (isGroqDailyLimited()) {
+        scheduleDeferredIngestResume();
+        return;
+    }
+    if (marketDriverIngestInFlight) {
+        scheduleDeferredIngestResume();
+        return;
+    }
+
+    const payload = deferredRssItems.slice();
+    deferredRssItems = [];
+    logger.info(`[MarketDriver] Resuming deferred classify for ${payload.length} headline(s)`);
+
+    try {
+        const { websocketService } = await import('./websocket.service.js');
+        const result = await ingestMarketDriverRssItems(payload);
+        if (result.ingestComplete && result.changed) {
+            websocketService.emitCalendarNewsUpdate('market-driver');
+            logger.info(
+                `[MarketDriver] Deferred resume COMPLETE: stored=${result.stored} fresh=${result.fresh} — board is final`,
+            );
+        } else if (!result.ingestComplete) {
+            logger.warn(
+                `[MarketDriver] Deferred resume still PARTIAL: deferred=${result.deferredCount} — waiting again`,
+            );
+        }
+    } catch (err) {
+        // Put them back so a later cron / resume can retry.
+        deferredRssItems = payload;
+        scheduleDeferredIngestResume();
+        logger.error(
+            `[MarketDriver] Deferred resume failed: ${err instanceof Error ? err.message : String(err)}`,
+            err,
+        );
+    }
+}
+
 /**
  * Ingest raw RSS items from forex-scraping: dedup → classify new items → store.
  * Safe to call on a webhook; no-ops cleanly on any failure.
@@ -477,6 +579,50 @@ export async function ingestMarketDriverRssItems(rawItems: unknown[]): Promise<{
     changed: boolean;
     realigned: number;
     classifyFailed?: boolean;
+    skippedOverlap?: boolean;
+    /** False when TPD aborted mid-run — remaining headlines are queued for auto-resume. */
+    ingestComplete: boolean;
+    deferredCount: number;
+}> {
+    const receivedCount = Array.isArray(rawItems) ? rawItems.length : 0;
+    if (marketDriverIngestInFlight) {
+        logger.warn(
+            `[MarketDriver] Ingest skipped — classify already running (accepted ${receivedCount} item(s) without overlapping Groq)`,
+        );
+        return {
+            received: receivedCount,
+            fresh: 0,
+            stored: 0,
+            carried: 0,
+            reclassified: 0,
+            changed: false,
+            realigned: 0,
+            skippedOverlap: true,
+            ingestComplete: false,
+            deferredCount: deferredRssItems.length,
+        };
+    }
+    marketDriverIngestInFlight = true;
+    try {
+        const result = await runMarketDriverIngest(rawItems);
+        const ingestComplete = result.deferredCount === 0;
+        return { ...result, ingestComplete };
+    } finally {
+        marketDriverIngestInFlight = false;
+        lastMarketDriverIngestFinishedAtMs = Date.now();
+    }
+}
+
+async function runMarketDriverIngest(rawItems: unknown[]): Promise<{
+    received: number;
+    fresh: number;
+    stored: number;
+    carried: number;
+    reclassified: number;
+    changed: boolean;
+    realigned: number;
+    classifyFailed?: boolean;
+    deferredCount: number;
 }> {
     const dayKey = marketDayKey();
     const repaired = await repairLockedDuplicates();
@@ -492,6 +638,7 @@ export async function ingestMarketDriverRssItems(rawItems: unknown[]): Promise<{
             reclassified: 0,
             changed: realigned > 0,
             realigned,
+            deferredCount: deferredRssItems.length,
         };
     }
 
@@ -541,6 +688,7 @@ export async function ingestMarketDriverRssItems(rawItems: unknown[]): Promise<{
 
     let stored = 0;
     let classifyFailed = false;
+    let deferredCount = 0;
     if (fresh.length > 0) {
         // Semantic dedup context (doc §3): principals from live + previous UAE day.
         const todaysPrincipals = await prisma.marketDriverNews.findMany({
@@ -580,8 +728,20 @@ export async function ingestMarketDriverRssItems(rawItems: unknown[]): Promise<{
                 existingTopics,
             );
             if (classified.length === 0) {
+                if (isGroqDailyLimited()) {
+                    const leftover = fresh.slice(i);
+                    deferredCount = queueDeferredRssItems(leftover);
+                    const left = Math.ceil(leftover.length / CLASSIFY_BATCH_SIZE);
+                    logger.error(
+                        `[MarketDriver] Stopping ingest early — Groq daily TPD limit hit; ` +
+                            `${left} batch(es) / ${leftover.length} headline(s) queued for auto-resume ` +
+                            `(same API key as local+prod burns one TPD bucket)`,
+                    );
+                    classifyFailed = true;
+                    break;
+                }
                 logger.error(
-                    `[MarketDriver] Groq returned 0 classifications for batch ${i / CLASSIFY_BATCH_SIZE + 1} (${chunk.length} headline(s)) — check GROQ_API_KEY`,
+                    `[MarketDriver] Groq returned 0 classifications for batch ${i / CLASSIFY_BATCH_SIZE + 1} (${chunk.length} headline(s)) — check GROQ_API_KEY / rate limits`,
                 );
                 continue;
             }
@@ -689,8 +849,13 @@ export async function ingestMarketDriverRssItems(rawItems: unknown[]): Promise<{
         }
 
         if (!classifiedAny) {
+            if (isGroqDailyLimited()) {
+                deferredCount = queueDeferredRssItems(fresh);
+            }
             logger.error(
-                `[MarketDriver] Groq stored nothing for ${fresh.length} fresh headline(s) — check GROQ_API_KEY on this server.`,
+                isGroqDailyLimited()
+                    ? `[MarketDriver] Groq stored nothing for ${fresh.length} fresh headline(s) — daily TPD limit exhausted (shared local+prod key). ${deferredCount} queued for auto-resume.`
+                    : `[MarketDriver] Groq stored nothing for ${fresh.length} fresh headline(s) — check GROQ_API_KEY on this server.`,
             );
             classifyFailed = true;
         }
@@ -700,7 +865,7 @@ export async function ingestMarketDriverRssItems(rawItems: unknown[]): Promise<{
     // (all IRRELEVANT / Low / wrong day). Reclassify a small batch so News Headline fills.
     let reclassified = 0;
     const boardCount = await countLiveBoardItems(dayKey);
-    if (boardCount === 0) {
+    if (boardCount === 0 && deferredCount === 0) {
         reclassified = await reclassifyFeedMatchedForEmptyBoard(dayKey, guids);
     }
 
@@ -716,6 +881,7 @@ export async function ingestMarketDriverRssItems(rawItems: unknown[]): Promise<{
         realigned,
         /** Present when fresh items arrived but Groq stored nothing — usually missing GROQ_API_KEY. */
         classifyFailed: classifyFailed || (fresh.length > 0 && stored === 0),
+        deferredCount,
     };
 }
 

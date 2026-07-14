@@ -4,13 +4,13 @@ import { HTTP_STATUS } from '../../../config/constants.js';
 import { ApiError } from '../../../exceptions/ApiError.js';
 import { successResponse } from '../../../utils/response.util.js';
 import { logger } from '../../../utils/logger.util.js';
-import { ingestMarketDriverRssItems } from '../../../services/marketDriverBoard.service.js';
+import {
+    ingestMarketDriverRssItems,
+    isMarketDriverIngestRunning,
+} from '../../../services/marketDriverBoard.service.js';
 import { websocketService } from '../../../services/websocket.service.js';
 
 const WEBHOOK_HEADER = 'x-scraper-webhook-key';
-
-/** Prevent overlapping full-feed classify runs (200+ headlines can take minutes). */
-let ingestInFlight: Promise<void> | null = null;
 
 /**
  * Receives raw FinancialJuice + FXStreet RSS items from forex-scraping.
@@ -32,27 +32,37 @@ export const ingestMarketDriverRss = async (req: Request, res: Response, next: N
         }
 
         const received = items.length;
-        const alreadyRunning = Boolean(ingestInFlight);
+        const alreadyRunning = isMarketDriverIngestRunning();
 
-        if (!ingestInFlight) {
+        if (!alreadyRunning) {
             // Copy payload so the request body isn't relied on after the response is sent.
             const payload = items.slice();
-            ingestInFlight = (async () => {
+            void (async () => {
                 try {
                     const result = await ingestMarketDriverRssItems(payload);
-                    if (result.changed) {
-                        websocketService.emitCalendarNewsUpdate('market-driver');
+                    if (result.skippedOverlap) {
+                        logger.warn(
+                            `[MarketDriverWebhook] Ingest already running — accepted ${received} item(s) but skipped overlapping classify`,
+                        );
+                        return;
                     }
-                    logger.info(
-                        `[MarketDriverWebhook] Full-feed ingest done: received=${result.received} fresh=${result.fresh} stored=${result.stored} changed=${result.changed}`,
-                    );
+                    if (result.ingestComplete) {
+                        if (result.changed) {
+                            websocketService.emitCalendarNewsUpdate('market-driver');
+                        }
+                        logger.info(
+                            `[MarketDriverWebhook] COMPLETE ingest: received=${result.received} fresh=${result.fresh} stored=${result.stored} changed=${result.changed}`,
+                        );
+                    } else {
+                        logger.warn(
+                            `[MarketDriverWebhook] PARTIAL ingest (not final): received=${result.received} fresh=${result.fresh} stored=${result.stored} deferred=${result.deferredCount} — auto-resume after Groq cooldown`,
+                        );
+                    }
                 } catch (err) {
                     logger.error(
                         `[MarketDriverWebhook] Background ingest failed: ${err instanceof Error ? err.message : String(err)}`,
                         err,
                     );
-                } finally {
-                    ingestInFlight = null;
                 }
             })();
         } else {

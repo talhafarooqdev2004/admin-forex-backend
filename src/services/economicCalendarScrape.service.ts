@@ -10,7 +10,7 @@ import { logger } from '../utils/logger.util.js';
 
 export type EconomicCalendarEvent = {
     time: string;
-    /** Raw investing.com row timestamp, e.g. "2026-07-06 07:00:00" (widget timezone). */
+    /** Dubai-local wall clock from scraper, e.g. "2026-07-14 02:00:00". */
     timestamp: string;
     currency: string;
     country: string;
@@ -22,6 +22,8 @@ export type EconomicCalendarEvent = {
     trendScore: number;
     evidenceScore: number;
     bias: 'Bullish' | 'Bearish' | 'Neutral';
+    /** Investing.com DOM row id when provided (eventRowId_…). */
+    id?: string | null;
 };
 
 type Snapshot = { data: EconomicCalendarEvent[]; scrapedAt: number };
@@ -64,6 +66,7 @@ function normalizeEvent(raw: unknown): EconomicCalendarEvent | null {
         trendScore: Number.isFinite(trendScore) ? trendScore : 0,
         evidenceScore: Number.isFinite(evidenceScore) ? evidenceScore : 0,
         bias,
+        id: row.id == null || row.id === '' ? null : String(row.id),
     };
 }
 
@@ -102,9 +105,37 @@ function loadPersistedSnapshot(): Snapshot | null {
 // Restore on process boot so GET /economic-calendar is never empty after deploy restart.
 snapshot = loadPersistedSnapshot();
 
+function eventMergeKey(e: EconomicCalendarEvent): string {
+    if (e.id) return `id:${e.id}`;
+    return `${e.timestamp}|${e.currency}|${e.event}`.toLowerCase();
+}
+
+/**
+ * Merge a possibly-partial scrape into the prior snapshot:
+ * - Matching keys get updated (actual/forecast/previous/scores).
+ * - New keys are added.
+ * - Prior keys missing from a truncated scrape are kept (never wipe the week).
+ */
+function mergeCalendarSnapshots(
+    previous: EconomicCalendarEvent[],
+    incoming: EconomicCalendarEvent[],
+): EconomicCalendarEvent[] {
+    const map = new Map<string, EconomicCalendarEvent>();
+    for (const e of previous) map.set(eventMergeKey(e), e);
+    for (const e of incoming) map.set(eventMergeKey(e), e);
+    return [...map.values()].sort((a, b) => {
+        const ta = a.timestamp.localeCompare(b.timestamp);
+        if (ta !== 0) return ta;
+        const ca = a.currency.localeCompare(b.currency);
+        if (ca !== 0) return ca;
+        return a.event.localeCompare(b.event);
+    });
+}
+
 /**
  * Replace the live snapshot with events pushed from forex-scraping.
- * Refuses to wipe a good snapshot with an empty/failed scrape.
+ * Refuses to wipe a good snapshot with an empty scrape.
+ * Truncated scrapes are MERGED into the prior week (update actuals + keep missing rows).
  */
 export function applyEconomicCalendarSnapshot(
     events: unknown[],
@@ -123,22 +154,37 @@ export function applyEconomicCalendarSnapshot(
         return [];
     }
 
-    // Guard against truncated scrapes wiping a full week (e.g. only Monday rows).
-    const prevCount = snapshot?.data?.length ?? 0;
-    if (prevCount >= 40 && data.length < Math.floor(prevCount * 0.35)) {
+    const prev = snapshot?.data ?? [];
+    const prevCount = prev.length;
+    const looksTruncated = prevCount >= 40 && data.length < Math.floor(prevCount * 0.7);
+
+    let nextData: EconomicCalendarEvent[];
+    if (looksTruncated) {
+        nextData = mergeCalendarSnapshots(prev, data);
         logger.warn(
-            `[EconomicCalendar] Ignoring truncated ingest (${data.length} vs prior ${prevCount}) — keeping existing snapshot`,
+            `[EconomicCalendar] Truncated ingest (${data.length} vs prior ${prevCount}) — merged → ${nextData.length} event(s)`,
         );
-        return snapshot!.data;
+    } else {
+        // Full / healthy scrape: still merge once so we never lose a row that briefly
+        // failed to render on Investing's lazy table (union of prior + new).
+        nextData = prevCount > 0 ? mergeCalendarSnapshots(prev, data) : data;
+        // If the new scrape is clearly the full week (same size or larger), prefer it
+        // as the authority so removed/cancelled events can disappear after a good pull.
+        if (data.length >= prevCount && data.length >= 40) {
+            nextData = data;
+        }
+        logger.info(
+            `[EconomicCalendar] Applied webhook snapshot: ${nextData.length} event(s)` +
+                (nextData.length !== data.length ? ` (merged from ${data.length} scraped)` : ''),
+        );
     }
 
     snapshot = {
-        data,
+        data: nextData,
         scrapedAt: Number.isFinite(scrapedAt) ? scrapedAt : Date.now(),
     };
     persistSnapshot(snapshot);
-    logger.info(`[EconomicCalendar] Applied webhook snapshot: ${data.length} event(s)`);
-    return data;
+    return nextData;
 }
 
 /** Last scraped snapshot, if any — instant, never triggers a scrape. */

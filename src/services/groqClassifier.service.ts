@@ -4,6 +4,51 @@ import { logger } from '../utils/logger.util.js';
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const REQUEST_TIMEOUT_MS = 45000;
 
+/**
+ * When Groq returns a daily token (TPD) 429, further short retries only burn the rest of the
+ * budget and delay recovery. Pause all classify calls until this timestamp.
+ */
+let groqDailyLimitedUntilMs = 0;
+
+/** True while the org is under a daily TPD cooldown (shared by local + prod on the same key). */
+export function isGroqDailyLimited(): boolean {
+    return Date.now() < groqDailyLimitedUntilMs;
+}
+
+/** Milliseconds left on the daily TPD cooldown (0 if clear). */
+export function groqDailyLimitRemainingMs(): number {
+    return Math.max(0, groqDailyLimitedUntilMs - Date.now());
+}
+
+function parseRetryAfterMsFrom429Body(body: string): number | null {
+    // e.g. "Please try again in 8m9.024s" or "try again in 4m5.376s"
+    const m = body.match(/try again in\s+(\d+)m([\d.]+)?s/i);
+    if (m) {
+        const mins = Number(m[1]) || 0;
+        const secs = Number(m[2]) || 0;
+        return Math.ceil((mins * 60 + secs) * 1000);
+    }
+    const s = body.match(/try again in\s+([\d.]+)\s*s/i);
+    if (s) return Math.ceil(Number(s[1]) * 1000);
+    return null;
+}
+
+function noteGroq429(body: string): { dailyTpd: boolean; waitMs: number } {
+    const dailyTpd = /tokens per day|TPD|tpd/i.test(body);
+    const parsed = parseRetryAfterMsFrom429Body(body);
+    if (dailyTpd) {
+        // Daily window: wait at least the suggested time, floor 10 minutes so we don't hammer.
+        const waitMs = Math.max(parsed ?? 10 * 60_000, 10 * 60_000);
+        groqDailyLimitedUntilMs = Date.now() + waitMs;
+        logger.error(
+            `[GroqClassifier] Daily token limit (TPD) hit — pausing classify for ${Math.ceil(waitMs / 60000)}m (same key for local+prod)`,
+        );
+        return { dailyTpd: true, waitMs };
+    }
+    // Per-minute / burst 429 — short backoff is fine.
+    return { dailyTpd: false, waitMs: parsed ?? 5000 };
+}
+
 /** Tracked assets — everything else classifies to IRRELEVANT (doc §1). */
 export const TRACKED_ASSETS = ['USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD', 'NZD', 'GOLD', 'OIL'] as const;
 export type TrackedAsset = (typeof TRACKED_ASSETS)[number];
@@ -142,6 +187,12 @@ type GroqResponse = {
 
 async function groqJson(system: string, user: string): Promise<Record<string, unknown> | null> {
     if (!ENV.GROQ_API_KEY) return null;
+    if (isGroqDailyLimited()) {
+        logger.warn(
+            `[GroqClassifier] Skipping call — daily TPD cooldown ${Math.ceil(groqDailyLimitRemainingMs() / 60000)}m left`,
+        );
+        return null;
+    }
     const maxAttempts = 4;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         const controller = new AbortController();
@@ -165,11 +216,20 @@ async function groqJson(system: string, user: string): Promise<Record<string, un
                 }),
             });
 
-            if (res.status === 429 && attempt < maxAttempts) {
-                const waitMs = 5000 * attempt;
-                logger.warn(`[GroqClassifier] Rate-limited (429); retrying in ${waitMs}ms (attempt ${attempt}/${maxAttempts})`);
-                await new Promise((r) => setTimeout(r, waitMs));
-                continue;
+            if (res.status === 429) {
+                const body = (await res.text()).slice(0, 500);
+                const { dailyTpd, waitMs } = noteGroq429(body);
+                logger.error(`[GroqClassifier] Groq returned 429: ${body.slice(0, 300)}`);
+                if (dailyTpd) return null; // do not burn remaining daily budget with short retries
+                if (attempt < maxAttempts) {
+                    const backoff = Math.max(waitMs, 5000 * attempt);
+                    logger.warn(
+                        `[GroqClassifier] Rate-limited (429); retrying in ${backoff}ms (attempt ${attempt}/${maxAttempts})`,
+                    );
+                    await new Promise((r) => setTimeout(r, backoff));
+                    continue;
+                }
+                return null;
             }
             if (!res.ok) {
                 logger.error(`[GroqClassifier] Groq returned ${res.status}: ${(await res.text()).slice(0, 300)}`);
@@ -1113,6 +1173,12 @@ export async function classifyHeadlines(
         logger.error('[GroqClassifier] GROQ_API_KEY is not set — skipping classification');
         return [];
     }
+    if (isGroqDailyLimited()) {
+        logger.warn(
+            `[GroqClassifier] Skipping batch of ${headlines.length} — daily TPD cooldown ${Math.ceil(groqDailyLimitRemainingMs() / 60000)}m left`,
+        );
+        return [];
+    }
 
     const existingBlock = existingTopics.length
         ? '\n\nEXISTING topics already stored today (id: text):\n' +
@@ -1152,11 +1218,20 @@ export async function classifyHeadlines(
                 clearTimeout(timeout);
             }
 
-            if (res.status === 429 && attempt < maxAttempts) {
-                const waitMs = 5000 * attempt;
-                logger.warn(`[GroqClassifier] Rate-limited (429); retrying in ${waitMs}ms (attempt ${attempt}/${maxAttempts})`);
-                await new Promise((r) => setTimeout(r, waitMs));
-                continue;
+            if (res.status === 429) {
+                const body = (await res.text()).slice(0, 500);
+                const { dailyTpd, waitMs } = noteGroq429(body);
+                logger.error(`[GroqClassifier] Groq returned 429: ${body.slice(0, 300)}`);
+                if (dailyTpd) return [];
+                if (attempt < maxAttempts) {
+                    const backoff = Math.max(waitMs, 5000 * attempt);
+                    logger.warn(
+                        `[GroqClassifier] Rate-limited (429); retrying in ${backoff}ms (attempt ${attempt}/${maxAttempts})`,
+                    );
+                    await new Promise((r) => setTimeout(r, backoff));
+                    continue;
+                }
+                return [];
             }
 
             if (!res.ok) {

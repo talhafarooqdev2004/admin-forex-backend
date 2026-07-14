@@ -6,7 +6,9 @@ import {
     sanitizeClassification,
 } from './groqClassifier.service.js';
 import {
+    getMarketDriverIngestIdleMs,
     ingestMarketDriverRssItems,
+    isMarketDriverIngestRunning,
     marketDayKey,
 } from './marketDriverBoard.service.js';
 
@@ -22,9 +24,13 @@ import {
  * Locked rows are never rewritten — once shown on News Headline they stay for the UAE day.
  * Then re-verify. Only gaps that survive healing are reported as failures (ERROR log + status).
  *
- * Runs on a cron (server.ts) and once at boot; the manual test script and the admin endpoint
- * call the same function, so engineer checks, CI, and production all see identical logic.
+ * Cron only (no boot heal). Skips while RSS classify is running and for
+ * {@link COVERAGE_AUDIT_COOLDOWN_MS} after it finishes so heal never races the 10‑min ingest.
+ * Admin `?run=1` can force. Manual test script / admin endpoint share this function.
  */
+
+/** Wait after last full-feed ingest before heal may call Groq (avoids TPM 429 wars). */
+const COVERAGE_AUDIT_COOLDOWN_MS = 2 * 60 * 1000;
 
 /** Same feeds + guid prefixes as forex-scraping's marketDriverRss.service.js — a healed MISSING
  *  item stores under the guid the scraper would later send, so no double-ingest. */
@@ -246,11 +252,50 @@ async function healHiddenRow(row: DbRow, title: string, promote: boolean): Promi
     });
 }
 
-export async function runMarketDriverCoverageAudit(): Promise<CoverageAuditResult> {
+function deferredCoverageAudit(reason: string): CoverageAuditResult {
+    const liveDay = marketDayKey();
+    const result: CoverageAuditResult = {
+        ranAt: new Date().toISOString(),
+        liveDay,
+        feedsFetched: [],
+        feedsFailed: [],
+        uniqueLiveItems: 0,
+        requiredByRules: 0,
+        requiredOk: 0,
+        healedMissing: 0,
+        healedHidden: 0,
+        residualGaps: [],
+        systemVisible: 0,
+        pass: true,
+    };
+    logger.warn(`[CoverageAudit] Skipped — ${reason}`);
+    return result;
+}
+
+export async function runMarketDriverCoverageAudit(
+    options: { force?: boolean } = {},
+): Promise<CoverageAuditResult> {
     // Concurrent calls (cron tick + admin ?run=1) share one run.
     if (auditInFlight) return auditInFlight;
     auditInFlight = (async () => {
         try {
+            if (!options.force) {
+                if (isMarketDriverIngestRunning()) {
+                    return deferredCoverageAudit('market-driver ingest still classifying');
+                }
+                const idleMs = getMarketDriverIngestIdleMs();
+                if (idleMs == null) {
+                    return deferredCoverageAudit(
+                        'no ingest finished yet this process (boot / pre-RSS guard)',
+                    );
+                }
+                if (idleMs < COVERAGE_AUDIT_COOLDOWN_MS) {
+                    const leftSec = Math.ceil((COVERAGE_AUDIT_COOLDOWN_MS - idleMs) / 1000);
+                    return deferredCoverageAudit(
+                        `only ${Math.round(idleMs / 1000)}s since last ingest (need ${COVERAGE_AUDIT_COOLDOWN_MS / 1000}s, ${leftSec}s left)`,
+                    );
+                }
+            }
             return await runAuditOnce();
         } finally {
             auditInFlight = null;

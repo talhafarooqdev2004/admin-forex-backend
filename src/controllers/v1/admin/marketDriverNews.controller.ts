@@ -30,7 +30,9 @@ export const getMarketDriverNewsHeadlines = async (req: Request, res: Response, 
 export const getMarketDriverCoverageStatus = async (req: Request, res: Response, next: NextFunction) => {
     try {
         const force = req.query.run === '1' || req.query.run === 'true';
-        const result = force ? await runMarketDriverCoverageAudit() : (getLastCoverageAudit() ?? (await runMarketDriverCoverageAudit()));
+        const result = force
+            ? await runMarketDriverCoverageAudit({ force: true })
+            : (getLastCoverageAudit() ?? (await runMarketDriverCoverageAudit()));
         res.status(HTTP_STATUS.OK).json(successResponse('Coverage audit status', result));
     } catch (error) {
         next(error);

@@ -101,12 +101,8 @@ httpServer.listen(PORT, async () => {
         { timezone: 'Asia/Dubai' },
     );
 
-    // Offset from the :00/:10/... RSS ingest and the :15 archive catchup so feed hits spread out.
+    // :07 / :37 — between */10 RSS ticks. Still guarded: skips while classify runs + 2m cooldown.
     cronService.startJob('marketDriverCoverageAudit', '7,37 * * * *', async () => {
         await runCoverageAuditTick();
     });
-    // Boot-time audit, slightly delayed so the first webhook ingest (if due) lands first.
-    setTimeout(() => {
-        void runCoverageAuditTick();
-    }, 45000);
 });
