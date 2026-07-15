@@ -65,7 +65,10 @@ export type ClassifiedAsset = {
 };
 
 /** An already-stored, non-duplicate headline from today the model can match new ones against. */
-export type ExistingTopic = { id: string; text: string };
+export type ExistingTopic = { id: string; text: string; publishedAt?: Date | string | null };
+
+/** Optional pub time so the LLM can tell same-briefing fragments from later separate developments. */
+export type HeadlineInput = { text: string; publishedAt?: Date | string | null };
 
 export type ClassifiedHeadline = {
     index: number;
@@ -159,13 +162,38 @@ FEW-SHOT (learn the pattern, generalize to new wording):
 
 ASSET TAGGING STRICTNESS:
 - Wrong asset is worse than IRRELEVANT.
-- Do NOT auto-add CAD on every oil story unless Canada/CAD/loonie/BoC is named.
+- Do NOT auto-add CAD on every oil story. When the oil bias is Moderate Bullish (+0.5) or Extreme
+  Bullish (+1), ALSO tag CAD Bullish with the SAME score as OIL (oil supports the loonie). If oil is
+  weak/neutral/bearish, do NOT tag CAD unless Canada/CAD/loonie/BoC is explicitly named.
 - Do NOT auto-add USD/JPY/CHF safe-haven on every Iran headline unless risk-off/dollar/Fed is explicit.
 - Escalation → bullish OIL/GOLD as relevant. De-escalation/talks → bearish OIL/GOLD or Neutral 0.
 
-DEDUPLICATION (doc §3) — separate lists:
-Same specific announcement restated = duplicate. Same region but different facts = NOT duplicate.
-When unsure, do NOT mark duplicate.
+DEDUPLICATION (doc §3) — applies to ANY topic/person/asset family (geopolitics, political speech,
+central-bank quotes, gold/oil price wraps, FX pair moves, economic data restatements — NOT a fixed
+list of names, and NOT "war headlines only"):
+Group as ONE story (mark duplicates) when headlines are:
+  (a) the SAME specific event/announcement/outcome/price-print restated (near-paraphrases, agency rewrites), OR
+  (b) separate quote-bullets/wire fragments from the SAME single statement, interview, press briefing,
+      or speech by the SAME speaker/source on the SAME subject at roughly the SAME time — even if each
+      bullet quotes a different sentence. Treat the whole briefing as one story; keep the most
+      complete/specific bullet as principal.
+DUPLICATE examples (count once — learn the PATTERN, generalize beyond these exact words):
+  • geo: three Centcom wires about the same strike wave
+  • political speech: three "Trump: ..." bullets from one press briefing minutes apart
+  • central bank: two "Fed's X says rates…" paraphrases of one speech
+  • gold wrap: "Gold climbs above $2,400 on safe-haven demand" + "XAU/USD rallies past $2,400 amid risk-off"
+  • FX pair: "EUR/USD slides below 1.0800 after ECB" + "Euro weakens under 1.08 post-ECB decision"
+  • CB quote: "ECB's Lagarde: inflation on track to 2%" + "Lagarde says price growth returning to target"
+  • data print: "China exports rise 27% YoY" + "Chinese June export growth beats at 27%"
+  • oil wrap: "Oil steadies near $78" + "WTI holds around $78 as traders await inventories"
+NOT duplicates (same asset/theme is NOT enough):
+  • "Gold rises Monday morning" + "Gold falls Monday evening" — opposite moves / different times
+  • a strike, then hours later a different country's diplomatic response, then a separate ceasefire
+    statement — each is its own market fact even if the region/topic overlaps
+Use [HH:MM] timestamps next to each headline when present: close times + same speaker/subject → same
+briefing; far-apart times or opposite direction → usually separate.
+Use judgment like a human editor would: could two wire services have filed both headlines about the
+exact same underlying moment? If yes, group them. Do not require exact wording.
 - duplicateGroups: [[principal, dup, ...], ...]
 - existingDuplicates: [{"i": batchIndex, "existingId": "id"}]
 
@@ -173,13 +201,68 @@ Respond ONLY with JSON:
 {"results":[{"i":0,"category":"...","impact":"...","assets":[{"asset":"...","bias":"...","score":0}],"summary":"..."}],"duplicateGroups":[],"existingDuplicates":[]}
 Every input index must appear exactly once in "results".`;
 
-const DEDUP_ONLY_PROMPT = `You detect duplicate forex market headlines (doc §3).
-Two headlines are duplicates ONLY when they report the SAME specific event/announcement/statement (including near-paraphrases from one briefing).
-NOT duplicates = same region/topic but different facts.
-When unsure, do NOT group them.
+const DEDUP_ONLY_PROMPT = `You are an experienced wire editor detecting duplicate forex market headlines (doc §3).
+Applies to ANY topic/person/asset family — geopolitics, political speech, central-bank quotes,
+gold/oil price wraps, FX pair moves, economic data restatements. NOT "war/Trump/Fed only".
+
+Group headlines together (duplicates) when they are:
+  (a) the SAME specific event/announcement/outcome/price-print restated (near-paraphrases, agency rewrites), OR
+  (b) separate quote-bullets/wire fragments from ONE single statement, interview, press briefing, or
+      speech by the SAME speaker/source on the SAME subject at roughly the SAME time — even if each
+      bullet quotes a different sentence from that briefing.
+Put the clearest/most complete headline first in each group (the principal); the rest are duplicates.
+
+DUPLICATE examples (count once — learn the PATTERN, generalize beyond these exact words):
+  • geo: three Centcom wires about the same strike wave
+  • political speech: three "Trump: ..." bullets from one press briefing minutes apart
+  • central bank: two "Fed's X says rates…" paraphrases of one speech
+  • gold wrap: "Gold climbs above $2,400 on safe-haven demand" + "XAU/USD rallies past $2,400 amid risk-off"
+  • FX pair: "EUR/USD slides below 1.0800 after ECB" + "Euro weakens under 1.08 post-ECB decision"
+  • CB quote: "ECB's Lagarde: inflation on track to 2%" + "Lagarde says price growth returning to target"
+  • data print: "China exports rise 27% YoY" + "Chinese June export growth beats at 27%"
+  • oil wrap: "Oil steadies near $78" + "WTI holds around $78 as traders await inventories"
+NOT duplicates (same asset/theme is NOT enough):
+  • "Gold rises Monday morning" + "Gold falls Monday evening" — opposite moves / different times
+  • a strike, then a different country's diplomatic reaction hours later, then a separate later
+    statement — each is its own story
+
+Use [HH:MM] timestamps when present: close times + same speaker/subject → same briefing;
+far-apart times or opposite direction → usually separate.
+Ask yourself: could two different wire services have filed both headlines about the exact same moment
+or the exact same single briefing? If yes, group them — do not require identical wording.
 
 Return JSON only: {"duplicateGroups":[[principal, dup, ...], ...]}
-Put the clearest/earliest index first in each group. Use [] if none.`;
+Use [] if none.`;
+
+/** Dubai market-clock HH:MM for prompt lines (matches product day window). */
+function dubaiHhMm(publishedAt: Date | string | null | undefined): string | null {
+    if (publishedAt == null || publishedAt === '') return null;
+    const d = publishedAt instanceof Date ? publishedAt : new Date(publishedAt);
+    if (Number.isNaN(d.getTime())) return null;
+    const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Asia/Dubai',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+    }).formatToParts(d);
+    const hh = parts.find((p) => p.type === 'hour')?.value;
+    const mm = parts.find((p) => p.type === 'minute')?.value;
+    if (!hh || !mm) return null;
+    return `${hh}:${mm}`;
+}
+
+function normalizeHeadlineInput(input: string | HeadlineInput): HeadlineInput {
+    if (typeof input === 'string') return { text: input };
+    return { text: input.text, publishedAt: input.publishedAt };
+}
+
+function formatPromptHeadlineLine(index: number | string, input: string | HeadlineInput): string {
+    const { text, publishedAt } = normalizeHeadlineInput(input);
+    const cleaned = text.replace(/\s+/g, ' ').trim();
+    const hhmm = dubaiHhMm(publishedAt);
+    const prefix = typeof index === 'number' ? `${index}.` : `${index}:`;
+    return hhmm ? `${prefix} [${hhmm}] ${cleaned}` : `${prefix} ${cleaned}`;
+}
 
 type GroqResponse = {
     choices?: Array<{ message?: { content?: string } }>;
@@ -251,35 +334,42 @@ async function groqJson(system: string, user: string): Promise<Record<string, un
 
 /**
  * Dedicated same-event dedup pass (doc §3). Returns map of duplicateIndex → principalIndex.
+ * Prefer passing publishedAt so the model can use [HH:MM] proximity for same-briefing detection.
  */
-export async function findBatchDuplicateMap(headlines: string[]): Promise<Map<number, number>> {
+export async function findBatchDuplicateMap(
+    headlines: Array<string | HeadlineInput>,
+): Promise<Map<number, number>> {
     const out = new Map<number, number>();
     if (headlines.length < 2) return out;
 
+    const normalized = headlines.map(normalizeHeadlineInput);
     const parsed = await groqJson(
         DEDUP_ONLY_PROMPT,
-        'Find duplicate groups among:\n' + headlines.map((h, i) => `${i}. ${h.replace(/\s+/g, ' ').trim()}`).join('\n'),
+        'Find duplicate groups among (times are Asia/Dubai HH:MM when known):\n' +
+            normalized.map((h, i) => formatPromptHeadlineLine(i, h)).join('\n'),
     );
-    if (!parsed) return out;
-
-    for (const groupRaw of Array.isArray(parsed.duplicateGroups) ? parsed.duplicateGroups : []) {
-        if (!Array.isArray(groupRaw) || groupRaw.length < 2) continue;
-        const group = groupRaw
-            .map((v) => Number(v))
-            .filter((v) => Number.isInteger(v) && v >= 0 && v < headlines.length);
-        if (group.length < 2) continue;
-        const principal = group[0]!;
-        for (const idx of group.slice(1)) {
-            if (idx !== principal && !out.has(idx)) out.set(idx, principal);
+    if (!parsed) {
+        // Fall through to deterministic backstop even when Groq is unavailable.
+    } else {
+        for (const groupRaw of Array.isArray(parsed.duplicateGroups) ? parsed.duplicateGroups : []) {
+            if (!Array.isArray(groupRaw) || groupRaw.length < 2) continue;
+            const group = groupRaw
+                .map((v) => Number(v))
+                .filter((v) => Number.isInteger(v) && v >= 0 && v < normalized.length);
+            if (group.length < 2) continue;
+            const principal = group[0]!;
+            for (const idx of group.slice(1)) {
+                if (idx !== principal && !out.has(idx)) out.set(idx, principal);
+            }
         }
     }
 
     // Token-overlap + fingerprint backstop for near-paraphrases the model misses.
-    for (let i = 0; i < headlines.length; i++) {
+    for (let i = 0; i < normalized.length; i++) {
         if (out.has(i)) continue;
         for (let j = 0; j < i; j++) {
             if (out.has(j)) continue;
-            if (likelySameEvent(headlines[i]!, headlines[j]!)) {
+            if (likelySameEvent(normalized[i]!.text, normalized[j]!.text)) {
                 out.set(i, j);
                 break;
             }
@@ -380,20 +470,33 @@ export function eventFingerprint(headline: string): string | null {
     // US / CENTCOM strike wave paraphrases on Iran (doc §3 restatements).
     if (
         /\biran/.test(h) &&
-        /\b(centcom|u\.?s\.?\s+forces|us forces|u\.?s\.?\s+hits|us hits|cnn reports)\b/.test(h) &&
-        /\b(strike|strikes|targets? hit|precision weapons|military (sites|targets)|coastal (defense|defence|surveillance)|missile and drone)\b/.test(
+        /\b(centcom|u\.?s\.?\s+forces|us forces|u\.?s\.?\s+hits|us hits|cnn reports|american enemy|u\.?s\.?\s+strike|us strike)\b/.test(
+            h,
+        ) &&
+        /\b(strike|strikes|struck|targets? hit|precision (?:weapons|munitions)|fired .{0,40}munition|military (sites|targets)|coastal (defense|defence|surveillance)|missile and drone|wheat storage|projectile)\b/.test(
             h,
         )
     ) {
         return 'us-iran-military-strikes';
     }
 
-    // Trump-on-Iran briefing bullets — split by distinct ask, collapse paraphrases of the same ask.
-    if (/\btrump on iran\b/.test(h) || (/\btrump\b/.test(h) && /\biran\b/.test(h) && /\b(planning|seeks|believes|dismantl|targeting)\b/.test(h))) {
+    // Centcom / US military update without the word "Iran" in the first clause (still Iran theater).
+    if (
+        /\bcentcom\b/.test(h) &&
+        /\b(strike|strikes|struck|munition|military sites?|iran|hormuz)\b/.test(h)
+    ) {
+        return 'us-iran-military-strikes';
+    }
+
+    // Trump-on-Iran briefing bullets — ANY Trump+Iran quote/remark from one briefing.
+    // Split only clearly distinct asks; everything else folds into trump-iran-remarks
+    // so paraphrases / different sentences from the same press hit count once on OIL.
+    if (/\btrump\b/.test(h) && /\biran\b/.test(h)) {
         if (/\b(strike|monday night|significant strike)\b/.test(h)) return 'trump-iran-strike-plan';
-        if (/\b(deal|achievable|negotiat)\b/.test(h)) return 'trump-iran-deal';
+        if (/\b(deal|achievable|negotiat|agreement|pressed .{0,20}agreement)\b/.test(h)) return 'trump-iran-deal';
         if (/\b(hormuz|compensation|shielding|toll|shipping)\b/.test(h)) return 'trump-iran-hormuz';
-        if (/\b(dismantl|offensive strength|capabilit)/.test(h)) return 'trump-iran-capability';
+        if (/\b(dismantl|offensive strength|capabilit|resilience|depleted)\b/.test(h)) return 'trump-iran-capability';
+        // "Trump: discussions…", "Trump: will preserve energy…", etc. → one remarks cluster
         return 'trump-iran-remarks';
     }
 
@@ -420,7 +523,12 @@ export function eventFingerprint(headline: string): string | null {
     }
 
     // WTI/Brent price reaction to the same ME supply shock — one catalyst, not every wire.
-    if (/\b(wti|brent|crude)\b/.test(h) && /\b(spike|spikes|advances?|forecast|four-week|near \$\d|middle east|hormuz)\b/.test(h)) {
+    if (
+        /\b(wti|brent|crude)\b/.test(h) &&
+        /\b(spike|spikes|rises?|advances?|jumps?|forecast|four-week|near \$\d|middle east|hormuz|iran|threatens? strikes?)\b/.test(
+            h,
+        )
+    ) {
         return 'wti-me-price-move';
     }
 
@@ -435,7 +543,9 @@ export function likelySameEvent(a: string, b: string): boolean {
     const ta = tokenSet(a);
     const tb = tokenSet(b);
     const jac = jaccard(ta, tb);
-    if (jac >= 0.55) return true;
+    // Slightly looser than 0.55 so agency paraphrases of the same wire still match
+    // (any topic — not only war). Still high enough to avoid merging different facts.
+    if (jac >= 0.48) return true;
 
     let inter = 0;
     const shared: string[] = [];
@@ -453,25 +563,61 @@ export function likelySameEvent(a: string, b: string): boolean {
 /**
  * Coarser OIL-only cluster for Market Catalyst (doc §3): many Iran/ME wires are
  * distinct enough for News Headline, but must not each add +1 to OIL.
+ * Same war/escalation *outcome* (Centcom strikes, IRGC Hormuz closure, strike
+ * paraphrases, WTI reaction to that wave) → one catalyst. De-escalation stays separate.
  */
 export function oilCatalystCluster(headline: string): string | null {
+    const h = headline.toLowerCase().replace(/\s+/g, ' ').trim();
+    const deEscalation =
+        /\b(ceasefire|reopen|reopening|de-?escalat|eases? oil|talks progress|negotiations progress|relief weighs)\b/.test(
+            h,
+        );
+
     const fp = eventFingerprint(headline);
     if (fp) {
-        if (fp === 'iran-jordan-missile' || fp === 'bahrain-iran-alert' || fp === 'iran-gulf-spillover') {
-            return 'iran-gulf-spillover';
+        if (
+            fp === 'us-iran-military-strikes' ||
+            fp === 'iran-jordan-missile' ||
+            fp === 'bahrain-iran-alert' ||
+            fp === 'iran-gulf-spillover' ||
+            fp === 'wti-me-price-move' ||
+            fp === 'trump-iran-strike-plan'
+        ) {
+            return deEscalation ? 'me-iran-de-escalation' : 'me-iran-war-escalation';
         }
-        // Same Hormuz supply-risk thread (official ask + tanker/IRGC wires).
+        // Hormuz supply-risk / IRGC closure vs reopening.
         if (fp === 'trump-iran-hormuz' || fp === 'hormuz-shipping-disruption' || fp === 'iran-shipping-us-demands') {
-            return 'hormuz-shipping-disruption';
+            return deEscalation ? 'me-iran-de-escalation' : 'me-iran-war-escalation';
         }
-        // One Trump Iran briefing → one OIL catalyst (strike plan stays separate as escalation).
+        // One Trump Iran briefing → one OIL catalyst (strike plan already mapped above).
         if (fp === 'trump-iran-deal' || fp === 'trump-iran-capability' || fp === 'trump-iran-remarks') {
             return 'trump-iran-briefing';
         }
         return fp;
     }
-    const h = headline.toLowerCase();
+
     if (/\b(ipsos|poll finds|% of americans)\b/.test(h) && /\biran/.test(h)) return 'iran-opinion-poll';
+
+    // Fallback: any Trump+Iran quote bullet → one OIL briefing catalyst (covers wires the
+    // fingerprint gate used to miss, e.g. "Trump: will preserve energy objectives…").
+    if (/\btrump\b/.test(h) && /\biran\b/.test(h)) {
+        return 'trump-iran-briefing';
+    }
+
+    // Fallback: unfingerprinted war/strike paraphrases that still price the same OIL risk.
+    if (!deEscalation) {
+        const warEscalation =
+            (/\bcentcom\b/.test(h) &&
+                /\b(strike|strikes|struck|munition|military|iran|hormuz|fighter|naval|drone)\b/.test(h)) ||
+            (/\biran/.test(h) &&
+                /\b(strike|strikes|struck|munition|projectile|irgc|hormuz|centcom|fighter|naval|military sites?|silo|wheat storage)\b/.test(
+                    h,
+                )) ||
+            (/\bhormuz\b/.test(h) && /\b(closed|close|blockade|irgc|strike|missile|remain closed)\b/.test(h)) ||
+            (/\b(wti|brent|crude)\b/.test(h) && /\b(iran|hormuz|strike|middle east|threatens? strikes?)\b/.test(h));
+        if (warEscalation) return 'me-iran-war-escalation';
+    }
+
     return null;
 }
 
@@ -564,11 +710,25 @@ export function headlineSupportsCad(headline: string): boolean {
 }
 
 /**
- * Keep Market Catalyst aligned with News Headline: oil/Hormuz wires show as OIL only,
- * so do not mirror the same scores onto CAD unless Canada/CAD is in the headline.
+ * Oil → CAD (client rule):
+ * - Canada/CAD/loonie/BoC named → keep whatever CAD tag Groq assigned.
+ * - OIL Moderate (+0.5) or Extreme (+1) Bullish → ensure CAD is tagged Bullish with the same score
+ *   (oil supports the loonie). This must ADD CAD, not only keep an existing tag.
+ * - Otherwise strip any implied CAD (weak/neutral/bearish oil must not move CAD).
  */
 export function stripImpliedCadFromOil(headline: string, assets: ClassifiedAsset[]): ClassifiedAsset[] {
     if (headlineSupportsCad(headline)) return assets;
+
+    const oil = assets.find((a) => a.asset === 'OIL');
+    // Moderate Bullish = Medium/+0.5; Extreme Bullish = High/+1.
+    if (oil && oil.score >= 0.5) {
+        const withoutCad = assets.filter((a) => a.asset !== 'CAD');
+        return [
+            ...withoutCad,
+            { asset: 'CAD', bias: 'Bullish' as AssetBias, score: oil.score },
+        ];
+    }
+
     return assets.filter((a) => a.asset !== 'CAD');
 }
 
@@ -999,7 +1159,6 @@ export function sanitizeClassification(
 
     // Oil/Iran energy stories must not also credit USD/JPY/CHF unless the headline is a real USD driver.
     assets = stripWeakSafeHavenTags(headline, assets);
-    assets = stripImpliedCadFromOil(headline, assets);
 
     // Denied / unfounded talks with no outcome → Neutral (do not force de-escalation).
     if (/\b(unfounded|denied|denies|no talks|not request(ed)? negotiations)\b/i.test(headline) && /\b(talks?|negotiat)/i.test(headline)) {
@@ -1077,6 +1236,10 @@ export function sanitizeClassification(
 
     // After geo can force OIL: currency reaction wraps stay on the FX subject (doc §21).
     assets = stripOilFromFxReactionWrap(headline, assets);
+
+    // Oil→CAD mirror runs AFTER FX-wrap OIL strip so "AUD weakens on Iran strikes" does not
+    // leave a leftover CAD tag once OIL was correctly removed from the wrap.
+    assets = stripImpliedCadFromOil(headline, assets);
 
     // Universal: Japan MoF / GPIF portfolio policy → DRIVER JPY.
     if (isJapanPortfolioPolicyHeadline(headline)) {
@@ -1163,9 +1326,10 @@ function coerceResult(
 /**
  * Batch-classify headlines in one Groq call, including deduplication against `existingTopics`
  * and against each other within the batch. Returns [] on failure so the caller can skip this cycle.
+ * Prefer HeadlineInput with publishedAt so [HH:MM] reaches the model for same-briefing judgment.
  */
 export async function classifyHeadlines(
-    headlines: string[],
+    headlines: Array<string | HeadlineInput>,
     existingTopics: ExistingTopic[] = [],
 ): Promise<ClassifiedHeadline[]> {
     if (headlines.length === 0) return [];
@@ -1180,14 +1344,17 @@ export async function classifyHeadlines(
         return [];
     }
 
+    const normalized = headlines.map(normalizeHeadlineInput);
+    const headlineTexts = normalized.map((h) => h.text);
+
     const existingBlock = existingTopics.length
-        ? '\n\nEXISTING topics already stored today (id: text):\n' +
-        existingTopics.map((t) => `${t.id}: ${t.text.replace(/\s+/g, ' ').trim()}`).join('\n')
+        ? '\n\nEXISTING topics already stored today (id: [HH:MM] text — Asia/Dubai when known):\n' +
+          existingTopics.map((t) => formatPromptHeadlineLine(t.id, { text: t.text, publishedAt: t.publishedAt })).join('\n')
         : '\n\nEXISTING topics already stored today: (none yet)';
 
     const userContent =
-        'Classify these headlines (indices are for THIS batch):\n' +
-        headlines.map((h, i) => `${i}. ${h.replace(/\s+/g, ' ').trim()}`).join('\n') +
+        'Classify these headlines (indices are for THIS batch; times are Asia/Dubai HH:MM when known):\n' +
+        normalized.map((h, i) => formatPromptHeadlineLine(i, h)).join('\n') +
         existingBlock;
 
     const maxAttempts = 4;
@@ -1256,8 +1423,8 @@ export async function classifyHeadlines(
             >();
             for (const raw of Array.isArray(parsed.results) ? parsed.results : []) {
                 const idx = Number((raw as Record<string, unknown>)?.i);
-                if (!Number.isInteger(idx) || idx < 0 || idx >= headlines.length) continue;
-                const coerced = coerceResult(raw, idx, headlines[idx]!);
+                if (!Number.isInteger(idx) || idx < 0 || idx >= headlineTexts.length) continue;
+                const coerced = coerceResult(raw, idx, headlineTexts[idx]!);
                 if (coerced) baseByIndex.set(idx, coerced);
             }
 
@@ -1266,7 +1433,7 @@ export async function classifyHeadlines(
                 if (!Array.isArray(groupRaw) || groupRaw.length < 2) continue;
                 const group = groupRaw
                     .map((v) => Number(v))
-                    .filter((v) => Number.isInteger(v) && v >= 0 && v < headlines.length);
+                    .filter((v) => Number.isInteger(v) && v >= 0 && v < headlineTexts.length);
                 if (group.length < 2) continue;
                 const principal = group[0]!;
                 for (const idx of group.slice(1)) {
@@ -1280,7 +1447,7 @@ export async function classifyHeadlines(
                 const o = raw as Record<string, unknown>;
                 const idx = Number(o.i);
                 const existingId = String(o.existingId ?? '');
-                if (!Number.isInteger(idx) || idx < 0 || idx >= headlines.length) continue;
+                if (!Number.isInteger(idx) || idx < 0 || idx >= headlineTexts.length) continue;
                 if (!existingIds.has(existingId)) continue;
                 existingDuplicateOf.set(idx, existingId);
             }

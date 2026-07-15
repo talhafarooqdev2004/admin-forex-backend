@@ -326,14 +326,14 @@ export async function reclassifyTodaysMarketDriverNews(): Promise<{ updated: num
         // that were never shown; if reclassify makes one visible it gets locked (an ADD).
         where: { day_key: dayKey, board_locked: false },
         orderBy: { created_at: 'asc' },
-        select: { id: true, headline: true },
+        select: { id: true, headline: true, published_at: true },
     });
 
     let updated = 0;
     for (let i = 0; i < items.length; i += RECLASSIFY_BATCH) {
         const batch = items.slice(i, i + RECLASSIFY_BATCH);
         const classified = await classifyHeadlines(
-            batch.map((b) => b.headline),
+            batch.map((b) => ({ text: b.headline, publishedAt: b.published_at })),
             [],
         );
         if (classified.length === 0) {
@@ -388,7 +388,7 @@ export async function markTodaysSemanticDuplicates(): Promise<number> {
             category: { in: BOARD_CATEGORIES },
         },
         orderBy: { created_at: 'asc' },
-        select: { id: true, headline: true, board_locked: true },
+        select: { id: true, headline: true, board_locked: true, published_at: true },
     });
     if (principals.length < 2) return 0;
 
@@ -397,7 +397,9 @@ export async function markTodaysSemanticDuplicates(): Promise<number> {
         const batch = principals.slice(i, i + RECLASSIFY_BATCH);
         if (batch.length < 2) break;
 
-        const dupMap = await findBatchDuplicateMap(batch.map((b) => b.headline));
+        const dupMap = await findBatchDuplicateMap(
+            batch.map((b) => ({ text: b.headline, publishedAt: b.published_at })),
+        );
         for (const [dupIdx, principalIdx] of dupMap) {
             const principal = batch[principalIdx];
             const dup = batch[dupIdx];
@@ -416,6 +418,58 @@ export async function markTodaysSemanticDuplicates(): Promise<number> {
         }
     }
 
+    return marked;
+}
+
+/**
+ * AI-judgment same-briefing dedup (doc §3), bounded to a recent time window so it runs
+ * automatically after every ingest without re-scanning (and re-billing) the whole day.
+ * Catches fragments Groq's per-batch pass and the cheap fingerprint pass both miss —
+ * e.g. three separate "Trump: ..." bullets from one Iran briefing minutes apart — without
+ * hardcoding a name/topic list: Groq itself judges "same briefing" (see DEDUP_ONLY_PROMPT).
+ */
+export async function markRecentSemanticDuplicates(windowMinutes = 180): Promise<number> {
+    if (isGroqDailyLimited()) return 0;
+
+    const dayKey = marketDayKey();
+    const since = new Date(Date.now() - windowMinutes * 60 * 1000);
+    const principals = await prisma.marketDriverNews.findMany({
+        where: {
+            day_key: dayKey,
+            duplicate_of: null,
+            category: { in: BOARD_CATEGORIES },
+            created_at: { gte: since },
+        },
+        orderBy: { created_at: 'asc' },
+        select: { id: true, headline: true, board_locked: true, published_at: true },
+    });
+    if (principals.length < 2) return 0;
+
+    let marked = 0;
+    for (let i = 0; i < principals.length; i += RECLASSIFY_BATCH - 2) {
+        const batch = principals.slice(i, i + RECLASSIFY_BATCH);
+        if (batch.length < 2) break;
+
+        const dupMap = await findBatchDuplicateMap(
+            batch.map((b) => ({ text: b.headline, publishedAt: b.published_at })),
+        );
+        for (const [dupIdx, principalIdx] of dupMap) {
+            const principal = batch[principalIdx];
+            const dup = batch[dupIdx];
+            if (!principal || !dup || principal.id === dup.id) continue;
+            // Never demote a locked (already-shown) row — it stays visible for the whole day.
+            if (dup.board_locked) continue;
+            await prisma.marketDriverNews.update({
+                where: { id: dup.id },
+                data: { duplicate_of: principal.id },
+            });
+            marked += 1;
+        }
+    }
+
+    if (marked > 0) {
+        logger.info(`[MarketDriver] Recent-window AI dedup marked ${marked} duplicate(s) (last ${windowMinutes}m)`);
+    }
     return marked;
 }
 
@@ -693,11 +747,15 @@ async function runMarketDriverIngest(rawItems: unknown[]): Promise<{
         // Semantic dedup context (doc §3): principals from live + previous UAE day.
         const todaysPrincipals = await prisma.marketDriverNews.findMany({
             where: { day_key: { in: [dayKey, yesterday] }, duplicate_of: null, published_at: { not: null } },
-            select: { id: true, headline: true },
+            select: { id: true, headline: true, published_at: true },
             orderBy: { created_at: 'desc' },
             take: MAX_EXISTING_TOPICS,
         });
-        let existingTopics: ExistingTopic[] = todaysPrincipals.map((r) => ({ id: r.id, text: r.headline }));
+        let existingTopics: ExistingTopic[] = todaysPrincipals.map((r) => ({
+            id: r.id,
+            text: r.headline,
+            publishedAt: r.published_at,
+        }));
 
         const todaysNormalized = await prisma.marketDriverNews.findMany({
             where: { day_key: { in: [dayKey, yesterday] }, published_at: { not: null } },
@@ -724,7 +782,7 @@ async function runMarketDriverIngest(rawItems: unknown[]): Promise<{
         for (let i = 0; i < fresh.length; i += CLASSIFY_BATCH_SIZE) {
             const chunk = fresh.slice(i, i + CLASSIFY_BATCH_SIZE);
             const classified = await classifyHeadlines(
-                chunk.map((f) => f.title),
+                chunk.map((f) => ({ text: f.title, publishedAt: f.pubDate })),
                 existingTopics,
             );
             if (classified.length === 0) {
@@ -840,7 +898,10 @@ async function runMarketDriverIngest(rawItems: unknown[]): Promise<{
             // Grow dedup context for the next Groq batch with newly stored principals.
             for (const row of rows) {
                 if (row.duplicate_of) continue;
-                existingTopics = [{ id: row.id, text: row.headline }, ...existingTopics].slice(0, MAX_EXISTING_TOPICS);
+                existingTopics = [
+                    { id: row.id, text: row.headline, publishedAt: row.published_at },
+                    ...existingTopics,
+                ].slice(0, MAX_EXISTING_TOPICS);
             }
 
             if (i + CLASSIFY_BATCH_SIZE < fresh.length) {
@@ -870,6 +931,12 @@ async function runMarketDriverIngest(rawItems: unknown[]): Promise<{
     }
 
     const deterministicDupes = await markTodaysDeterministicDuplicates();
+    // Bounded AI (Groq) same-briefing pass — recent window only, so this runs every ingest
+    // without re-billing the whole day. Skips cleanly if Groq is TPD-limited.
+    const semanticDupes = await markRecentSemanticDuplicates().catch((error) => {
+        logger.error(`[MarketDriver] Recent-window semantic dedup failed: ${(error as Error).message}`);
+        return 0;
+    });
 
     return {
         received: items.length,
@@ -877,7 +944,13 @@ async function runMarketDriverIngest(rawItems: unknown[]): Promise<{
         stored,
         carried,
         reclassified,
-        changed: realigned > 0 || stored > 0 || carried > 0 || reclassified > 0 || deterministicDupes > 0,
+        changed:
+            realigned > 0 ||
+            stored > 0 ||
+            carried > 0 ||
+            reclassified > 0 ||
+            deterministicDupes > 0 ||
+            semanticDupes > 0,
         realigned,
         /** Present when fresh items arrived but Groq stored nothing — usually missing GROQ_API_KEY. */
         classifyFailed: classifyFailed || (fresh.length > 0 && stored === 0),
@@ -902,7 +975,7 @@ async function reclassifyFeedMatchedForEmptyBoard(dayKey: string, feedGuids: str
         where: { day_key: dayKey, guid: { in: feedGuids }, published_at: { not: null }, board_locked: false },
         orderBy: { created_at: 'desc' },
         take: CLASSIFY_BATCH_SIZE * 3,
-        select: { id: true, headline: true },
+        select: { id: true, headline: true, published_at: true },
     });
     if (candidates.length === 0) {
         logger.warn(
@@ -916,7 +989,7 @@ async function reclassifyFeedMatchedForEmptyBoard(dayKey: string, feedGuids: str
     );
 
     const classified = await classifyHeadlines(
-        candidates.map((c) => c.headline),
+        candidates.map((c) => ({ text: c.headline, publishedAt: c.published_at })),
         [],
     );
     if (classified.length === 0) {
@@ -1067,10 +1140,23 @@ function aggregateCatalystBoard(items: Awaited<ReturnType<typeof loadBoardItemsF
 
     for (const asset of BOARD_ASSET_ORDER) {
         const row = agg.get(asset)!;
-        for (const entry of collapseSameEventEntries(byAsset.get(asset) ?? [])) {
+        const collapsed = collapseSameEventEntries(byAsset.get(asset) ?? []);
+        for (const entry of collapsed) {
             if (entry.primary.score > 0) row.bullishCount += 1;
             else if (entry.primary.score < 0) row.bearishCount += 1;
             row.driverScore += entry.primary.score;
+        }
+
+        // Client oil→CAD rule (heatmap): when OIL is Moderate/Extreme Bullish after §3 collapse,
+        // CAD also receives that bullish catalyst. Primary-asset pick always prefers OIL over CAD,
+        // so without this mirror CAD stays flat even when oil is strongly bid.
+        if (asset === 'OIL') {
+            const cadRow = agg.get('CAD')!;
+            for (const entry of collapsed) {
+                if (entry.primary.score < 0.5) continue;
+                cadRow.bullishCount += 1;
+                cadRow.driverScore += entry.primary.score;
+            }
         }
     }
 

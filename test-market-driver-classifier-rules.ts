@@ -64,19 +64,19 @@ const MUST_SHOW: { headline: string; category?: Expect['category']; assetsInclud
     { headline: 'AUD/USD Price Forecast: Tests nine-day EMA barrier near 0.6950', category: 'DRIVER', assetsInclude: ['AUD'] },
     { headline: 'Forex Today: US Dollar surges as Hormuz tensions send Oil to one-month high', category: ['DRIVER', 'GEOPOLITICAL'], assetsInclude: ['USD'] },
     { headline: 'Chinese Yuan: Consolidation after sharper drop against US Dollar – UOB', category: 'DRIVER', assetsInclude: ['USD'] },
-    { headline: 'WTI spikes amid escalating Middle East Tensions', category: ['DRIVER', 'GEOPOLITICAL'], assetsInclude: ['OIL'] },
+    { headline: 'WTI spikes amid escalating Middle East Tensions', category: ['DRIVER', 'GEOPOLITICAL'], assetsInclude: ['OIL', 'CAD'] },
     { headline: 'Gold bounces off two-week low as USD bulls turn cautious ahead of US CPI', category: 'DRIVER', assetsInclude: ['GOLD'] },
     // CB speech / fixing (any official — not person-specific)
     { headline: 'RBNZ\'s Conway: Inflation to Return to 2% Over Medium Term', category: 'DRIVER', assetsInclude: ['NZD'] },
     { headline: 'Reserve Bank of NZ chief economist: additional easing of monetary stimulus probably needed', category: 'DRIVER', assetsInclude: ['NZD'] },
     { headline: 'PBOC sets USD/CNY reference rate at 6.7990 vs. 6.7972 previous', category: 'DRIVER', assetsInclude: ['USD'] },
     { headline: 'China PBOC likely to set yuan midpoint at 6.7927 per dollar: estimate', category: 'DRIVER', assetsInclude: ['USD'] },
-    // Geopolitical
-    { headline: 'US CENTCOM says US forces complete new strikes on Iranian military targets', category: 'GEOPOLITICAL', assetsInclude: ['OIL'] },
-    { headline: 'Centcom: U.S. forces conduct fresh strikes on Iranian military targets', category: 'GEOPOLITICAL', assetsInclude: ['OIL'] },
-    { headline: 'Iranian missiles hit two UAE tankers in Hormuz — Reuters', category: 'GEOPOLITICAL', assetsInclude: ['OIL'] },
-    { headline: 'Trump on Iran: planning another significant strike Monday night', category: 'GEOPOLITICAL', assetsInclude: ['OIL'] },
-    { headline: 'Iran’s Revolutionary Guards: Targeted U.S. Air Base in Jordan with Ballistic Missiles - Fars News', category: 'GEOPOLITICAL', assetsInclude: ['OIL'] },
+    // Geopolitical — OIL bullish also mirrors CAD (client oil→CAD support rule)
+    { headline: 'US CENTCOM says US forces complete new strikes on Iranian military targets', category: 'GEOPOLITICAL', assetsInclude: ['OIL', 'CAD'] },
+    { headline: 'Centcom: U.S. forces conduct fresh strikes on Iranian military targets', category: 'GEOPOLITICAL', assetsInclude: ['OIL', 'CAD'] },
+    { headline: 'Iranian missiles hit two UAE tankers in Hormuz — Reuters', category: 'GEOPOLITICAL', assetsInclude: ['OIL', 'CAD'] },
+    { headline: 'Trump on Iran: planning another significant strike Monday night', category: 'GEOPOLITICAL', assetsInclude: ['OIL', 'CAD'] },
+    { headline: 'Iran’s Revolutionary Guards: Targeted U.S. Air Base in Jordan with Ballistic Missiles - Fars News', category: 'GEOPOLITICAL', assetsInclude: ['OIL', 'CAD'] },
     // Japan portfolio policy (role-based, not name-based)
     {
         headline: 'Japan’s finance minister: Sharp shift in asset management environment could prompt review of GPIF portfolio',
@@ -191,4 +191,36 @@ console.log('\n=== DOC §3 OIL / IRAN DEDUP + FX WRAPS ===');
     );
     assert.ok(!sanitized.assets.some((a) => a.asset === 'OIL'), 'sanitize drops OIL from AUD wrap');
     console.log('OK §3 fingerprints + FX-wrap OIL strip');
+}
+
+// Oil → CAD: Moderate/Extreme bullish OIL must ADD CAD (not only keep an existing tag).
+{
+    const added = sanitizeClassification(
+        'US CENTCOM says US forces complete new strikes on Iranian military targets',
+        {
+            category: 'GEOPOLITICAL',
+            impact: 'High',
+            assets: [{ asset: 'OIL', bias: 'Bullish', score: 1 }],
+            summary: 'Escalation supports oil',
+        },
+    );
+    const cad = added.assets.find((a) => a.asset === 'CAD');
+    assert.ok(cad, 'bullish OIL must mirror CAD');
+    assert.equal(cad!.score, 1);
+    assert.equal(cad!.bias, 'Bullish');
+
+    const stripped = sanitizeClassification(
+        'Oil steadies near $78 as traders await inventories',
+        {
+            category: 'DRIVER',
+            impact: 'Medium',
+            assets: [
+                { asset: 'OIL', bias: 'Neutral', score: 0 },
+                { asset: 'CAD', bias: 'Bullish', score: 0.5 },
+            ],
+            summary: 'Oil flat',
+        },
+    );
+    assert.ok(!stripped.assets.some((a) => a.asset === 'CAD'), 'neutral OIL must not keep implied CAD');
+    console.log('OK oil→CAD Moderate/Extreme bullish mirror');
 }
