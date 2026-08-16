@@ -7,6 +7,11 @@ const parseInteger = (value: string | undefined, fallback: number): number => {
     return Number.isNaN(parsed) ? fallback : parsed;
 };
 
+const parseNumber = (value: string | undefined, fallback: number): number => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+};
+
 const normalizeOrigin = (origin: string): string => origin.trim().replace(/\/+$/, "");
 
 const parseOriginList = (...values: Array<string | undefined>): string[] => {
@@ -75,7 +80,37 @@ export const ENV = {
     CACHE_API_KEY: process.env.CACHE_API_KEY,
     /** Groq LLM API key — classifies FinancialJuice headlines for the Market Driver Board. */
     GROQ_API_KEY: process.env.GROQ_API_KEY,
-    GROQ_MODEL: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
+    /** OpenAI is the primary classifier. Keep this server-side; never expose it through API config. */
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OPENAI_CLASSIFICATION_MODEL: process.env.OPENAI_CLASSIFICATION_MODEL || 'gpt-5.4-nano',
+    /** The old llama model is intentionally not used; this is the only Groq fallback model. */
+    GROQ_FALLBACK_MODEL: process.env.GROQ_FALLBACK_MODEL || 'openai/gpt-oss-120b',
+    /** Backward-compatible read-only alias for older imports; it resolves to the new fallback. */
+    GROQ_MODEL: process.env.GROQ_FALLBACK_MODEL || 'openai/gpt-oss-120b',
+    AI_REQUEST_TIMEOUT_MS: parseInteger(process.env.AI_REQUEST_TIMEOUT_MS, 45000),
+    AI_PRIMARY_MAX_ATTEMPTS: parseInteger(process.env.AI_PRIMARY_MAX_ATTEMPTS, 3),
+    AI_FALLBACK_MAX_ATTEMPTS: parseInteger(process.env.AI_FALLBACK_MAX_ATTEMPTS, 2),
+    AI_RETRY_BASE_MS: parseInteger(process.env.AI_RETRY_BASE_MS, 1000),
+    AI_MAX_OUTPUT_TOKENS: parseInteger(process.env.AI_MAX_OUTPUT_TOKENS, 1800),
+    AI_DEDUP_MAX_OUTPUT_TOKENS: parseInteger(process.env.AI_DEDUP_MAX_OUTPUT_TOKENS, 600),
+    AI_CLASSIFICATION_BATCH_GAP_MS: parseInteger(process.env.AI_CLASSIFICATION_BATCH_GAP_MS, 20000),
+    AI_QUEUE_POLL_MS: parseInteger(process.env.AI_QUEUE_POLL_MS, 30000),
+    AI_QUEUE_LOCK_TIMEOUT_MS: parseInteger(process.env.AI_QUEUE_LOCK_TIMEOUT_MS, 180000),
+    AI_QUEUE_MAX_ATTEMPTS: parseInteger(process.env.AI_QUEUE_MAX_ATTEMPTS, 6),
+    AI_OPENAI_INPUT_PRICE_PER_MILLION: process.env.AI_OPENAI_INPUT_PRICE_PER_MILLION || '0.20',
+    AI_OPENAI_CACHED_INPUT_PRICE_PER_MILLION: process.env.AI_OPENAI_CACHED_INPUT_PRICE_PER_MILLION || '0.02',
+    AI_OPENAI_OUTPUT_PRICE_PER_MILLION: process.env.AI_OPENAI_OUTPUT_PRICE_PER_MILLION || '1.25',
+    AI_GROQ_INPUT_PRICE_PER_MILLION: process.env.AI_GROQ_INPUT_PRICE_PER_MILLION || '0.15',
+    AI_GROQ_CACHED_INPUT_PRICE_PER_MILLION: process.env.AI_GROQ_CACHED_INPUT_PRICE_PER_MILLION || '0.075',
+    AI_GROQ_OUTPUT_PRICE_PER_MILLION: process.env.AI_GROQ_OUTPUT_PRICE_PER_MILLION || '0.60',
+    AI_OPENAI_REASONING_EFFORT: process.env.AI_OPENAI_REASONING_EFFORT || 'none',
+    AI_GROQ_REASONING_EFFORT: process.env.AI_GROQ_REASONING_EFFORT || 'low',
+    AI_GROQ_INCLUDE_REASONING: parseEnvBool(process.env.AI_GROQ_INCLUDE_REASONING, false),
+    /** Informational dashboard thresholds; OpenAI Platform billing limits remain authoritative. */
+    AI_USAGE_COST_ATTENTION_USD: parseNumber(process.env.AI_USAGE_COST_ATTENTION_USD, 2),
+    AI_USAGE_COST_WARNING_USD: parseNumber(process.env.AI_USAGE_COST_WARNING_USD, 5),
+    AI_USAGE_COST_CRITICAL_USD: parseNumber(process.env.AI_USAGE_COST_CRITICAL_USD, 8),
+    AI_USAGE_MONTHLY_BUDGET_USD: parseNumber(process.env.AI_USAGE_MONTHLY_BUDGET_USD, 10),
     MAX_FILE_SIZE: parseInteger(process.env.MAX_FILE_SIZE, 10485760),
     UPLOAD_DIR: process.env.UPLOAD_DIR || './uploads',
     SMTP_HOST: process.env.SMTP_HOST || 'smtp.gmail.com',
@@ -120,7 +155,8 @@ export const ENV = {
     COT_RAW_DATA_RANGE: process.env.COT_RAW_DATA_RANGE || 'A72:W89',
     SCORE_DASHBOARD_SHEET_NAME: process.env.SCORE_DASHBOARD_SHEET_NAME || 'Sheet76',
     SCORE_DASHBOARD_SHEET_RANGE: process.env.SCORE_DASHBOARD_SHEET_RANGE || 'A2:J30',
-    SCRAPER_WEBHOOK_SECRET: process.env.SCRAPER_WEBHOOK_SECRET || 'forex-scraper-webhook-secret',
+    /** Required for scraper webhooks; never fall back to a shared source-controlled secret. */
+    SCRAPER_WEBHOOK_SECRET: process.env.SCRAPER_WEBHOOK_SECRET || '',
     /**
      * When true, loopback/private client IPs are stored as resolved rows with country
      * "Local or private network" (for local testing only). Default is false in all environments:

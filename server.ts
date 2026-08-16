@@ -7,11 +7,16 @@ import { websocketService } from './src/services/websocket.service.js';
 import { googleSheetsService } from './src/services/googleSheets.service.js';
 import { cronService } from './src/services/cron.service.js';
 import { scoreDashboardSheetSyncService } from './src/services/scoreDashboardSheetSync.service.js';
-import { runUaeMidnightArchive } from './src/services/marketDriverBoard.service.js';
+import { resumeIncompleteMarketDriverSemanticDedup } from './src/services/marketDriverBoard.service.js';
 import { runMarketDriverCoverageAudit } from './src/services/marketDriverCoverageAudit.service.js';
 import { requeuePendingVisitorGeoJobs } from './src/services/visitorGeo.service.js';
 import { startVisitorGeoWorker } from './src/workers/visitorGeo.worker.js';
 import { startTradeAlertEvaluator } from './src/workers/tradeAlertEvaluator.worker.js';
+import { startAiClassificationQueueWorker } from './src/services/aiClassificationQueue.service.js';
+import {
+    MARKET_BUSINESS_TIMEZONE,
+} from './src/utils/marketBusinessDay.util.js';
+import { runMarketDriverRollover } from './src/services/marketDriverRollover.service.js';
 
 const PORT = ENV.PORT || 5005;
 
@@ -39,15 +44,10 @@ async function runScoreDashboardSheetSyncJob() {
  * Live boards clear automatically — they only query today's `day_key`. Headlines stay in DB.
  * (RSS fetch + economic calendar scrape live in forex-scraping and notify via webhooks.)
  */
-async function runUaeMidnightArchiveTick() {
-    try {
-        const archived = await runUaeMidnightArchive();
-        if (archived > 0) {
-            websocketService.emitCalendarNewsUpdate('uae-day-archive');
-            logger.info(`[MarketDriverCron] UAE 01:00 archive finalized ${archived} day(s)`);
-        }
-    } catch (error) {
-        logger.error(`[MarketDriverCron] UAE archive failed: ${error instanceof Error ? error.message : error}`);
+async function runUaeMidnightArchiveTick(trigger: 'startup' | 'scheduled' | 'catchup' = 'scheduled') {
+    const result = await runMarketDriverRollover(trigger);
+    if (result.success && result.archivesCreatedOrRefreshed > 0) {
+        websocketService.emitCalendarNewsUpdate('uae-day-archive');
     }
 }
 
@@ -68,17 +68,32 @@ async function runCoverageAuditTick() {
     }
 }
 
+/**
+ * A crashed semantic-dedup lease may still be fresh during the first startup check. Recheck it
+ * periodically so it becomes recoverable after the lease timeout without reprocessing rows whose
+ * durable semantic_dedup_completed checkpoint is already true.
+ */
+async function runSemanticDedupRecoveryTick() {
+    try {
+        await resumeIncompleteMarketDriverSemanticDedup();
+    } catch (error) {
+        logger.error(`[MarketDriver] Failed to resume unfinished semantic-dedup checkpoints: ${error instanceof Error ? error.message : error}`);
+    }
+}
+
 httpServer.listen(PORT, async () => {
     logger.info(`Forex Dashboard Backend running on port ${PORT} in ${ENV.NODE_ENV} mode`);
 
     void runScoreDashboardSheetSyncJob();
-    void runUaeMidnightArchiveTick();
+    void runUaeMidnightArchiveTick('startup');
 
     void requeuePendingVisitorGeoJobs().catch((e) =>
         logger.error('[VisitorGeo] Failed to re-queue pending jobs', e),
     );
     startVisitorGeoWorker();
     startTradeAlertEvaluator();
+    startAiClassificationQueueWorker();
+    void runSemanticDedupRecoveryTick();
 
     cronService.startJob('scoreDashboardSheetSync', '* * * * *', async () => {
         await runScoreDashboardSheetSyncJob();
@@ -88,21 +103,24 @@ httpServer.listen(PORT, async () => {
         'marketDriverUaeDayArchive',
         '0 1 * * *',
         async () => {
-            await runUaeMidnightArchiveTick();
+            await runUaeMidnightArchiveTick('scheduled');
         },
-        { timezone: 'Asia/Dubai' },
+        { timezone: MARKET_BUSINESS_TIMEZONE },
     );
     cronService.startJob(
         'marketDriverUaeArchiveCatchup',
         '15 * * * *',
         async () => {
-            await runUaeMidnightArchiveTick();
+            await runUaeMidnightArchiveTick('catchup');
         },
-        { timezone: 'Asia/Dubai' },
+        { timezone: MARKET_BUSINESS_TIMEZONE },
     );
 
     // :07 / :37 — between */10 RSS ticks. Still guarded: skips while classify runs + 2m cooldown.
     cronService.startJob('marketDriverCoverageAudit', '7,37 * * * *', async () => {
         await runCoverageAuditTick();
+    });
+    cronService.startJob('marketDriverSemanticDedupRecovery', '* * * * *', async () => {
+        await runSemanticDedupRecoveryTick();
     });
 });

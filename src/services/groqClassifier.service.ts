@@ -1,8 +1,13 @@
+import OpenAI from 'openai';
 import { ENV } from '../config/env.js';
 import { logger } from '../utils/logger.util.js';
+import { recordAiUsage, type AiOperationType, type ProviderUsage } from './aiUsage.service.js';
 
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const REQUEST_TIMEOUT_MS = 45000;
+const REQUEST_TIMEOUT_MS = Math.max(5_000, ENV.AI_REQUEST_TIMEOUT_MS);
+const OPENAI_CLIENT = ENV.OPENAI_API_KEY
+    ? new OpenAI({ apiKey: ENV.OPENAI_API_KEY, timeout: REQUEST_TIMEOUT_MS, maxRetries: 0 })
+    : null;
 
 /**
  * When Groq returns a daily token (TPD) 429, further short retries only burn the rest of the
@@ -52,6 +57,9 @@ function noteGroq429(body: string): { dailyTpd: boolean; waitMs: number } {
 /** Tracked assets — everything else classifies to IRRELEVANT (doc §1). */
 export const TRACKED_ASSETS = ['USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD', 'NZD', 'GOLD', 'OIL'] as const;
 export type TrackedAsset = (typeof TRACKED_ASSETS)[number];
+/** The FFE Catalyst Driver rules score these eight currencies only. */
+export const CATALYST_CURRENCIES = ['USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD', 'NZD'] as const;
+export type CatalystCurrency = (typeof CATALYST_CURRENCIES)[number];
 
 export type NewsCategory = 'ECONOMIC' | 'DRIVER' | 'GEOPOLITICAL' | 'IRRELEVANT';
 export type NewsImpact = 'High' | 'Medium' | 'Low';
@@ -60,7 +68,7 @@ export type AssetBias = 'Bullish' | 'Bearish' | 'Neutral' | 'Mixed';
 export type ClassifiedAsset = {
     asset: TrackedAsset;
     bias: AssetBias;
-    /** Market-driver impact score, doc §22: +1 / +0.5 / 0 / -0.5 / -1. */
+    /** FFE Catalyst score: +1 / +0.5 / +0.25 / 0 / -0.25 / -0.5 / -1. */
     score: number;
 };
 
@@ -86,7 +94,8 @@ export type ClassifiedHeadline = {
  * Directional + asset + summary rules distilled from the automation-rules doc
  * (§1, §3, §4, §21–§25, §32, §34) + families observed on FinancialJuice + FXStreet feeds.
  *
- * DESIGN: Groq is the primary classifier for ANY new wording. Sanitize is only a thin
+ * DESIGN: the configured primary model is the classifier for ANY new wording; Groq is only the
+ * bounded fallback. Sanitize is only a thin
  * universal safety net. Do NOT add person/event-specific code when a new headline appears —
  * improve this prompt / universal families instead.
  */
@@ -103,8 +112,8 @@ Return for each headline ("i. text"):
 1) category — pick ONE using the FAMILY MAP below
 2) assets — only DIRECTLY affected tracked assets (empty if IRRELEVANT)
 3) impact — High | Medium | Low
-4) per asset: bias Bullish|Bearish|Neutral|Mixed + score matching impact
-   High± → ±1 · Medium± → ±0.5 · Low/Neutral/Mixed → 0
+4) per asset: bias Bullish|Bearish|Neutral|Mixed + score from this exact set:
+   +1, +0.5, +0.25, 0, -0.25, -0.5, -1
 5) summary — short WHY for the primary (highest |score|) asset (≤8 words). Not a truncated headline.
 
 ════════════════════════════════════════
@@ -197,6 +206,18 @@ exact same underlying moment? If yes, group them. Do not require exact wording.
 - duplicateGroups: [[principal, dup, ...], ...]
 - existingDuplicates: [{"i": batchIndex, "existingId": "id"}]
 
+FFE CATALYST DRIVER SCORING RULES — THIS OVERRIDES ANY EARLIER EXAMPLES:
+- Score only USD, EUR, GBP, JPY, CHF, CAD, AUD and NZD. Gold and oil may explain a story but never receive a Catalyst score.
+- Include only clear, unique, market-moving non-calendar drivers: central-bank/rate guidance, meaningful yield repricing, confirmed geopolitical or broad risk regime changes, strong fundamentally-driven oil moves, major China/industrial-metal developments, meaningful dairy moves, intervention warnings, or major fiscal/political developments.
+- Remove all pair-price analysis, forecasts, technical/support/resistance/target stories, naked currency moves, crypto, company news, minor politics, speculation, and scheduled CPI/GDP/employment/PMI/retail/industrial releases.
+- DXY or another currency index is only evidence of a genuine new fundamental cause. Never count the index and that same cause twice.
+- Confirmed meaningful geopolitical escalation: USD +0.5, CHF +0.5, AUD -0.5, NZD -0.5, EUR -0.25, GBP -0.25; JPY +0.5 only with confirmed safe-haven buying; CAD is not scored through geopolitics. Reverse only with clear market-confirmed de-escalation.
+- Strong fundamental oil rise: CAD +0.5 (or +1 for major/sustained surge), JPY -0.5, EUR -0.25. Strong oil fall: CAD -0.5 (or -1 major/sustained), JPY +0.25.
+- Major China/industrial-metal improvement: AUD +0.5 (or +1 major), NZD +0.25. Major deterioration reverses those signs.
+- Strong dairy rise/fall: NZD +0.5/-0.5.
+- Central-bank/rate/yield/political drivers score the directly affected currency by strength: strong ±1, moderate ±0.5, weak but valid ±0.25.
+- Count every underlying event once per affected currency; keep opposing drivers. Return a short main-driver explanation.
+
 Respond ONLY with JSON:
 {"results":[{"i":0,"category":"...","impact":"...","assets":[{"asset":"...","bias":"...","score":0}],"summary":"..."}],"duplicateGroups":[],"existingDuplicates":[]}
 Every input index must appear exactly once in "results".`;
@@ -264,69 +285,452 @@ function formatPromptHeadlineLine(index: number | string, input: string | Headli
     return hhmm ? `${prefix} [${hhmm}] ${cleaned}` : `${prefix} ${cleaned}`;
 }
 
-type GroqResponse = {
-    choices?: Array<{ message?: { content?: string } }>;
+type JsonSchema = { [key: string]: unknown };
+type ProviderResponse = {
+    parsed: Record<string, unknown>;
+    provider: 'openai' | 'groq';
+    model: string;
+};
+type RequestOptions = {
+    operationType: AiOperationType;
+    jobId?: string | null;
+    ingestId?: string | null;
+    schema: JsonSchema;
+    schemaName: string;
+    maxOutputTokens: number;
+    validate?: (value: Record<string, unknown>) => boolean;
 };
 
-async function groqJson(system: string, user: string): Promise<Record<string, unknown> | null> {
-    if (!ENV.GROQ_API_KEY) return null;
-    if (isGroqDailyLimited()) {
-        logger.warn(
-            `[GroqClassifier] Skipping call — daily TPD cooldown ${Math.ceil(groqDailyLimitRemainingMs() / 60000)}m left`,
-        );
+/**
+ * The model can occasionally return a syntactically valid strict-schema response that is
+ * incomplete for a large RSS batch (for example, one index is omitted).  Never persist a
+ * partial classification; retain a small, non-sensitive diagnostic so the caller can safely
+ * retry the same work in smaller batches.
+ */
+function completeClassificationResponseError(value: Record<string, unknown>, expectedCount: number): string | null {
+    if (!Array.isArray(value.results)) return 'results is not an array';
+    if (!Array.isArray(value.duplicateGroups)) return 'duplicateGroups is not an array';
+    if (!Array.isArray(value.existingDuplicates)) return 'existingDuplicates is not an array';
+
+    const indices = value.results.map((raw) => Number((raw as Record<string, unknown>)?.i));
+    const unique = new Set(indices);
+    const missing = Array.from({ length: expectedCount }, (_, index) => index).filter((index) => !unique.has(index));
+    if (missing.length > 0 || unique.size !== expectedCount || indices.length !== expectedCount) {
+        return `complete result set required (expected=${expectedCount}, results=${indices.length}, unique=${unique.size}, missing=${missing.length})`;
+    }
+    return null;
+}
+
+/** Test-only provider seam. Production never sets this; restart tests can return deterministic
+ * JSON and still exercise the real idempotency/job/database path without spending API quota. */
+type AiProviderRequestOverride = (
+    system: string,
+    user: string,
+    options: RequestOptions,
+) => Record<string, unknown> | null | Promise<Record<string, unknown> | null>;
+let aiProviderRequestOverride: AiProviderRequestOverride | null = null;
+
+export function setAiProviderRequestOverrideForTests(override: AiProviderRequestOverride | null): void {
+    aiProviderRequestOverride = override;
+}
+
+export type AiProviderTransportTestRequest = {
+    provider: 'openai' | 'groq';
+    model: string;
+    attempt: number;
+    operationType: AiOperationType;
+    schemaName: string;
+    schema: JsonSchema;
+    system: string;
+    user: string;
+};
+
+export type AiProviderTransportTestResponse = {
+    parsed: Record<string, unknown> | null;
+    usage?: ProviderUsage | null;
+    requestId?: string | null;
+};
+
+/**
+ * Test-only transport seam. Unlike the high-level synthetic override above, this runs inside the
+ * real primary/retry/fallback loop so verification can count every bounded provider attempt while
+ * guaranteeing that no network request or paid credential is used.
+ */
+type AiProviderTransportOverride = (
+    request: AiProviderTransportTestRequest,
+) => AiProviderTransportTestResponse | Promise<AiProviderTransportTestResponse>;
+let aiProviderTransportOverride: AiProviderTransportOverride | null = null;
+
+export function setAiProviderTransportOverrideForTests(override: AiProviderTransportOverride | null): void {
+    aiProviderTransportOverride = override;
+}
+
+const CLASSIFICATION_RESPONSE_SCHEMA: JsonSchema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+        results: {
+            type: 'array',
+            items: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                    i: { type: 'integer', minimum: 0 },
+                    category: { type: 'string', enum: ['ECONOMIC', 'DRIVER', 'GEOPOLITICAL', 'IRRELEVANT'] },
+                    impact: { type: 'string', enum: ['High', 'Medium', 'Low'] },
+                    assets: {
+                        type: 'array',
+                        items: {
+                            type: 'object',
+                            additionalProperties: false,
+                            properties: {
+                                asset: { type: 'string', enum: [...TRACKED_ASSETS] },
+                                bias: { type: 'string', enum: ['Bullish', 'Bearish', 'Neutral', 'Mixed'] },
+                                score: { type: 'number' },
+                            },
+                            required: ['asset', 'bias', 'score'],
+                        },
+                    },
+                    summary: { type: 'string' },
+                },
+                required: ['i', 'category', 'impact', 'assets', 'summary'],
+            },
+        },
+        duplicateGroups: {
+            type: 'array',
+            items: { type: 'array', items: { type: 'integer', minimum: 0 } },
+        },
+        existingDuplicates: {
+            type: 'array',
+            items: {
+                type: 'object',
+                additionalProperties: false,
+                properties: { i: { type: 'integer', minimum: 0 }, existingId: { type: 'string' } },
+                required: ['i', 'existingId'],
+            },
+        },
+    },
+    required: ['results', 'duplicateGroups', 'existingDuplicates'],
+};
+
+/**
+ * Strict Structured Outputs guarantees the declared JSON shape, but an unconstrained array can
+ * still contain too few or too many rows. Bind the schema to this request's batch size so the
+ * provider cannot legally emit 11/13/55 results for a 12-headline prompt.
+ * Use `enum` for index to force the model to use EXACTLY the range [0, expectedCount-1],
+ * which prevents incomplete/duplicate responses and avoids expensive split/retry cycles.
+ */
+function classificationResponseSchema(expectedCount: number): JsonSchema {
+    const schema = structuredClone(CLASSIFICATION_RESPONSE_SCHEMA) as {
+        properties: {
+            results: {
+                minItems?: number;
+                maxItems?: number;
+                items: { properties: { i: { maximum?: number; enum?: number[] } } };
+            };
+        };
+    };
+    schema.properties.results.minItems = expectedCount;
+    schema.properties.results.maxItems = expectedCount;
+    // Use enum to force the model to use EXACTLY the valid indices [0, 1, ..., expectedCount-1]
+    // This prevents the model from omitting indices or using invalid ones
+    schema.properties.results.items.properties.i.enum = Array.from(
+        { length: expectedCount },
+        (_, i) => i,
+    );
+    delete schema.properties.results.items.properties.i.maximum;
+    return schema as JsonSchema;
+}
+
+const DEDUP_RESPONSE_SCHEMA: JsonSchema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+        duplicateGroups: {
+            type: 'array',
+            items: { type: 'array', items: { type: 'integer', minimum: 0 } },
+        },
+    },
+    required: ['duplicateGroups'],
+};
+
+type GroqResponse = {
+    id?: string;
+    choices?: Array<{ message?: { content?: string } }>;
+    usage?: Record<string, unknown>;
+};
+
+function retryableStatus(status: number | null): boolean {
+    return status === 408 || status === 409 || status === 429 || (status != null && status >= 500);
+}
+
+function errorStatus(error: unknown): number | null {
+    const status = (error as { status?: unknown })?.status;
+    return typeof status === 'number' ? status : null;
+}
+
+function errorKind(error: unknown, status: number | null): string {
+    if ((error as { name?: unknown })?.name === 'AbortError' || /timeout|timed out/i.test(String((error as Error)?.message ?? error))) {
+        return 'timeout';
+    }
+    if (status === 401 || status === 403) return 'authentication';
+    if (status === 429) return 'rate_limit';
+    if (status != null && status >= 500) return 'server';
+    if (status === 400 || status === 404) return 'permanent';
+    return 'network';
+}
+
+function safeProviderMessage(error: unknown): string {
+    return String((error as Error)?.message ?? error).replace(/\s+/g, ' ').slice(0, 500);
+}
+
+function parseUsage(raw: unknown, requestId?: string | null): ProviderUsage {
+    const value = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
+    const inputDetails = value.input_tokens_details as Record<string, unknown> | undefined;
+    const promptDetails = value.prompt_tokens_details as Record<string, unknown> | undefined;
+    const outputDetails = value.output_tokens_details as Record<string, unknown> | undefined;
+    const completionDetails = value.completion_tokens_details as Record<string, unknown> | undefined;
+    const number = (...values: unknown[]): number | null => {
+        const found = values.find((v) => typeof v === 'number' && Number.isFinite(v));
+        return found == null ? null : Number(found);
+    };
+    return {
+        inputTokens: number(value.input_tokens, value.prompt_tokens),
+        cachedInputTokens: number(inputDetails?.cached_tokens, promptDetails?.cached_tokens),
+        outputTokens: number(value.output_tokens, value.completion_tokens),
+        reasoningTokens: number(outputDetails?.reasoning_tokens, completionDetails?.reasoning_tokens),
+        totalTokens: number(value.total_tokens),
+        requestId: requestId ?? null,
+    };
+}
+
+function parseJsonText(content: unknown): Record<string, unknown> | null {
+    if (typeof content !== 'string' || !content.trim()) return null;
+    try {
+        const parsed: unknown = JSON.parse(content);
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+            ? parsed as Record<string, unknown>
+            : null;
+    } catch {
         return null;
     }
-    const maxAttempts = 4;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-        try {
-            const res = await fetch(GROQ_URL, {
-                method: 'POST',
-                signal: controller.signal,
-                headers: {
-                    Authorization: `Bearer ${ENV.GROQ_API_KEY}`,
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    model: ENV.GROQ_MODEL,
-                    temperature: 0,
-                    response_format: { type: 'json_object' },
-                    messages: [
-                        { role: 'system', content: system },
-                        { role: 'user', content: user },
-                    ],
-                }),
-            });
+}
 
-            if (res.status === 429) {
-                const body = (await res.text()).slice(0, 500);
-                const { dailyTpd, waitMs } = noteGroq429(body);
-                logger.error(`[GroqClassifier] Groq returned 429: ${body.slice(0, 300)}`);
-                if (dailyTpd) return null; // do not burn remaining daily budget with short retries
-                if (attempt < maxAttempts) {
-                    const backoff = Math.max(waitMs, 5000 * attempt);
-                    logger.warn(
-                        `[GroqClassifier] Rate-limited (429); retrying in ${backoff}ms (attempt ${attempt}/${maxAttempts})`,
-                    );
-                    await new Promise((r) => setTimeout(r, backoff));
-                    continue;
+function openAiText(response: unknown): string | null {
+    const value = response as { output_text?: unknown; output?: unknown };
+    if (typeof value.output_text === 'string') return value.output_text;
+    if (!Array.isArray(value.output)) return null;
+    const chunks: string[] = [];
+    for (const item of value.output) {
+        const content = (item as { content?: unknown })?.content;
+        if (!Array.isArray(content)) continue;
+        for (const part of content) {
+            const text = (part as { text?: unknown })?.text;
+            if (typeof text === 'string') chunks.push(text);
+        }
+    }
+    return chunks.join('') || null;
+}
+
+async function waitBeforeRetry(attempt: number, retryAfterMs?: number | null): Promise<void> {
+    const delay = Math.min(
+        60_000,
+        Math.max(retryAfterMs ?? 0, ENV.AI_RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1)),
+    );
+    if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+}
+
+async function requestJson(system: string, user: string, options: RequestOptions): Promise<ProviderResponse | null> {
+    if (aiProviderRequestOverride) {
+        const startedAt = Date.now();
+        const parsed = await aiProviderRequestOverride(system, user, options);
+        const valid = parsed !== null && (!options.validate || options.validate(parsed));
+        await recordAiUsage({
+            provider: 'openai',
+            model: 'restart-test-synthetic',
+            operationType: options.operationType,
+            jobId: options.jobId,
+            ingestId: options.ingestId,
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            requestStatus: valid ? 'success' : 'error',
+            latencyMs: Date.now() - startedAt,
+            attemptNumber: 1,
+            isRetry: false,
+            isFallback: false,
+            errorKind: valid ? null : 'schema',
+            errorMessage: valid ? null : 'Synthetic test response failed schema validation',
+        });
+        return valid ? { parsed: parsed!, provider: 'openai', model: 'restart-test-synthetic' } : null;
+    }
+    const providers: Array<'openai' | 'groq'> = ['openai', 'groq'];
+    for (const provider of providers) {
+        if (provider === 'openai' && !OPENAI_CLIENT && !aiProviderTransportOverride) {
+            logger.warn('[AIProvider] OpenAI primary is not configured; trying Groq fallback');
+            continue;
+        }
+        if (provider === 'groq' && !ENV.GROQ_API_KEY && !aiProviderTransportOverride) {
+            logger.warn('[AIProvider] Groq fallback is not configured');
+            continue;
+        }
+        if (provider === 'groq' && isGroqDailyLimited()) {
+            logger.warn(`[AIProvider] Groq fallback paused by daily limit (${Math.ceil(groqDailyLimitRemainingMs() / 60000)}m left)`);
+            continue;
+        }
+
+        const model = provider === 'openai' ? ENV.OPENAI_CLASSIFICATION_MODEL : ENV.GROQ_FALLBACK_MODEL;
+        const maxAttempts = provider === 'openai'
+            ? Math.max(1, ENV.AI_PRIMARY_MAX_ATTEMPTS)
+            : Math.max(1, ENV.AI_FALLBACK_MAX_ATTEMPTS);
+        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+            const startedAt = Date.now();
+            let usage: ProviderUsage = {};
+            let requestId: string | null = null;
+            try {
+                let parsed: Record<string, unknown> | null = null;
+                if (aiProviderTransportOverride) {
+                    const mocked = await aiProviderTransportOverride({
+                        provider,
+                        model,
+                        attempt,
+                        operationType: options.operationType,
+                        schemaName: options.schemaName,
+                        schema: options.schema,
+                        system,
+                        user,
+                    });
+                    parsed = mocked.parsed;
+                    usage = mocked.usage ?? {};
+                    requestId = mocked.requestId ?? mocked.usage?.requestId ?? null;
+                } else if (provider === 'openai') {
+                    const response = await OPENAI_CLIENT!.responses.create({
+                        model,
+                        input: [
+                            { role: 'system', content: system },
+                            { role: 'user', content: user },
+                        ],
+                        reasoning: { effort: ENV.AI_OPENAI_REASONING_EFFORT as 'none' | 'low' | 'medium' | 'high' | 'xhigh' },
+                        max_output_tokens: Math.max(128, options.maxOutputTokens),
+                        text: {
+                            format: {
+                                type: 'json_schema',
+                                name: options.schemaName,
+                                strict: true,
+                                schema: options.schema,
+                            },
+                        },
+                    });
+                    const responseValue = response as unknown as Record<string, unknown>;
+                    requestId = typeof responseValue._request_id === 'string'
+                        ? responseValue._request_id
+                        : (typeof responseValue.id === 'string' ? responseValue.id : null);
+                    usage = parseUsage(responseValue.usage, requestId);
+                    parsed = parseJsonText(openAiText(response));
+                } else {
+                    const controller = new AbortController();
+                    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+                    try {
+                        const response = await fetch(GROQ_URL, {
+                            method: 'POST',
+                            signal: controller.signal,
+                            headers: {
+                                Authorization: `Bearer ${ENV.GROQ_API_KEY}`,
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify({
+                                model,
+                                temperature: 0,
+                                max_tokens: Math.max(128, options.maxOutputTokens),
+                                reasoning_effort: ENV.AI_GROQ_REASONING_EFFORT,
+                                include_reasoning: ENV.AI_GROQ_INCLUDE_REASONING,
+                                response_format: { type: 'json_object' },
+                                messages: [
+                                    { role: 'system', content: system },
+                                    { role: 'user', content: user },
+                                ],
+                            }),
+                        });
+                        requestId = response.headers.get('x-request-id');
+                        if (!response.ok) {
+                            const body = (await response.text()).slice(0, 500);
+                            const status = response.status;
+                            if (status === 429) {
+                                const { dailyTpd, waitMs } = noteGroq429(body);
+                                logger.warn('[AIProvider] Groq request rate limited', { status, dailyTpd, attempt });
+                                await recordAiUsage({
+                                    provider, model, operationType: options.operationType, jobId: options.jobId,
+                                    ingestId: options.ingestId, usage: { ...usage, requestId }, requestStatus: 'error',
+                                    latencyMs: Date.now() - startedAt, attemptNumber: attempt, isRetry: attempt > 1,
+                                    isFallback: true, errorKind: dailyTpd ? 'daily_limit' : 'rate_limit',
+                                    errorMessage: body,
+                                });
+                                if (dailyTpd) break;
+                                if (attempt < maxAttempts) {
+                                    await waitBeforeRetry(attempt, waitMs);
+                                    continue;
+                                }
+                                break;
+                            }
+                            const kind = retryableStatus(status) ? errorKind(null, status) : errorKind(null, status);
+                            const message = `Groq returned HTTP ${status}`;
+                            await recordAiUsage({
+                                provider, model, operationType: options.operationType, jobId: options.jobId,
+                                ingestId: options.ingestId, usage: { ...usage, requestId }, requestStatus: 'error',
+                                latencyMs: Date.now() - startedAt, attemptNumber: attempt, isRetry: attempt > 1,
+                                isFallback: true, errorKind: kind, errorMessage: message,
+                            });
+                            if (retryableStatus(status) && attempt < maxAttempts) {
+                                await waitBeforeRetry(attempt);
+                                continue;
+                            }
+                            break;
+                        }
+                        const json = await response.json() as GroqResponse;
+                        usage = parseUsage(json.usage, requestId ?? json.id ?? null);
+                        parsed = parseJsonText(json.choices?.[0]?.message?.content);
+                    } finally {
+                        clearTimeout(timeout);
+                    }
                 }
-                return null;
+
+                const valid = parsed !== null && (!options.validate || options.validate(parsed));
+                await recordAiUsage({
+                    provider, model, operationType: options.operationType, jobId: options.jobId,
+                    ingestId: options.ingestId, usage, requestStatus: valid ? 'success' : 'error',
+                    latencyMs: Date.now() - startedAt, attemptNumber: attempt, isRetry: attempt > 1,
+                    isFallback: provider === 'groq', errorKind: valid ? null : 'schema',
+                    errorMessage: valid ? null : 'Provider response did not satisfy the required JSON schema',
+                });
+                if (valid) {
+                    logger.info('[AIProvider] Request complete', {
+                        provider,
+                        model,
+                        operationType: options.operationType,
+                        attempt,
+                        latencyMs: Date.now() - startedAt,
+                        usageAvailable: Object.values(usage).some((value) => value != null),
+                    });
+                    return { parsed: parsed!, provider, model };
+                }
+                // Schema/validation failures are permanent for this response. Do not retry the
+                // same malformed output indefinitely; move directly to the bounded fallback.
+                break;
+            } catch (error) {
+                const status = errorStatus(error);
+                const kind = errorKind(error, status);
+                const retryable = retryableStatus(status) || status === null;
+                await recordAiUsage({
+                    provider, model, operationType: options.operationType, jobId: options.jobId,
+                    ingestId: options.ingestId, usage: { ...usage, requestId }, requestStatus: 'error',
+                    latencyMs: Date.now() - startedAt, attemptNumber: attempt, isRetry: attempt > 1,
+                    isFallback: provider === 'groq', errorKind: kind, errorMessage: safeProviderMessage(error),
+                });
+                logger.warn('[AIProvider] Provider request failed', { provider, model, kind, attempt });
+                if (!retryable || attempt >= maxAttempts) break;
+                await waitBeforeRetry(attempt);
             }
-            if (!res.ok) {
-                logger.error(`[GroqClassifier] Groq returned ${res.status}: ${(await res.text()).slice(0, 300)}`);
-                return null;
-            }
-            const json = (await res.json()) as GroqResponse;
-            const content = json.choices?.[0]?.message?.content;
-            if (!content) return null;
-            return JSON.parse(content) as Record<string, unknown>;
-        } catch (error) {
-            logger.error(`[GroqClassifier] Request failed: ${(error as Error).message}`);
-            return null;
-        } finally {
-            clearTimeout(timeout);
+        }
+        if (provider === 'openai') {
+            logger.warn('[AIProvider] OpenAI primary produced no usable result; trying Groq fallback once within its retry policy');
         }
     }
     return null;
@@ -338,18 +742,29 @@ async function groqJson(system: string, user: string): Promise<Record<string, un
  */
 export async function findBatchDuplicateMap(
     headlines: Array<string | HeadlineInput>,
+    options: { jobId?: string | null; ingestId?: string | null } = {},
 ): Promise<Map<number, number>> {
     const out = new Map<number, number>();
     if (headlines.length < 2) return out;
 
     const normalized = headlines.map(normalizeHeadlineInput);
-    const parsed = await groqJson(
+    const response = await requestJson(
         DEDUP_ONLY_PROMPT,
         'Find duplicate groups among (times are Asia/Dubai HH:MM when known):\n' +
             normalized.map((h, i) => formatPromptHeadlineLine(i, h)).join('\n'),
+        {
+            operationType: 'semantic_dedup',
+            jobId: options.jobId,
+            ingestId: options.ingestId,
+            schema: DEDUP_RESPONSE_SCHEMA,
+            schemaName: 'market_driver_dedup',
+            maxOutputTokens: ENV.AI_DEDUP_MAX_OUTPUT_TOKENS,
+            validate: (value) => Array.isArray(value.duplicateGroups),
+        },
     );
+    const parsed = response?.parsed ?? null;
     if (!parsed) {
-        // Fall through to deterministic backstop even when Groq is unavailable.
+        // Fall through to deterministic backstop even when both providers are unavailable.
     } else {
         for (const groupRaw of Array.isArray(parsed.duplicateGroups) ? parsed.duplicateGroups : []) {
             if (!Array.isArray(groupRaw) || groupRaw.length < 2) continue;
@@ -642,9 +1057,155 @@ export function alignScoreToImpact(
 
     if (sign === 0) return { bias: 'Neutral', score: 0 };
 
-    const magnitude = impact === 'High' ? 1 : 0.5;
+    const requestedMagnitude = Math.abs(Number(rawScore));
+    const magnitude = requestedMagnitude >= 0.75 ? 1 : requestedMagnitude >= 0.375 ? 0.5 : 0.25;
     const score = sign * magnitude;
     return { bias: score > 0 ? 'Bullish' : 'Bearish', score };
+}
+
+function catalystImpactForScore(score: number): NewsImpact {
+    if (Math.abs(score) >= 0.75) return 'High';
+    return 'Medium';
+}
+
+function catalystAsset(asset: CatalystCurrency, score: number): ClassifiedAsset {
+    return {
+        asset,
+        bias: score > 0 ? 'Bullish' : score < 0 ? 'Bearish' : 'Neutral',
+        score: Math.max(-1, Math.min(1, Math.round(score * 4) / 4)),
+    };
+}
+
+function byCatalystCurrency(assets: ClassifiedAsset[]): ClassifiedAsset[] {
+    const best = new Map<CatalystCurrency, ClassifiedAsset>();
+    for (const asset of assets) {
+        if (!CATALYST_CURRENCIES.includes(asset.asset as CatalystCurrency)) continue;
+        const score = Math.max(-1, Math.min(1, Math.round(Number(asset.score || 0) * 4) / 4));
+        if (score === 0) continue;
+        const next = catalystAsset(asset.asset as CatalystCurrency, score);
+        const current = best.get(next.asset as CatalystCurrency);
+        if (!current || Math.abs(next.score) > Math.abs(current.score)) {
+            best.set(next.asset as CatalystCurrency, next);
+        }
+    }
+    return [...best.values()];
+}
+
+function isCatalystExcludedHeadline(headline: string): boolean {
+    const h = headline.toLowerCase();
+    if (isScheduledDataReleaseHeadline(headline)) return true;
+    if (/\b(price forecast|forecast:|technical analysis|support|resistance|breakout|chart|moving average|ema|rsi|fibonacci|price target)\b/.test(h)) return true;
+    if (/\b(eur\/usd|gbp\/usd|usd\/jpy|aud\/usd|nzd\/usd|usd\/cad|eur\/jpy|gbp\/jpy|xau\/usd)\b/.test(h) &&
+        /\b(gains?|falls?|rall(?:y|ies)|weakens?|tests?|trades?|near|above|below|holds?)\b/.test(h) &&
+        !/\b(fed|fomc|ecb|boe|boj|boc|rba|rbnz|snb|yield|rate|sanction|tariff|fiscal|intervention|risk[- ]?(?:on|off)|oil supply|opec)\b/.test(h)) return true;
+    if (/\b(bitcoin|ethereum|xrp|crypto|btc|eth|nvidia|tesla|earnings|shares?)\b/.test(h)) return true;
+    if (
+        /\b(may|might|could|likely|expected to|rumou?r)\b/.test(h) &&
+        !/\b(markets? (?:price|fully price)|rate expectations?|yield repricing)\b/.test(h) &&
+        !isCentralBankSpeechHeadline(headline)
+    ) return true;
+    return false;
+}
+
+function hasConfirmedJpySafeHavenFlow(headline: string): boolean {
+    return /\b(jpy|yen|japanese assets?)\b/i.test(headline) &&
+        /\b(safe[- ]?haven|strengthens?|gains?|buying|demand|usd\/jpy (?:falls?|drops?|slides?))\b/i.test(headline);
+}
+
+function isConfirmedGeoOrRiskOff(headline: string): boolean {
+    const h = headline.toLowerCase();
+    const confirmedEscalation = /\b(strikes?|attack(?:ed|s)?|missiles?|war expansion|blockade|shipping disruption|hormuz|red sea|energy infrastructure|major sanctions?)\b/.test(h);
+    const broadRiskOff = /\b(risk[- ]?off|safe[- ]?haven demand|broad equity sell-?off|global stocks? (?:fall|drop|slide))\b/.test(h);
+    return (isGeopoliticalConflictHeadline(headline) && confirmedEscalation) || broadRiskOff;
+}
+
+function hasClearDeEscalation(headline: string): boolean {
+    return /\b(confirmed ceasefire|ceasefire agreement|truce agreed|shipping (?:reopens?|reopened)|hormuz (?:reopens?|reopened)|de-?escalat(?:ion|es)|tensions? eas(?:e|es|d))\b/i.test(headline);
+}
+
+function geoCatalystScores(headline: string): ClassifiedAsset[] | null {
+    if (!isConfirmedGeoOrRiskOff(headline) && !hasClearDeEscalation(headline)) return null;
+    const sign = hasClearDeEscalation(headline) ? -1 : 1;
+    const scores: ClassifiedAsset[] = [
+        catalystAsset('USD', sign * 0.5),
+        catalystAsset('CHF', sign * 0.5),
+        catalystAsset('AUD', sign * -0.5),
+        catalystAsset('NZD', sign * -0.5),
+        catalystAsset('EUR', sign * -0.25),
+        catalystAsset('GBP', sign * -0.25),
+    ];
+    if (hasConfirmedJpySafeHavenFlow(headline)) scores.push(catalystAsset('JPY', sign * 0.5));
+    return scores;
+}
+
+function oilCatalystScores(headline: string): ClassifiedAsset[] | null {
+    const h = headline.toLowerCase();
+    const hasOil = /\b(wti|brent|crude|oil prices?|opec)\b/.test(h);
+    const fundamentalCause = /\b(supply disruption|hormuz|red sea|opec|production cut|inventory shock|physical (?:shortage|market)|sanctions?|geopolitical supply|pipeline)\b/.test(h);
+    if (!hasOil || !fundamentalCause) return null;
+    const rising = /\b(rises?|rall(?:y|ies)|surges?|spikes?|jumps?|gains?|higher)\b/.test(h);
+    const falling = /\b(falls?|drops?|tumbles?|slides?|plunges?|lower)\b/.test(h);
+    if (rising === falling) return null;
+    const major = /\b(major|sustained|sharp|surge|spike|plunge|record|hormuz (?:closure|closed)|supply disruption)\b/.test(h);
+    if (rising) {
+        return [catalystAsset('CAD', major ? 1 : 0.5), catalystAsset('JPY', -0.5), catalystAsset('EUR', -0.25)];
+    }
+    return [catalystAsset('CAD', major ? -1 : -0.5), catalystAsset('JPY', 0.25)];
+}
+
+function chinaCatalystScores(headline: string): ClassifiedAsset[] | null {
+    const h = headline.toLowerCase();
+    const chinaOrMetals = /\b(china|chinese|iron ore|copper|industrial metals?)\b/.test(h);
+    const growthOrDemand = /\b(stimulus|growth outlook|property|construction|industrial demand|industrial activity|demand)\b/.test(h);
+    if (!chinaOrMetals || !growthOrDemand) return null;
+    const stronger = /\b(stimulus|rebound|upgrade|improv|stronger|surge|rise|recovery)\b/.test(h);
+    const weaker = /\b(downgrade|deteriorat|weak(?:er|ness)?|sharp fall|decline|slump|crisis)\b/.test(h);
+    if (stronger === weaker) return null;
+    const major = /\b(major|large|strong|sharp|severe|significant)\b/.test(h);
+    const sign = stronger ? 1 : -1;
+    return [catalystAsset('AUD', sign * (major ? 1 : 0.5)), catalystAsset('NZD', sign * 0.25)];
+}
+
+function dairyCatalystScores(headline: string): ClassifiedAsset[] | null {
+    const h = headline.toLowerCase();
+    if (!/\b(dairy|milk prices?|global dairy trade|gdt)\b/.test(h) || !/\b(strong|sharp|meaningful|surge|plunge|large)\b/.test(h)) return null;
+    const up = /\b(rises?|gains?|surges?|higher|up)\b/.test(h);
+    const down = /\b(falls?|drops?|plunges?|lower|down)\b/.test(h);
+    return up === down ? null : [catalystAsset('NZD', up ? 0.5 : -0.5)];
+}
+
+function policyOrYieldScore(headline: string): number {
+    const h = headline.toLowerCase();
+    const positive = /\b(hawkish|rate hike|higher for longer|tighten(?:ing)?|yields? (?:rise|rally)|intervention (?:warning|threat))\b/.test(h);
+    const negative = /\b(dovish|rate cut|eas(?:e|ing)|yields? (?:fall|drop)|intervention to weaken)\b/.test(h);
+    if (positive === negative) return 0;
+    const magnitude = /\b(fully price|sharply|major|clear shift|material|aggressive)\b/.test(h) ? 1
+        : /\b(mild|slight|some concern|gradual)\b/.test(h) ? 0.25 : 0.5;
+    return positive ? magnitude : -magnitude;
+}
+
+function policyOrYieldCatalystScores(headline: string, assets: ClassifiedAsset[]): ClassifiedAsset[] | null {
+    const h = headline.toLowerCase();
+    const relevant = isCentralBankSpeechHeadline(headline) || /\b(rate expectations?|yield repricing|bond yields?|treasury yields?|fiscal|tariff|intervention|dollar index|\bdxy\b)\b/.test(h);
+    if (!relevant) return null;
+    const score = policyOrYieldScore(headline);
+    const bankAsset = centralBankToAsset(headline);
+    if (bankAsset && score !== 0 && CATALYST_CURRENCIES.includes(bankAsset as CatalystCurrency)) {
+        return [catalystAsset(bankAsset as CatalystCurrency, score)];
+    }
+    const direct = byCatalystCurrency(assets);
+    return direct.length ? direct : null;
+}
+
+function applyFfeCatalystRules(headline: string, assets: ClassifiedAsset[]): ClassifiedAsset[] {
+    // An explicit strong oil move uses the dedicated oil table even when its
+    // cause is geopolitical; otherwise the geopolitical/risk table applies.
+    return oilCatalystScores(headline)
+        ?? geoCatalystScores(headline)
+        ?? chinaCatalystScores(headline)
+        ?? dairyCatalystScores(headline)
+        ?? policyOrYieldCatalystScores(headline, assets)
+        ?? [];
 }
 
 /** Nat gas / diesel / gasoline alone are not Crude Oil (doc §1 / §32). */
@@ -996,8 +1557,7 @@ function isCentralBankSpeechHeadline(headline: string): boolean {
         /\b(bank of england|bank of japan|european central bank|federal reserve|people'?s bank of china)\b/.test(h);
     // Universal: bank + speech/guidance markers (any official). Person names are optional boosters only.
     const speechCue =
-        /\b(says|said|speech|guidance|minutes|chief economist|governor|president)\b/.test(h) ||
-        /:/.test(h) ||
+        /\b(says|said|signals?|express(?:es|ed)?|policymakers?|speech|guidance|minutes|chief economist|governor|president)\b/.test(h) ||
         /\b(midpoint|fixing|reference rate)\b/.test(h);
     return bank && speechCue && !isScheduledDataReleaseHeadline(headline);
 }
@@ -1011,7 +1571,9 @@ function centralBankToAsset(headline: string): TrackedAsset | null {
     if (/\b(ecb|european central bank)\b/.test(h)) return 'EUR';
     if (/\b(boj|bank of japan)\b/.test(h)) return 'JPY';
     if (/\b(fed|fomc|federal reserve)\b/.test(h)) return 'USD';
-    if (/\b(pboc|people'?s bank of china)\b/.test(h)) return 'USD';
+    // CNY/CNH is outside the eight-currency Catalyst table. PBoC policy must never be relabelled
+    // as a USD catalyst; broader confirmed China/metals drivers are handled by the AUD/NZD rules.
+    if (/\b(pboc|people'?s bank of china)\b/.test(h)) return null;
     if (/\bsnb\b/.test(h)) return 'CHF';
     return null;
 }
@@ -1073,8 +1635,11 @@ function trackedAssetHintsFromHeadline(headline: string): TrackedAsset[] {
     if (/\b(wti|brent|crude|\boil\b|opec|hormuz)\b/.test(h) && !/\bheating oil|natural gas|gasoline\b/.test(h)) {
         add('OIL');
     }
-    // USD/CNY or yuan vs dollar still affects USD.
-    if (/\b(yuan|cny|pboc|usd\/cny)\b/.test(h)) add('USD');
+    // USD/CNY pair movements or PBOC rate-fixing (not generic yuan speculation). Do NOT add USD
+    // for PBoC policy statements or Chinese yuan forecasts that don't explicitly discuss the dollar.
+    if (/\b(usd\/cny|yuan.*vs.*dollar|dollar.*vs.*yuan|cny.*vs.*dollar|fixing|reference rate)\b/.test(h) && /\b(pboc|yuan|cny)\b/.test(h)) {
+        add('USD');
+    }
     return out;
 }
 
@@ -1108,8 +1673,9 @@ export function isBoardVisibleClassification(input: {
 }): boolean {
     if (input.duplicateOf) return false;
     if (!['DRIVER', 'GEOPOLITICAL'].includes(String(input.category).toUpperCase())) return false;
-    if (!['High', 'Medium'].includes(input.impact)) return false;
-    return Array.isArray(input.assets) && input.assets.length > 0;
+    return Array.isArray(input.assets) && input.assets.some(
+        (asset) => CATALYST_CURRENCIES.includes(asset.asset as CatalystCurrency) && asset.score !== 0,
+    );
 }
 
 /**
@@ -1128,12 +1694,12 @@ export function sanitizeClassification(
 ): Omit<ClassifiedHeadline, 'index' | 'duplicateOfExistingId' | 'duplicateOfBatchIndex'> {
     let { category, impact, assets, summary } = input;
 
-    if (isDocIgnoredHeadline(headline) || isNonCrudeEnergyHeadline(headline)) {
+    if (isDocIgnoredHeadline(headline) || isNonCrudeEnergyHeadline(headline) || isCatalystExcludedHeadline(headline)) {
         return {
             category: 'IRRELEVANT',
             impact: 'Low',
             assets: [],
-            summary: isDocIgnoredHeadline(headline) ? 'Outside tracked-asset universe' : 'Non-crude energy product ignored',
+            summary: isDocIgnoredHeadline(headline) ? 'Outside tracked-asset universe' : 'Not a valid Catalyst Driver',
         };
     }
 
@@ -1144,12 +1710,6 @@ export function sanitizeClassification(
             assets: [],
             summary: 'No tracked-asset impact',
         };
-    }
-
-    // Doc §4 A: scheduled data prints belong on Economic Calendar, not News Headline.
-    if (isScheduledDataReleaseHeadline(headline) && !isFxMarketCommentaryHeadline(headline)) {
-        category = 'ECONOMIC';
-        // Keep whatever assets Groq assigned for Currency Health; board filters ECONOMIC out.
     }
 
     // Drop OIL tags with no crude / ME-energy basis (stops N Korea→OIL, local fire→OIL, etc.).
@@ -1175,23 +1735,6 @@ export function sanitizeClassification(
         assets = assets.filter((a) => a.asset !== 'OIL');
         const aligned = alignScoreToImpact(oilImpact, 'Bullish', 0.5);
         assets.push({ asset: 'OIL', bias: aligned.bias, score: aligned.score });
-    }
-
-    // Universal §4 B: FX market wraps → DRIVER ≥ Medium with tracked assets.
-    if (
-        isFxMarketCommentaryHeadline(headline) &&
-        !isScheduledDataReleaseHeadline(headline)
-    ) {
-        const hints = trackedAssetHintsFromHeadline(headline);
-        if (hints.length > 0 || assets.length > 0) {
-            if (category === 'ECONOMIC' || category === 'IRRELEVANT') category = 'DRIVER';
-            if (impact === 'Low') impact = 'Medium';
-            if (assets.length === 0 && hints.length > 0) {
-                const bias = biasFromMoveLanguage(headline);
-                const aligned = alignScoreToImpact(impact, bias, bias === 'Neutral' ? 0 : 0.5);
-                assets = hints.slice(0, 2).map((asset) => ({ asset, bias: aligned.bias, score: aligned.score }));
-            }
-        }
     }
 
     // Universal §4 B: CB speech / fixing / guidance → DRIVER ≥ Medium.
@@ -1254,13 +1797,19 @@ export function sanitizeClassification(
         return { asset: a.asset, bias: aligned.bias, score: aligned.score };
     });
 
+    // FFE Catalyst Driver Scoring Rules are the final authority. They replace broad
+    // FX-wrap/OIL tagging with one event-level, eight-currency score set.
+    assets = applyFfeCatalystRules(headline, assets);
     if (assets.length === 0) {
-        category = 'IRRELEVANT';
-        impact = 'Low';
-    } else if (category === 'IRRELEVANT') {
-        category = 'DRIVER';
-        if (impact === 'Low') impact = 'Medium';
+        return {
+            category: 'IRRELEVANT',
+            impact: 'Low',
+            assets: [],
+            summary: 'No clear, market-moving Catalyst Driver',
+        };
     }
+    category = isConfirmedGeoOrRiskOff(headline) || hasClearDeEscalation(headline) ? 'GEOPOLITICAL' : 'DRIVER';
+    impact = catalystImpactForScore(Math.max(...assets.map((asset) => Math.abs(asset.score))));
 
     summary = ensureReasonSummary(summary, headline, impact, assets, category);
 
@@ -1301,7 +1850,7 @@ function coerceResult(
         let rawScore = Number(o.score);
         if (!Number.isFinite(rawScore)) rawScore = 0;
         rawScore = Math.max(-1, Math.min(1, rawScore));
-        rawScore = Math.round(rawScore * 2) / 2;
+        rawScore = Math.round(rawScore * 4) / 4;
 
         const aligned = alignScoreToImpact(impact, biasGuess, rawScore);
         assets.push({ asset: asset as TrackedAsset, bias: aligned.bias, score: aligned.score });
@@ -1324,25 +1873,16 @@ function coerceResult(
 }
 
 /**
- * Batch-classify headlines in one Groq call, including deduplication against `existingTopics`
+ * Batch-classify headlines in one bounded provider call, including deduplication against `existingTopics`
  * and against each other within the batch. Returns [] on failure so the caller can skip this cycle.
  * Prefer HeadlineInput with publishedAt so [HH:MM] reaches the model for same-briefing judgment.
  */
 export async function classifyHeadlines(
     headlines: Array<string | HeadlineInput>,
     existingTopics: ExistingTopic[] = [],
+    options: { operationType?: AiOperationType; jobId?: string | null; ingestId?: string | null } = {},
 ): Promise<ClassifiedHeadline[]> {
     if (headlines.length === 0) return [];
-    if (!ENV.GROQ_API_KEY) {
-        logger.error('[GroqClassifier] GROQ_API_KEY is not set — skipping classification');
-        return [];
-    }
-    if (isGroqDailyLimited()) {
-        logger.warn(
-            `[GroqClassifier] Skipping batch of ${headlines.length} — daily TPD cooldown ${Math.ceil(groqDailyLimitRemainingMs() / 60000)}m left`,
-        );
-        return [];
-    }
 
     const normalized = headlines.map(normalizeHeadlineInput);
     const headlineTexts = normalized.map((h) => h.text);
@@ -1357,118 +1897,102 @@ export async function classifyHeadlines(
         normalized.map((h, i) => formatPromptHeadlineLine(i, h)).join('\n') +
         existingBlock;
 
-    const maxAttempts = 4;
-    try {
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-            let res: Response;
-            try {
-                res = await fetch(GROQ_URL, {
-                    method: 'POST',
-                    signal: controller.signal,
-                    headers: {
-                        Authorization: `Bearer ${ENV.GROQ_API_KEY}`,
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({
-                        model: ENV.GROQ_MODEL,
-                        temperature: 0,
-                        response_format: { type: 'json_object' },
-                        messages: [
-                            { role: 'system', content: SYSTEM_PROMPT },
-                            { role: 'user', content: userContent },
-                        ],
-                    }),
-                });
-            } finally {
-                clearTimeout(timeout);
-            }
-
-            if (res.status === 429) {
-                const body = (await res.text()).slice(0, 500);
-                const { dailyTpd, waitMs } = noteGroq429(body);
-                logger.error(`[GroqClassifier] Groq returned 429: ${body.slice(0, 300)}`);
-                if (dailyTpd) return [];
-                if (attempt < maxAttempts) {
-                    const backoff = Math.max(waitMs, 5000 * attempt);
-                    logger.warn(
-                        `[GroqClassifier] Rate-limited (429); retrying in ${backoff}ms (attempt ${attempt}/${maxAttempts})`,
-                    );
-                    await new Promise((r) => setTimeout(r, backoff));
-                    continue;
-                }
-                return [];
-            }
-
-            if (!res.ok) {
-                logger.error(`[GroqClassifier] Groq returned ${res.status}: ${(await res.text()).slice(0, 300)}`);
-                return [];
-            }
-
-            const json = (await res.json()) as GroqResponse;
-            const content = json.choices?.[0]?.message?.content;
-            if (!content) return [];
-
-            const parsed = JSON.parse(content) as {
-                results?: unknown[];
-                duplicateGroups?: unknown[];
-                existingDuplicates?: unknown[];
-            };
-            const existingIds = new Set(existingTopics.map((t) => t.id));
-
-            const baseByIndex = new Map<
-                number,
-                Omit<ClassifiedHeadline, 'duplicateOfExistingId' | 'duplicateOfBatchIndex'>
-            >();
-            for (const raw of Array.isArray(parsed.results) ? parsed.results : []) {
-                const idx = Number((raw as Record<string, unknown>)?.i);
-                if (!Number.isInteger(idx) || idx < 0 || idx >= headlineTexts.length) continue;
-                const coerced = coerceResult(raw, idx, headlineTexts[idx]!);
-                if (coerced) baseByIndex.set(idx, coerced);
-            }
-
-            const batchDuplicateOf = new Map<number, number>();
-            for (const groupRaw of Array.isArray(parsed.duplicateGroups) ? parsed.duplicateGroups : []) {
-                if (!Array.isArray(groupRaw) || groupRaw.length < 2) continue;
-                const group = groupRaw
-                    .map((v) => Number(v))
-                    .filter((v) => Number.isInteger(v) && v >= 0 && v < headlineTexts.length);
-                if (group.length < 2) continue;
-                const principal = group[0]!;
-                for (const idx of group.slice(1)) {
-                    if (idx !== principal && !batchDuplicateOf.has(idx)) batchDuplicateOf.set(idx, principal);
-                }
-            }
-
-            const existingDuplicateOf = new Map<number, string>();
-            for (const raw of Array.isArray(parsed.existingDuplicates) ? parsed.existingDuplicates : []) {
-                if (!raw || typeof raw !== 'object') continue;
-                const o = raw as Record<string, unknown>;
-                const idx = Number(o.i);
-                const existingId = String(o.existingId ?? '');
-                if (!Number.isInteger(idx) || idx < 0 || idx >= headlineTexts.length) continue;
-                if (!existingIds.has(existingId)) continue;
-                existingDuplicateOf.set(idx, existingId);
-            }
-
-            const out: ClassifiedHeadline[] = [];
-            for (const [index, base] of baseByIndex) {
-                out.push({
-                    ...base,
-                    duplicateOfExistingId: existingDuplicateOf.get(index) ?? null,
-                    duplicateOfBatchIndex: existingDuplicateOf.has(index)
+    let validationFailure: string | null = null;
+    const response = await requestJson(SYSTEM_PROMPT, userContent, {
+        operationType: options.operationType ?? 'classification',
+        jobId: options.jobId,
+        ingestId: options.ingestId,
+        schema: classificationResponseSchema(headlineTexts.length),
+        schemaName: 'market_driver_classification',
+        maxOutputTokens: ENV.AI_MAX_OUTPUT_TOKENS,
+        // A complete result per input is required. A malformed/partial primary response is sent
+        // to the bounded Groq fallback rather than being silently persisted as partial data.
+        validate: (value) => {
+            validationFailure = completeClassificationResponseError(value, headlineTexts.length);
+            return validationFailure === null;
+        },
+    });
+    if (!response) {
+        // A valid-but-incomplete model response is not a provider quota failure. Split only this
+        // failed request into smaller, independent prompts. The same durable job remains claimed,
+        // so no second worker can process the headlines concurrently and no partial DB rows exist.
+        if (validationFailure && normalized.length > 1) {
+            const splitAt = Math.ceil(normalized.length / 2);
+            logger.warn('[AIProvider] Incomplete classification response; retrying the durable job in smaller batches', {
+                headlineCount: normalized.length,
+                splitAt,
+                reason: validationFailure,
+            });
+            const left = await classifyHeadlines(normalized.slice(0, splitAt), existingTopics, options);
+            if (left.length !== splitAt) return [];
+            const right = await classifyHeadlines(normalized.slice(splitAt), existingTopics, options);
+            if (right.length !== normalized.length - splitAt) return [];
+            return [
+                ...left,
+                ...right.map((item) => ({
+                    ...item,
+                    index: item.index + splitAt,
+                    duplicateOfBatchIndex: item.duplicateOfBatchIndex == null
                         ? null
-                        : (batchDuplicateOf.get(index) ?? null),
-                });
-            }
-
-            return out.sort((a, b) => a.index - b.index);
+                        : item.duplicateOfBatchIndex + splitAt,
+                })),
+            ].sort((a, b) => a.index - b.index);
         }
-
-        return [];
-    } catch (error) {
-        logger.error(`[GroqClassifier] Classification failed: ${(error as Error).message}`);
         return [];
     }
+
+    const parsed = response.parsed as {
+        results?: unknown[];
+        duplicateGroups?: unknown[];
+        existingDuplicates?: unknown[];
+    };
+    const existingIds = new Set(existingTopics.map((t) => t.id));
+
+    const baseByIndex = new Map<
+        number,
+        Omit<ClassifiedHeadline, 'duplicateOfExistingId' | 'duplicateOfBatchIndex'>
+    >();
+    for (const raw of Array.isArray(parsed.results) ? parsed.results : []) {
+        const idx = Number((raw as Record<string, unknown>)?.i);
+        if (!Number.isInteger(idx) || idx < 0 || idx >= headlineTexts.length) continue;
+        const coerced = coerceResult(raw, idx, headlineTexts[idx]!);
+        if (coerced) baseByIndex.set(idx, coerced);
+    }
+
+    const batchDuplicateOf = new Map<number, number>();
+    for (const groupRaw of Array.isArray(parsed.duplicateGroups) ? parsed.duplicateGroups : []) {
+        if (!Array.isArray(groupRaw) || groupRaw.length < 2) continue;
+        const group = groupRaw
+            .map((v) => Number(v))
+            .filter((v) => Number.isInteger(v) && v >= 0 && v < headlineTexts.length);
+        if (group.length < 2) continue;
+        const principal = group[0]!;
+        for (const idx of group.slice(1)) {
+            if (idx !== principal && !batchDuplicateOf.has(idx)) batchDuplicateOf.set(idx, principal);
+        }
+    }
+
+    const existingDuplicateOf = new Map<number, string>();
+    for (const raw of Array.isArray(parsed.existingDuplicates) ? parsed.existingDuplicates : []) {
+        if (!raw || typeof raw !== 'object') continue;
+        const o = raw as Record<string, unknown>;
+        const idx = Number(o.i);
+        const existingId = String(o.existingId ?? '');
+        if (!Number.isInteger(idx) || idx < 0 || idx >= headlineTexts.length) continue;
+        if (!existingIds.has(existingId)) continue;
+        existingDuplicateOf.set(idx, existingId);
+    }
+
+    const out: ClassifiedHeadline[] = [];
+    for (const [index, base] of baseByIndex) {
+        out.push({
+            ...base,
+            duplicateOfExistingId: existingDuplicateOf.get(index) ?? null,
+            duplicateOfBatchIndex: existingDuplicateOf.has(index)
+                ? null
+                : (batchDuplicateOf.get(index) ?? null),
+        });
+    }
+
+    return out.sort((a, b) => a.index - b.index);
 }

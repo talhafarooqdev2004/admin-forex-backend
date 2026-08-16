@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { XMLParser } from 'fast-xml-parser';
 import { prisma } from '../lib/prisma.js';
 import { logger } from '../utils/logger.util.js';
@@ -29,16 +30,16 @@ import {
  * Admin `?run=1` can force. Manual test script / admin endpoint share this function.
  */
 
-/** Wait after last full-feed ingest before heal may call Groq (avoids TPM 429 wars). */
+/** Wait after last full-feed ingest before heal may call the provider (avoids burst-limit wars). */
 const COVERAGE_AUDIT_COOLDOWN_MS = 2 * 60 * 1000;
 
 /** Same feeds + guid prefixes as forex-scraping's marketDriverRss.service.js — a healed MISSING
  *  item stores under the guid the scraper would later send, so no double-ingest. */
 const AUDIT_FEEDS = [
-    { name: 'FJ_RSS', url: 'https://www.financialjuice.com/feed.ashx?xml=RSS', source: 'FinancialJuice', guidPrefix: '' },
-    { name: 'FXS_news', url: 'https://www.fxstreet.com/rss/news', source: 'FXStreet', guidPrefix: 'fxs-news:' },
-    { name: 'FXS_main', url: 'https://www.fxstreet.com/rss', source: 'FXStreet', guidPrefix: 'fxs:' },
-    { name: 'FXS_crypto', url: 'https://www.fxstreet.com/rss/crypto', source: 'FXStreet', guidPrefix: 'fxs-crypto:' },
+    { name: 'FJ_RSS', url: 'https://www.financialjuice.com/feed.ashx?xml=RSS', source: 'FinancialJuice', sourceId: 'financialjuice:rss', guidPrefix: '' },
+    { name: 'FXS_news', url: 'https://www.fxstreet.com/rss/news', source: 'FXStreet', sourceId: 'fxstreet:news', guidPrefix: 'fxs-news:' },
+    { name: 'FXS_main', url: 'https://www.fxstreet.com/rss', source: 'FXStreet', sourceId: 'fxstreet:root', guidPrefix: 'fxs:' },
+    { name: 'FXS_crypto', url: 'https://www.fxstreet.com/rss/crypto', source: 'FXStreet', sourceId: 'fxstreet:crypto', guidPrefix: 'fxs-crypto:' },
 ] as const;
 
 const FEED_PRIORITY: Record<string, number> = { FJ_RSS: 0, FXS_news: 1, FXS_main: 2, FXS_crypto: 3 };
@@ -69,6 +70,7 @@ export type CoverageAuditResult = {
 
 type FeedItem = {
     guid: string;
+    sourceId: string;
     title: string;
     source: string;
     feedName: string;
@@ -110,13 +112,13 @@ function normalizeTitle(t: string): string {
         .trim();
 }
 
-function extractGuid(raw: Record<string, unknown>, fallback: string): string {
+function extractGuid(raw: Record<string, unknown>): string {
     const guidField = raw.guid;
     const guid =
         guidField && typeof guidField === 'object'
             ? String((guidField as Record<string, unknown>)['#text'] ?? '')
             : String(guidField ?? '');
-    return guid || String(raw.link ?? '') || fallback;
+    return guid || String(raw.link ?? '');
 }
 
 async function fetchFeed(feed: (typeof AUDIT_FEEDS)[number]): Promise<FeedItem[]> {
@@ -145,12 +147,18 @@ async function fetchFeed(feed: (typeof AUDIT_FEEDS)[number]): Promise<FeedItem[]
             const title = stripSourcePrefix(String(it.title ?? '').trim());
             if (!title) continue;
             const author = it.author ? String(it.author).trim() : feed.source;
+            const pubDate = it.pubDate ? String(it.pubDate).trim() : null;
+            const rawGuid = extractGuid(it);
+            const stableId = rawGuid || createHash('sha256')
+                .update(`${feed.sourceId}\n${author || feed.source}\n${pubDate || ''}\n${normalizeTitle(title)}`)
+                .digest('hex');
             out.push({
-                guid: `${feed.guidPrefix}${extractGuid(it, title)}`.slice(0, 500),
+                guid: `${feed.guidPrefix}${stableId}`.slice(0, 500),
+                sourceId: feed.sourceId,
                 title,
                 source: author || feed.source,
                 feedName: feed.name,
-                pubDate: it.pubDate ? String(it.pubDate).trim() : null,
+                pubDate,
                 norm: normalizeTitle(title),
             });
         }
@@ -245,6 +253,9 @@ async function healHiddenRow(row: DbRow, title: string, promote: boolean): Promi
             impact: recovered.impact,
             assets: recovered.assets as unknown as object,
             summary: recovered.summary,
+            classification_completed: true,
+            coverage_repair_completed: true,
+            semantic_dedup_completed: true,
             ...(promote ? { duplicate_of: null } : {}),
             // Lock only when the row is a true board principal (no duplicate_of).
             ...(willShow ? { board_locked: true } : {}),
@@ -273,7 +284,7 @@ function deferredCoverageAudit(reason: string): CoverageAuditResult {
 }
 
 export async function runMarketDriverCoverageAudit(
-    options: { force?: boolean } = {},
+    options: { force?: boolean; now?: Date; ingestId?: string } = {},
 ): Promise<CoverageAuditResult> {
     // Concurrent calls (cron tick + admin ?run=1) share one run.
     if (auditInFlight) return auditInFlight;
@@ -296,7 +307,7 @@ export async function runMarketDriverCoverageAudit(
                     );
                 }
             }
-            return await runAuditOnce();
+            return await runAuditOnce(options.now ?? new Date(), options.ingestId);
         } finally {
             auditInFlight = null;
         }
@@ -304,9 +315,9 @@ export async function runMarketDriverCoverageAudit(
     return auditInFlight;
 }
 
-async function runAuditOnce(): Promise<CoverageAuditResult> {
-    const liveDay = marketDayKey();
-    const ranAt = new Date().toISOString();
+async function runAuditOnce(now: Date, ingestId?: string): Promise<CoverageAuditResult> {
+    const liveDay = marketDayKey(now);
+    const ranAt = now.toISOString();
 
     const feedsFetched: string[] = [];
     const feedsFailed: string[] = [];
@@ -364,12 +375,13 @@ async function runAuditOnce(): Promise<CoverageAuditResult> {
         logger.warn(`[CoverageAudit] ${missing.length} rule-required item(s) missing — ingesting through pipeline`);
         const raw = missing.map((a) => ({
             guid: a.item.guid,
+            sourceId: a.item.sourceId,
             title: a.item.title,
             source: a.item.source,
             pubDate: a.item.pubDate,
         }));
         try {
-            const result = await ingestMarketDriverRssItems(raw);
+            const result = await ingestMarketDriverRssItems(raw, { operationType: 'coverage_repair', now, ingestId });
             healedMissing = result.stored;
         } catch (error) {
             logger.error(`[CoverageAudit] Heal-ingest failed: ${(error as Error).message}`);

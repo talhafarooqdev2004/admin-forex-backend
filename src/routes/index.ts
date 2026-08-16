@@ -29,6 +29,8 @@ import webhookRoutes from './webhook.routes.js';
 
 import visitorAnalyticsRoutes from './visitorAnalytics.routes.js';
 import marketDriverNewsRoutes from './marketDriverNews.routes.js';
+import aiUsageDashboardRoutes from './aiUsageDashboard.routes.js';
+import macroCommentRoutes from './macroComment.routes.js';
 
 const router = express.Router();
 
@@ -58,6 +60,8 @@ router.use('/admin/edge-tools', edgeToolsSyncRoutes);
 router.use('/admin/cot-data-analysis', cotDataAnalysisSyncRoutes);
 router.use('/admin/analytics', visitorAnalyticsRoutes);
 router.use('/admin/market-driver-news', marketDriverNewsRoutes);
+router.use('/admin/ai-usage', aiUsageDashboardRoutes);
+router.use('/admin/macro-comments', macroCommentRoutes);
 router.use('/webhooks', webhookRoutes);
 
 router.post('/admin/cache/flush/users', (req, res) => {

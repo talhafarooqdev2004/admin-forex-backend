@@ -88,10 +88,9 @@ export async function replaceDynamicTableFromSheetGrid(
             where: { dynamic_table_id: table.id },
         });
 
-        const createdColumns: { id: bigint; column_index: number }[] = [];
-        for (const column of columnDefs) {
-            const createdColumn = await tx.tableColumn.create({
-                data: {
+        if (columnDefs.length > 0) {
+            await tx.tableColumn.createMany({
+                data: columnDefs.map((column) => ({
                     dynamic_table_id: table.id,
                     header: column.header,
                     key: column.key,
@@ -100,41 +99,53 @@ export async function replaceDynamicTableFromSheetGrid(
                         source: 'google_sheets',
                         sourceSheetName: sheetName,
                     },
-                },
+                })),
             });
-            createdColumns.push(createdColumn);
         }
+        const createdColumns = await tx.tableColumn.findMany({
+            where: { dynamic_table_id: table.id },
+            select: { id: true, column_index: true },
+        });
+        const columnIdByIndex = new Map(createdColumns.map((column) => [column.column_index, column.id]));
 
-        for (const rowData of tableRows) {
-            const createdRow = await tx.tableRow.create({
-                data: {
+        if (tableRows.length > 0) {
+            await tx.tableRow.createMany({
+                data: tableRows.map((rowData) => ({
                     dynamic_table_id: table.id,
                     row_index: rowData.row_index,
                     row_metadata: rowData.row_metadata as Prisma.InputJsonValue,
-                },
+                })),
             });
+        }
+        const createdRows = await tx.tableRow.findMany({
+            where: { dynamic_table_id: table.id },
+            select: { id: true, row_index: true },
+        });
+        const rowIdByIndex = new Map(createdRows.map((row) => [row.row_index, row.id]));
 
+        const cells: Prisma.TableCellCreateManyInput[] = [];
+        for (const rowData of tableRows) {
+            const rowId = rowIdByIndex.get(rowData.row_index);
+            if (rowId == null) continue;
             for (const cellData of rowData.cells) {
-                const relatedColumn = createdColumns.find((column) => column.column_index === cellData.column_index);
-                if (!relatedColumn) {
-                    continue;
-                }
-
-                await tx.tableCell.create({
-                    data: {
-                        table_row_id: createdRow.id,
-                        table_column_id: relatedColumn.id,
-                        value: cellData.value || null,
-                        formula: null,
-                        data_type: cellData.data_type,
-                        cell_metadata: {
-                            source: 'google_sheets',
-                        },
+                const columnId = columnIdByIndex.get(cellData.column_index);
+                if (columnId == null) continue;
+                cells.push({
+                    table_row_id: rowId,
+                    table_column_id: columnId,
+                    value: cellData.value || null,
+                    formula: null,
+                    data_type: cellData.data_type,
+                    cell_metadata: {
+                        source: 'google_sheets',
                     },
                 });
             }
         }
-    });
+        if (cells.length > 0) {
+            await tx.tableCell.createMany({ data: cells });
+        }
+    }, { maxWait: 5_000, timeout: 30_000 });
 
     const tableRepository = new DynamicTableRepository();
     const syncedTable = await tableRepository.findByIdentifier(identifier);

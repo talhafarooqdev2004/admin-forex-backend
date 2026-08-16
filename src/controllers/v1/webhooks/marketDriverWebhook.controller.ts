@@ -15,7 +15,7 @@ const WEBHOOK_HEADER = 'x-scraper-webhook-key';
 /**
  * Receives raw FinancialJuice + FXStreet RSS items from forex-scraping.
  * Accepts the full feed immediately, then classifies ALL fresh items in the background
- * (Groq batches) so HTTP timeouts never truncate a large first scrape.
+ * (bounded AI batches) so HTTP timeouts never truncate a large first scrape.
  */
 export const ingestMarketDriverRss = async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -55,7 +55,7 @@ export const ingestMarketDriverRss = async (req: Request, res: Response, next: N
                         );
                     } else {
                         logger.warn(
-                            `[MarketDriverWebhook] PARTIAL ingest (not final): received=${result.received} fresh=${result.fresh} stored=${result.stored} deferred=${result.deferredCount} — auto-resume after Groq cooldown`,
+                            `[MarketDriverWebhook] PARTIAL ingest (not final): received=${result.received} fresh=${result.fresh} stored=${result.stored} deferred=${result.deferredCount} — durable AI queue will retry`,
                         );
                     }
                 } catch (err) {

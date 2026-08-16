@@ -598,8 +598,14 @@ enum locales {
 /// past days stay in the table and become the source for the Historical Analysis page.
 model MarketDriverNews {
   id             String   @id @default(cuid())
-  /// RSS guid/link — hard dedup: the same feed item is never inserted twice.
-  guid           String   @unique @db.VarChar(500)
+  /// RSS guid/link (or deterministic fallback fingerprint).
+  guid           String   @db.VarChar(500)
+  /// Stable feed/source identity. A GUID is only unique within a source.
+  source_id      String   @default("unknown") @db.VarChar(80)
+  /// SHA-256(source_id + stable source identifier). New writes always populate this.
+  source_key     String?  @unique @db.VarChar(800)
+  /// SHA-256 of source content used to decide whether an explicit reprocess is needed.
+  content_hash   String?  @db.Char(64)
   /// Normalized headline used for soft/semantic dedup within a day.
   normalized     String   @db.VarChar(500)
   day_key        String   @db.VarChar(10)
@@ -619,11 +625,21 @@ model MarketDriverNews {
   /// (dedup, re-sanitize, re-key, heal) may un-show a locked row. Admission decisions happen
   /// before locking; after locking a row is frozen for visibility. Doc §34 stability requirement.
   board_locked   Boolean  @default(false)
+  /// Durable processing checkpoints. Existing rows are backfilled as complete by migration.
+  classification_completed Boolean @default(true)
+  semantic_dedup_completed Boolean @default(true)
+  semantic_dedup_started_at DateTime?
+  semantic_dedup_worker_id String? @db.VarChar(120)
+  coverage_repair_completed Boolean @default(true)
   published_at   DateTime?
   created_at     DateTime @default(now())
 
   @@index([day_key])
   @@index([category])
+  @@index([guid])
+  @@index([source_id])
+  @@index([semantic_dedup_completed, semantic_dedup_started_at], map: "market_driver_news_semantic_dedup_recovery_idx")
+  @@unique([source_id, guid], map: "market_driver_news_source_id_guid_key")
   @@index([day_key, board_locked])
   @@map("market_driver_news")
 }
@@ -643,4 +659,114 @@ model MarketDriverDayArchive {
   created_at      DateTime @default(now())
 
   @@map("market_driver_day_archive")
+}
+
+/// Durable work item for Market Driver classification/recovery. Payloads contain only public RSS
+/// headline data and never API keys or prompts. `idempotency_key` prevents duplicate enqueueing
+/// when the scraper retries a webhook or a coverage audit overlaps an ingest.
+model AiClassificationJob {
+  id              String          @id @default(cuid())
+  job_type        String          @db.VarChar(40)
+  source          String          @db.VarChar(40)
+  operation_type  String          @default("classification") @db.VarChar(40)
+  content_hash    String?         @db.Char(64)
+  idempotency_key String          @unique @db.VarChar(255)
+  ingest_id       String?         @db.VarChar(100)
+  headline_ids    Json
+  payload         Json
+  status          String          @default("pending") @db.VarChar(20)
+  provider        String?         @db.VarChar(30)
+  model           String?         @db.VarChar(120)
+  attempt_count   Int             @default(0)
+  max_attempts    Int             @default(6)
+  next_retry_at   DateTime        @default(now())
+  locked_at       DateTime?
+  worker_id       String?         @db.VarChar(120)
+  last_error_code String?         @db.VarChar(40)
+  last_error_kind String?         @db.VarChar(40)
+  last_error      String?         @db.VarChar(1000)
+  retry_count     Int             @default(0)
+  stale_recovery_count Int         @default(0)
+  last_retry_at   DateTime?
+  last_retry_by   String?         @db.VarChar(120)
+  completed_at    DateTime?
+  created_at      DateTime        @default(now())
+  updated_at      DateTime        @updatedAt
+  usage_records   AiUsageRecord[]
+
+  @@index([status, next_retry_at])
+  @@index([status, locked_at])
+  @@index([last_error_kind])
+  @@index([stale_recovery_count])
+  @@index([job_type, created_at])
+  @@map("ai_classification_jobs")
+}
+
+/// Compact, one-row-per-ingest operational counters. This intentionally stores counters and
+/// timing only; RSS payloads and prompts remain in the durable job/provider systems.
+model MarketDriverProcessingRun {
+  id                        String    @id @default(cuid())
+  ingest_id                 String    @unique @db.VarChar(100)
+  source                    String    @db.VarChar(80)
+  started_at                DateTime
+  completed_at              DateTime?
+  items_fetched             Int       @default(0)
+  new_items                 Int       @default(0)
+  existing_items_skipped    Int       @default(0)
+  items_enqueued            Int       @default(0)
+  items_classified          Int       @default(0)
+  exact_duplicates_skipped  Int       @default(0)
+  semantic_duplicates_found Int       @default(0)
+  failed_items              Int       @default(0)
+  recovered_items           Int       @default(0)
+  coverage_repairs          Int       @default(0)
+  status                    String    @default("processing") @db.VarChar(20)
+  error_category            String?   @db.VarChar(40)
+  duration_ms               Int?
+  created_at                DateTime  @default(now())
+  updated_at                DateTime  @updatedAt
+
+  @@index([started_at])
+  @@index([source, started_at])
+  @@index([status, started_at])
+  @@map("market_driver_processing_runs")
+}
+
+/// One auditable provider attempt. Token fields are nullable because providers do not always
+/// return usage on rejected/network failures; null is intentionally different from zero.
+model AiUsageRecord {
+  id                    String               @id @default(cuid())
+  job_id                String?
+  ingest_id             String?              @db.VarChar(100)
+  operation_type        String               @db.VarChar(40)
+  provider              String               @db.VarChar(30)
+  model                 String               @db.VarChar(120)
+  input_tokens          Int?
+  cached_input_tokens   Int?
+  output_tokens         Int?
+  reasoning_tokens      Int?
+  total_tokens          Int?
+  usage_available       Boolean              @default(false)
+  estimated_input_cost  Decimal?             @db.Decimal(20, 10)
+  estimated_cached_cost Decimal?             @db.Decimal(20, 10)
+  estimated_output_cost Decimal?             @db.Decimal(20, 10)
+  estimated_total_cost  Decimal?             @db.Decimal(20, 10)
+  currency              String               @default("USD") @db.Char(3)
+  request_status        String               @db.VarChar(20)
+  request_id            String?              @db.VarChar(255)
+  latency_ms            Int?
+  attempt_number        Int                  @default(1)
+  is_retry              Boolean              @default(false)
+  is_fallback           Boolean              @default(false)
+  error_kind            String?              @db.VarChar(40)
+  error_message         String?              @db.VarChar(1000)
+  created_at            DateTime             @default(now())
+  job                   AiClassificationJob? @relation(fields: [job_id], references: [id], onDelete: SetNull)
+
+  @@index([created_at])
+  @@index([provider, model, operation_type, created_at])
+  @@index([operation_type, created_at])
+  @@index([request_status, created_at])
+  @@index([job_id])
+  @@map("ai_usage_records")
 }
