@@ -1735,8 +1735,8 @@ export async function runUaeMidnightArchive(now: Date = new Date()): Promise<num
  * Prefer archived snapshots; also include past day_keys that still have news but were not archived yet
  * (reconstruct board from headlines so the picker is never empty when data exists).
  */
-export async function listHistoricalDays(): Promise<DayArchiveMeta[]> {
-    const today = marketDayKey();
+export async function listHistoricalDays(now: Date = new Date()): Promise<DayArchiveMeta[]> {
+    const today = marketDayKey(now);
     const archives = await prisma.marketDriverDayArchive.findMany({
         where: { day_key: { lt: today } },
         orderBy: { day_key: 'desc' },
@@ -1787,10 +1787,10 @@ export async function listHistoricalDays(): Promise<DayArchiveMeta[]> {
  * so scores match the current scoring path (and the News table for the same dayKey).
  * Archive row is used for meta / finalized status only.
  */
-export async function getHistoricalDay(dayKey: string): Promise<HistoricalDayPayload | null> {
+export async function getHistoricalDay(dayKey: string, now: Date = new Date()): Promise<HistoricalDayPayload | null> {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(dayKey)) return null;
 
-    const today = marketDayKey();
+    const today = marketDayKey(now);
     const isLiveDay = dayKey === today;
     const archive = await prisma.marketDriverDayArchive.findUnique({ where: { day_key: dayKey } });
 

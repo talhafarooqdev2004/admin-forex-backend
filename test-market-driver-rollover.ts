@@ -93,7 +93,7 @@ async function cleanup() {
     });
     await prisma.marketDriverProcessingRun.deleteMany({ where: { ingest_id: { startsWith: namespace } } });
     if (jobIds.size) await prisma.aiClassificationJob.deleteMany({ where: { id: { in: [...jobIds] } } });
-    await prisma.marketDriverDayArchive.deleteMany({ where: { day_key: { in: ['2037-08-12', '2037-08-13'] } } });
+    await prisma.marketDriverDayArchive.deleteMany({ where: { day_key: { in: ['2037-08-10', '2037-08-11', '2037-08-12', '2037-08-13'] } } });
     await prisma.marketDriverNews.deleteMany({ where: { source_id: { startsWith: sourcePrefix } } });
 }
 
@@ -103,6 +103,7 @@ const times = {
     t0100: new Date('2037-08-12T21:00:00.000Z'),
     t0101: new Date('2037-08-12T21:01:00.000Z'),
     t0110: new Date('2037-08-12T21:10:00.000Z'),
+    t0115: new Date('2037-08-12T21:15:00.000Z'),
     t0130: new Date('2037-08-12T21:30:00.000Z'),
     t0200: new Date('2037-08-12T22:00:00.000Z'),
 };
@@ -125,6 +126,9 @@ try {
     assert.equal(board.marketDayKey(times.t0050), '2037-08-12');
     assert.equal((await board.getMarketDriverNews('2037-08-12')).length, 1);
     assert.equal((await board.getMarketDriverNews('2037-08-13')).length, 0);
+    const beforeHistory = await board.getHistoricalDay('2037-08-12', times.t0050);
+    assert.equal(beforeHistory?.isLiveDay, true);
+    assert.equal(beforeHistory?.archived, false, 'fixture must reproduce archived:false before recovery');
     const lateOldDay = item('late-old-day', 'Bank of Canada signals another restrictive policy decision', '2037-08-12T20:58:00.000Z');
     let releaseLateClassification: (() => void) | undefined;
     let providerStarted: (() => void) | undefined;
@@ -154,8 +158,49 @@ try {
     const catchup = await runMarketDriverRollover('verification', times.t0110);
     assert.equal(catchup.success, true);
     assert.equal((await prisma.marketDriverDayArchive.findUnique({ where: { day_key: '2037-08-12' } }))?.headline_count, 2);
+    const recoveredHistory = await board.getHistoricalDay('2037-08-12', times.t0110);
+    assert.equal(recoveredHistory?.isLiveDay, false);
+    assert.equal(recoveredHistory?.archived, true, 'recovery must expose archived:true for the completed day');
+    assert.ok(recoveredHistory?.meta?.finalizedAt, 'recovered history must include a durable finalized timestamp');
+    const recoveredLiveHistory = await board.getHistoricalDay('2037-08-13', times.t0110);
+    assert.equal(recoveredLiveHistory?.isLiveDay, true);
+    assert.equal(recoveredLiveHistory?.archived, false, 'current day must remain live and unarchived');
+    report.historyApi = {
+        beforeRecovery: { dayKey: '2037-08-12', isLiveDay: beforeHistory?.isLiveDay, archived: beforeHistory?.archived },
+        afterRecovery: { dayKey: '2037-08-12', isLiveDay: recoveredHistory?.isLiveDay, archived: recoveredHistory?.archived, hasSnapshot: Boolean(recoveredHistory?.meta?.finalizedAt) },
+        currentDay: { dayKey: '2037-08-13', isLiveDay: recoveredLiveHistory?.isLiveDay, archived: recoveredLiveHistory?.archived },
+    };
     const beforeCalls = count(beforeStart);
 
+    // Simulate a backend that missed 01:00. At a later startup on Aug 14, Aug 13 is the
+    // previous day and Aug 11 is an older unarchived day. Startup recovery must archive both;
+    // a repeated :15 catch-up must be idempotent and must not rebuild an already-finalized day.
+    const startupOnly = item('startup-only', 'Reserve Bank of Australia keeps policy restrictive', '2037-08-13T20:30:00.000Z');
+    const olderUnarchived = item('older-unarchived', 'Bank of England inflation expectations ease', '2037-08-11T20:30:00.000Z');
+    const oldArchiveFixture = item('old-archive', 'Federal Reserve policy outlook remains steady', '2037-08-10T20:30:00.000Z');
+    assert.equal((await board.ingestMarketDriverRssItems([startupOnly], { ingestId: `${namespace}:startup-only`, now: times.t0200 })).stored, 1);
+    assert.equal((await board.ingestMarketDriverRssItems([olderUnarchived], { ingestId: `${namespace}:older-unarchived`, now: new Date('2037-08-12T20:00:00.000Z') })).stored, 1);
+    assert.equal((await board.ingestMarketDriverRssItems([oldArchiveFixture], { ingestId: `${namespace}:old-archive`, now: new Date('2037-08-10T20:00:00.000Z') })).stored, 1);
+    const startupAt = new Date('2037-08-13T21:10:00.000Z');
+    assert.equal(await board.finalizeUaeDay('2037-08-10', startupAt), true);
+    const oldArchiveBeforeRetry = await prisma.marketDriverDayArchive.findUnique({ where: { day_key: '2037-08-10' } });
+    assert.ok(oldArchiveBeforeRetry);
+    const startupRecovery = await runMarketDriverRollover('startup', startupAt);
+    assert.equal(startupRecovery.success, true);
+    const startupArchive = await prisma.marketDriverDayArchive.findUnique({ where: { day_key: '2037-08-13' } });
+    const olderArchive = await prisma.marketDriverDayArchive.findUnique({ where: { day_key: '2037-08-11' } });
+    assert.ok(startupArchive, 'startup recovery archived the missed previous day');
+    assert.ok(olderArchive, 'startup catch-up archived an older unarchived day');
+    const catchupRecovery = await runMarketDriverRollover('catchup', new Date('2037-08-13T21:15:00.000Z'));
+    assert.equal(catchupRecovery.success, true);
+    const oldArchiveAfterRetry = await prisma.marketDriverDayArchive.findUnique({ where: { day_key: '2037-08-10' } });
+    assert.equal(oldArchiveAfterRetry?.finalized_at.getTime(), oldArchiveBeforeRetry?.finalized_at.getTime(), 'finalized older history must not be rebuilt');
+    report.archiveRecovery = {
+        missed01: { trigger: 'startup', previousDay: '2037-08-13', archived: Boolean(startupArchive) },
+        olderUnarchived: { dayKey: '2037-08-11', archived: Boolean(olderArchive) },
+        repeatedCatchup: { trigger: 'catchup', success: catchupRecovery.success, archiveRowsChanged: false },
+        finalizedOlderDayPreserved: true,
+    };
     const pendingItem = item('pending', 'EUR USD rises after ECB policy guidance', '2037-08-12T20:55:00.000Z');
     const processingItem = item('processing', 'USD JPY moves after Bank of Japan guidance', '2037-08-12T20:56:00.000Z');
     const completedItem = item('completed', 'GBP USD advances after Bank of England signal', '2037-08-12T20:57:00.000Z');
