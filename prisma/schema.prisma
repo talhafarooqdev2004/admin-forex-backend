@@ -618,6 +618,19 @@ model MarketDriverNews {
   summary        String?  @db.VarChar(500)
   /// [{ asset, bias, score }] — tracked assets this headline affects.
   assets         Json
+  /// Semantic cause family used for deterministic scoring aggregation; not an event duplicate id.
+  driver_theme   String?  @db.VarChar(120)
+  causal_theme_id String? @db.VarChar(160)
+  /// Stable scheduled-release family key used to avoid calendar + RSS macro double counting.
+  macro_event_key String? @db.VarChar(80)
+  /// ESCALATION | DE_ESCALATION | WATCH | IRRELEVANT; determined before asset transmission.
+  geo_state      String?  @db.VarChar(20)
+  semantic_direction String? @db.VarChar(12)
+  semantic_strength String? @db.VarChar(12)
+  /// Direct provider signals and code-derived/transmitted signals remain separately auditable.
+  direct_asset_signals Json?
+  transmitted_asset_signals Json?
+  sign_validation_status String? @default("NOT_APPLICABLE") @db.VarChar(20)
   /// Set when this item was folded into an earlier one (soft dedup); such rows don't score.
   duplicate_of   String?  @db.VarChar(50)
   /// Once a row is shown on the News Headline board it is LOCKED for the rest of the UAE market
@@ -650,6 +663,9 @@ model MarketDriverNews {
   @@unique([source_id, guid], map: "market_driver_news_source_id_guid_key")
   @@index([day_key, board_locked])
   @@index([day_key, final_decision_code])
+  @@index([causal_theme_id])
+  @@index([macro_event_key])
+  @@index([geo_state])
   @@map("market_driver_news")
 }
 

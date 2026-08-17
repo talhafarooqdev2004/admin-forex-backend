@@ -21,6 +21,8 @@
     "test:alerts": "tsx test-alerts.ts",
     "test:compliance": "tsx --test test-client-compliance.ts",
     "test:market-driver-rules": "tsx test-market-driver-classifier-rules.ts",
+    "test:ffe-aug17-correction": "node --import tsx/esm test-ffe-aug17-correction.ts",
+    "test:ffe-holdout": "node --import tsx/esm test-ffe-holdout.ts",
     "test:market-driver-feed-coverage": "tsx test-market-driver-feed-coverage.ts",
     "test:market-driver-board-lock": "tsx test-market-driver-board-lock.ts",
     "test:restart-safety": "node --import tsx/esm test-restart-safety.ts",

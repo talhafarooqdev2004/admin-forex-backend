@@ -2,6 +2,17 @@ import OpenAI from 'openai';
 import { ENV } from '../config/env.js';
 import { logger } from '../utils/logger.util.js';
 import { recordAiUsage, type AiOperationType, type ProviderUsage } from './aiUsage.service.js';
+import {
+    deriveFfeDecision,
+    FFE_TRACKED_ASSETS,
+    inferCausalTheme,
+    inferGeoState,
+    isEconomicReleaseHeadline,
+    type FfeAssetSignal,
+    type GeoState,
+    type SemanticDirection,
+    type SemanticStrength,
+} from './ffeDecisionEngine.service.js';
 
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const REQUEST_TIMEOUT_MS = Math.max(5_000, ENV.AI_REQUEST_TIMEOUT_MS);
@@ -55,10 +66,10 @@ function noteGroq429(body: string): { dailyTpd: boolean; waitMs: number } {
 }
 
 /** Tracked assets — everything else classifies to IRRELEVANT (doc §1). */
-export const TRACKED_ASSETS = ['USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD', 'NZD', 'GOLD', 'OIL'] as const;
+export const TRACKED_ASSETS = FFE_TRACKED_ASSETS;
 export type TrackedAsset = (typeof TRACKED_ASSETS)[number];
-/** The FFE Catalyst Driver rules score these eight currencies only. */
-export const CATALYST_CURRENCIES = ['USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD', 'NZD'] as const;
+/** The validated FFE Catalyst contract tracks eight currencies plus GOLD and OIL. */
+export const CATALYST_CURRENCIES = FFE_TRACKED_ASSETS;
 export type CatalystCurrency = (typeof CATALYST_CURRENCIES)[number];
 
 export type NewsCategory = 'ECONOMIC' | 'DRIVER' | 'GEOPOLITICAL' | 'IRRELEVANT';
@@ -88,6 +99,17 @@ export type ClassifiedHeadline = {
     duplicateOfExistingId: string | null;
     /** Set when this headline is the same underlying event as another headline earlier IN THIS BATCH. */
     duplicateOfBatchIndex: number | null;
+    /** Semantic fields are persisted separately from event-duplicate identity. */
+    driverTheme?: string | null;
+    causalThemeId?: string | null;
+    geoState?: GeoState;
+    semanticDirection?: SemanticDirection;
+    semanticStrength?: SemanticStrength;
+    directAssetSignals?: FfeAssetSignal[];
+    transmittedAssetSignals?: FfeAssetSignal[];
+    signValidationStatus?: 'PASS' | 'CORRECTED' | 'FAILED' | 'NOT_APPLICABLE';
+    /** Explicit semantic visibility decision for Catalyst (watch-only rows stay auditable). */
+    catalystVisible?: boolean;
 };
 
 /**
@@ -115,6 +137,10 @@ Return for each headline ("i. text"):
 4) per asset: bias Bullish|Bearish|Neutral|Mixed + score from this exact set:
    +1, +0.5, +0.25, 0, -0.25, -0.5, -1
 5) summary — short WHY for the primary (highest |score|) asset (≤8 words). Not a truncated headline.
+6) driverTheme and causalThemeId — semantic cause family, never a literal event-duplicate id
+7) geoState — ESCALATION | DE_ESCALATION | WATCH | IRRELEVANT (classify before asset mapping)
+8) semanticDirection — BULLISH | BEARISH | NEUTRAL | MIXED
+9) semanticStrength — NONE | WEAK | MODERATE | STRONG
 
 ════════════════════════════════════════
 FAMILY MAP (universal — works for any date / any official name)
@@ -207,9 +233,11 @@ exact same underlying moment? If yes, group them. Do not require exact wording.
 - existingDuplicates: [{"i": batchIndex, "existingId": "id"}]
 
 FFE CATALYST DRIVER SCORING RULES — THIS OVERRIDES ANY EARLIER EXAMPLES:
-- Score only USD, EUR, GBP, JPY, CHF, CAD, AUD and NZD. Gold and oil may explain a story but never receive a Catalyst score.
+- Tracked Catalyst assets are USD, EUR, GBP, JPY, CHF, CAD, AUD, NZD, GOLD and OIL.
+- Return semantic cause and direction; final numeric aggregation is application-code controlled.
 - Include only clear, unique, market-moving non-calendar drivers: central-bank/rate guidance, meaningful yield repricing, confirmed geopolitical or broad risk regime changes, strong fundamentally-driven oil moves, major China/industrial-metal developments, meaningful dairy moves, intervention warnings, or major fiscal/political developments.
-- Remove all pair-price analysis, forecasts, technical/support/resistance/target stories, naked currency moves, crypto, company news, minor politics, speculation, and scheduled CPI/GDP/employment/PMI/retail/industrial releases.
+- Scheduled CPI/GDP/employment/PMI/retail/industrial/housing releases are ECONOMIC_MACRO_ONLY: preserve them for Macro, never discard them as IRRELEVANT and never score them as an independent Catalyst.
+- Remove all pair-price analysis, forecasts, technical/support/resistance/target stories, naked currency moves, crypto, company news, minor politics and unsupported speculation.
 - DXY or another currency index is only evidence of a genuine new fundamental cause. Never count the index and that same cause twice.
 - Confirmed meaningful geopolitical escalation: USD +0.5, CHF +0.5, AUD -0.5, NZD -0.5, EUR -0.25, GBP -0.25; JPY +0.5 only with confirmed safe-haven buying; CAD is not scored through geopolitics. Reverse only with clear market-confirmed de-escalation.
 - Strong fundamental oil rise: CAD +0.5 (or +1 for major/sustained surge), JPY -0.5, EUR -0.25. Strong oil fall: CAD -0.5 (or -1 major/sustained), JPY +0.25.
@@ -219,7 +247,7 @@ FFE CATALYST DRIVER SCORING RULES — THIS OVERRIDES ANY EARLIER EXAMPLES:
 - Count every underlying event once per affected currency; keep opposing drivers. Return a short main-driver explanation.
 
 Respond ONLY with JSON:
-{"results":[{"i":0,"category":"...","impact":"...","assets":[{"asset":"...","bias":"...","score":0}],"summary":"..."}],"duplicateGroups":[],"existingDuplicates":[]}
+{"results":[{"i":0,"category":"...","impact":"...","assets":[{"asset":"...","bias":"...","score":0}],"summary":"...","driverTheme":"...","causalThemeId":"...","geoState":"IRRELEVANT","semanticDirection":"NEUTRAL","semanticStrength":"NONE"}],"duplicateGroups":[],"existingDuplicates":[]}
 Every input index must appear exactly once in "results".`;
 
 const DEDUP_ONLY_PROMPT = `You are an experienced wire editor detecting duplicate forex market headlines (doc §3).
@@ -252,7 +280,7 @@ far-apart times or opposite direction → usually separate.
 Ask yourself: could two different wire services have filed both headlines about the exact same moment
 or the exact same single briefing? If yes, group them — do not require identical wording.
 
-Return JSON only: {"duplicateGroups":[[principal, dup, ...], ...]}
+Return JSON only: {"duplicateGroups":[[principal, dup, ...], ...],"causalThemes":[{"i":0,"causalThemeId":"THEME"}]}
 Use [] if none.`;
 
 /** Dubai market-clock HH:MM for prompt lines (matches product day window). */
@@ -392,8 +420,24 @@ const CLASSIFICATION_RESPONSE_SCHEMA: JsonSchema = {
                         },
                     },
                     summary: { type: 'string' },
+                    driverTheme: { type: 'string' },
+                    causalThemeId: { type: 'string' },
+                    geoState: { type: 'string', enum: ['ESCALATION', 'DE_ESCALATION', 'WATCH', 'IRRELEVANT'] },
+                    semanticDirection: { type: 'string', enum: ['BULLISH', 'BEARISH', 'NEUTRAL', 'MIXED'] },
+                    semanticStrength: { type: 'string', enum: ['NONE', 'WEAK', 'MODERATE', 'STRONG'] },
                 },
-                required: ['i', 'category', 'impact', 'assets', 'summary'],
+                required: [
+                    'i',
+                    'category',
+                    'impact',
+                    'assets',
+                    'summary',
+                    'driverTheme',
+                    'causalThemeId',
+                    'geoState',
+                    'semanticDirection',
+                    'semanticStrength',
+                ],
             },
         },
         duplicateGroups: {
@@ -450,8 +494,20 @@ const DEDUP_RESPONSE_SCHEMA: JsonSchema = {
             type: 'array',
             items: { type: 'array', items: { type: 'integer', minimum: 0 } },
         },
+        causalThemes: {
+            type: 'array',
+            items: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                    i: { type: 'integer', minimum: 0 },
+                    causalThemeId: { type: 'string' },
+                },
+                required: ['i', 'causalThemeId'],
+            },
+        },
     },
-    required: ['duplicateGroups'],
+    required: ['duplicateGroups', 'causalThemes'],
 };
 
 type GroqResponse = {
@@ -953,7 +1009,35 @@ export function eventFingerprint(headline: string): string | null {
 export function likelySameEvent(a: string, b: string): boolean {
     const fa = eventFingerprint(a);
     const fb = eventFingerprint(b);
+    // Opposite directional moves are separate market facts even when the
+    // asset/theme tokens overlap (for example, morning gold gains versus an
+    // evening gold decline). Keep this before the coarse event fingerprint.
+    const polarity = (text: string): number => {
+        const h = text.toLowerCase();
+        const primaryMove = h.match(/\b(?:gold|xau|wti|brent|crude|oil|usd|dollar|euro|eur|yen|jpy|aud|nzd|cad|gbp|pound)\b.{0,35}\b(rise|rises|rose|rally|rallies|gains?|gained|climbs?|higher|up|advances?|surges?|strengthens?|recovers?|fall|falls|fell|decline|declines|drops?|lower|down|slides?|weakens?|tumbles?|retreats?|slumps?)\b/);
+        if (primaryMove) return /fall|decline|drop|lower|down|slide|weaken|tumble|retreat|slump/.test(primaryMove[1]!) ? -1 : 1;
+        const positive = /\b(rise|rises|rose|rally|rallies|gains?|gained|climbs?|higher|up|advances?|surges?|strengthens?|recovers?)\b/.test(h);
+        const negative = /\b(fall|falls|fell|decline|declines|drops?|lower|down|slides?|weakens?|tumbles?|retreats?|slumps?)\b/.test(h);
+        return positive === negative ? 0 : positive ? 1 : -1;
+    };
+    const pa = polarity(a);
+    const pb = polarity(b);
+    if (pa !== 0 && pb !== 0 && pa !== pb) return false;
     if (fa && fb && fa === fb) return true;
+
+    // Scheduled releases share boilerplate (actual/forecast/previous) but remain distinct
+    // metrics/events. Never let that boilerplate make China retail sales look like industrial
+    // output, or GDP look like CPI. Macro clustering is handled by causalThemeId later.
+    if (isEconomicReleaseHeadline(a) && isEconomicReleaseHeadline(b)) {
+        const family = (headline: string): string => {
+            const h = headline.toLowerCase();
+            const markers = ['retail sales', 'industrial output', 'industrial production', 'gdp', 'cpi', 'ppi', 'pmi', 'housing', 'house price', 'unemployment', 'jobless', 'exports', 'imports', 'capital flows', 'electronic card retail', 'services index'];
+            return markers.find((marker) => h.includes(marker)) ?? '';
+        };
+        const familyA = family(a);
+        const familyB = family(b);
+        if (familyA && familyB && familyA !== familyB) return false;
+    }
 
     const ta = tokenSet(a);
     const tb = tokenSet(b);
@@ -1094,6 +1178,8 @@ function byCatalystCurrency(assets: ClassifiedAsset[]): ClassifiedAsset[] {
 function isCatalystExcludedHeadline(headline: string): boolean {
     const h = headline.toLowerCase();
     if (isScheduledDataReleaseHeadline(headline)) return true;
+    const deterministicPolicyTheme = inferCausalTheme(headline, 'DRIVER');
+    if (deterministicPolicyTheme && /^(?:BOJ_HAWKISH_REPRICING|BOE_HOLD_REPRICING|RBA_HAWKISH_PAUSE_REPRICING|RBA_HAWKISH_GUIDANCE|RBNZ_HOLD_REPRICING|ECB_HAWKISH_REPRICING)$/.test(deterministicPolicyTheme)) return false;
     if (/\b(price forecast|forecast:|technical analysis|support|resistance|breakout|chart|moving average|ema|rsi|fibonacci|price target)\b/.test(h)) return true;
     if (/\b(eur\/usd|gbp\/usd|usd\/jpy|aud\/usd|nzd\/usd|usd\/cad|eur\/jpy|gbp\/jpy|xau\/usd)\b/.test(h) &&
         /\b(gains?|falls?|rall(?:y|ies)|weakens?|tests?|trades?|near|above|below|holds?)\b/.test(h) &&
@@ -1101,7 +1187,7 @@ function isCatalystExcludedHeadline(headline: string): boolean {
     if (/\b(bitcoin|ethereum|xrp|crypto|btc|eth|nvidia|tesla|earnings|shares?)\b/.test(h)) return true;
     if (
         /\b(may|might|could|likely|expected to|rumou?r)\b/.test(h) &&
-        !/\b(markets? (?:price|fully price)|rate expectations?|yield repricing)\b/.test(h) &&
+        !/\b(markets? (?:price|fully price)|rate expectations?|yield repricing|real yields?|equities? pressure)\b/.test(h) &&
         !isCentralBankSpeechHeadline(headline)
     ) return true;
     return false;
@@ -1114,7 +1200,10 @@ function hasConfirmedJpySafeHavenFlow(headline: string): boolean {
 
 function isConfirmedGeoOrRiskOff(headline: string): boolean {
     const h = headline.toLowerCase();
-    const confirmedEscalation = /\b(strikes?|attack(?:ed|s)?|missiles?|war expansion|blockade|shipping disruption|hormuz|red sea|energy infrastructure|major sanctions?)\b/.test(h);
+    // Merely mentioning Hormuz, military logistics, or diplomatic contact is
+    // WATCH. Broad risk-off transmission requires a confirmed event or an
+    // explicit route/energy disruption.
+    const confirmedEscalation = /\b(strikes?|attack(?:ed|s)?|missiles?|war expansion|blockade|shipping disruption|hormuz (?:closure|closed|disruption|blockade)|tanker assaults?|red sea|energy infrastructure|major sanctions?)\b/.test(h);
     const broadRiskOff = /\b(risk[- ]?off|safe[- ]?haven demand|broad equity sell-?off|global stocks? (?:fall|drop|slide))\b/.test(h);
     return (isGeopoliticalConflictHeadline(headline) && confirmedEscalation) || broadRiskOff;
 }
@@ -1425,11 +1514,11 @@ export function buildReasonSummary(
     if (/\bopec\b/i.test(h)) {
         return bullish ? 'OPEC supply stance lifts oil' : 'OPEC supply outlook weighs on oil';
     }
-    if (/\b(hawkish|hike|higher for longer)\b/i.test(h)) {
-        return `Hawkish policy supports ${asset}`;
+    if (/\b(dovish|rate cut|easing|hike bets? (?:fade|fall|drop)|rate expectations? (?:fall|drop))\b/i.test(h)) {
+        return `Dovish repricing weighs on ${asset}`;
     }
-    if (/\b(dovish|rate cut|easing)\b/i.test(h)) {
-        return `Dovish policy weighs on ${asset}`;
+    if (/\b(hawkish|hike|higher for longer|hike bets? (?:rise|increase))\b/i.test(h)) {
+        return `Hawkish policy supports ${asset}`;
     }
     if (/\brisk[- ]?off\b|\bsafe[- ]?haven\b/i.test(h)) {
         return bullish ? `Risk-off supports ${asset}` : `Risk-off weighs on ${asset}`;
@@ -1495,24 +1584,11 @@ export function ensureReasonSummary(
 
 /** Scheduled print with actual/forecast figures — true ECONOMIC calendar row (doc §4 A). */
 function isScheduledDataReleaseHeadline(headline: string): boolean {
-    const h = headline.toLowerCase();
-    // Explicit Actual/Forecast release phrasing (FinancialJuice data alerts).
-    if (/\bactual\b/.test(h) && /\b(forecast|previous)\b/.test(h)) return true;
-    // China / customs trade surplus & shipment prints → calendar ECONOMIC, not FX wraps.
-    if (/\bchina\b/.test(h) && /\b(trade surplus|trade balance|exports|imports|customs)\b/.test(h)) return true;
-    // Classic named prints with a number, excluding FX market wraps / fixings.
-    if (
-        /\b(gdp|cpi|ppi|nfp|nonfarm|payrolls|pmi|retail sales|unemployment rate|jobless claims|interest rate decision|business confidence|business conditions|consumer confidence|capacity utilization|wholesale price)\b/.test(
-            h,
-        ) &&
-        /\d/.test(h) &&
-        !/\b(forex today|price forecast|consolidat|rallies|weakens|gains on|posts modest|surges as|slides as|reference rate|pboc sets)\b/.test(
-            h,
-        )
-    ) {
-        return true;
-    }
-    return false;
+    // Keep the exclusion path on the same broad, deterministic release
+    // detector used by the decision engine.  This prevents one helper from
+    // treating Canada/Japan/China secondary prints as drivers while another
+    // treats the same RSS item as a calendar release.
+    return isEconomicReleaseHeadline(headline);
 }
 
 /**
@@ -1582,11 +1658,11 @@ function centralBankToAsset(headline: string): TrackedAsset | null {
 function isGeopoliticalConflictHeadline(headline: string): boolean {
     const h = headline.toLowerCase();
     const conflict =
-        /\b(centcom|irgc|revolutionary guards|missile|missiles|ballistic|strike|strikes|hormuz|ceasefire|truce|patriot|airspace|tanker|tankers|blockade|sirens?)\b/.test(
+        /\b(centcom|irgc|revolutionary guards|missile|missiles|ballistic|strike|strikes|striking|hormuz|ceasefire|truce|patriot|airspace|tanker|tankers|blockade|sirens?|sanctions?|diplomatic breakthrough|peace deal|peace agreement|mou|memorandum|backchannel|kushner|deadline|ultimatum|threat|talks?|negotiat|diplom(?:acy|atic)|reopen(?:ed|s?)|gaza)\b/.test(
             h,
         ) || /\biran/.test(h);
     const actor =
-        /\b(us|u\.s\.|u\.s|trump|military|israel|jordan|bahrain|fleet|navy|war|troops|uae|iran|fars news)/.test(h);
+        /\b(us|u\.s\.|u\.s|trump|military|israel|jordan|bahrain|fleet|navy|war|troops|uae|iran|fars news|gaza|lebanon|russia|ukraine|houthi|china|beijing|taiwan|iraq|saudi|yemen|oman|korea)/.test(h);
     return conflict && actor;
 }
 
@@ -1594,6 +1670,13 @@ function isGeopoliticalConflictHeadline(headline: string): boolean {
 function isDocIgnoredHeadline(headline: string): boolean {
     const h = headline.toLowerCase();
     if (/\b(bitcoin|ethereum|xrp|crypto|btc|eth|solana|dogecoin)\b/.test(h)) return true;
+    // A fixing/reference-rate print is a policy observation, not a USD
+    // Catalyst. Keep it out unless the same headline contains a real
+    // scheduled macro series (which is handled by the Macro branch first).
+    if (/\b(pboc|people'?s bank of china)\b/.test(h) && /\b(reference rate|fixing|midpoint|usd\/cny|yuan)\b/.test(h) && !/\b(cpi|gdp|pmi|retail|industrial|sales|output)\b/.test(h)) return true;
+    // Contract/procurement headlines mention weapons but do not report an
+    // actual conflict event; they are not geopolitical market drivers.
+    if (/\b(?:awards?|awarded|contract|procurement|purchase order|boost output)\b/.test(h) && /\b(?:missile|tomahawk|raytheon|navy|defen[cs]e)\b/.test(h) && !/\b(?:strike|attack|launch|hit)\b/.test(h)) return true;
     if (/\b(silver|xag)\b/.test(h) && !/\b(gold|xau)\b/.test(h)) return true;
     if (
         /\b(sgd|myr|twd|taiwan|singapore dollar|ringgit|malaysian)\b/.test(h) &&
@@ -1670,12 +1753,28 @@ export function isBoardVisibleClassification(input: {
     impact: string;
     assets: ClassifiedAsset[];
     duplicateOf?: string | null;
+    catalystVisible?: boolean;
 }): boolean {
     if (input.duplicateOf) return false;
+    if (input.catalystVisible === false) return false;
     if (!['DRIVER', 'GEOPOLITICAL'].includes(String(input.category).toUpperCase())) return false;
     return Array.isArray(input.assets) && input.assets.some(
         (asset) => CATALYST_CURRENCIES.includes(asset.asset as CatalystCurrency) && asset.score !== 0,
     );
+}
+
+function catalystVisibilityForTheme(theme: string | null, headline: string): boolean {
+    if (!theme) return true;
+    const watchOnly = new Set([
+        'GAZA_DEESCALATION', 'GAZA_DEESCALATION_RHETORIC', 'HORMUZ_MILITARY_LOGISTICS',
+        'IRAN_CHINA_DIPLOMACY', 'CASPIAN_STRATEGIC_RHETORIC', 'US_HORMUZ_CONTROL_RHETORIC',
+        'US_IRAN_STRATEGIC_CONFRONTATION', 'IRAN_US_NEGOTIATION_CONDITIONS',
+        'IRAN_US_NEGOTIATION_TIMELINE', 'HORMUZ_DIPLOMATIC_COORDINATION', 'HORMUZ_OPEN_DEESCALATION',
+    ]);
+    if (watchOnly.has(theme)) return false;
+    if (theme === 'IRAN_US_NEGOTIATION_DEADLINE' && /\btimeframe\b|\bdoesn'?t have\b|\bno \d+[- ]day deadline\b/i.test(headline)) return false;
+    if (theme === 'IRAN_US_DIPLOMATIC_DETERIORATION' && /\bnot realistic\b/i.test(headline)) return false;
+    return true;
 }
 
 /**
@@ -1694,6 +1793,31 @@ export function sanitizeClassification(
 ): Omit<ClassifiedHeadline, 'index' | 'duplicateOfExistingId' | 'duplicateOfBatchIndex'> {
     let { category, impact, assets, summary } = input;
 
+    // Scheduled releases are durable Macro evidence. They are intentionally not Catalyst
+    // rows, but must never be rewritten to IRRELEVANT merely because the board excludes them.
+    // Central-bank speeches remain DRIVERs and are excluded from this branch.
+    if (isEconomicReleaseHeadline(headline) && !isCentralBankSpeechHeadline(headline)) {
+        const alignedProviderAssets = assets
+            .filter((asset) => TRACKED_ASSETS.includes(asset.asset))
+            .map((asset) => {
+                const aligned = alignScoreToImpact(impact, asset.bias, asset.score);
+                return { asset: asset.asset, bias: aligned.bias, score: aligned.score };
+            });
+        const macroDecision = deriveFfeDecision(headline, 'ECONOMIC', impact, alignedProviderAssets);
+        // Keep Macro evidence separate from Catalyst rows. Low-impact releases
+        // and releases without a deterministic signal must not leak a zero/AI
+        // asset tag into the Catalyst pipeline.
+        const macroAssets = macroDecision.transmittedAssetSignals
+            .filter((asset) => asset.score !== 0) as ClassifiedAsset[];
+        return {
+            category: 'ECONOMIC',
+            impact,
+            assets: macroAssets,
+            summary: ensureReasonSummary(summary, headline, impact, macroAssets, 'ECONOMIC'),
+            catalystVisible: false,
+        };
+    }
+
     if (isDocIgnoredHeadline(headline) || isNonCrudeEnergyHeadline(headline) || isCatalystExcludedHeadline(headline)) {
         return {
             category: 'IRRELEVANT',
@@ -1710,6 +1834,25 @@ export function sanitizeClassification(
             assets: [],
             summary: 'No tracked-asset impact',
         };
+    }
+
+    // The provider may label a valid rate/yield/industrial driver IRRELEVANT
+    // when it contains no explicit speech verb. Promote deterministic cause
+    // families before the final transmission pass; the rule is family-based,
+    // not tied to a person, source, or GUID.
+    const inferredTheme = inferCausalTheme(headline, category);
+    const deterministicDriverThemes = new Set([
+        'FED_REPRICING', 'FED_REPRICING_GOLD', 'FED_DOVISH_REPRICING', 'FED_DOVISH_REPRICING_GOLD',
+        'FED_HAWKISH_REPRICING', 'FED_HAWKISH_LONGER_TERM_REPRICING', 'LOWER_REAL_YIELDS',
+        'BOJ_POLICY_DOUBTS', 'BOJ_POLICY_REPRICING', 'BOJ_HAWKISH_REPRICING', 'JPY_INTERVENTION_RISK',
+        'ECB_HAWKISH_REPRICING', 'BOE_HOLD_REPRICING', 'RBA_HAWKISH_PAUSE_REPRICING',
+        'RBA_HAWKISH_GUIDANCE', 'RBNZ_HOLD_REPRICING', 'OIL_SUPPLY_RISK',
+        'IRAN_US_OIL_SUPPLY_RISK', 'OIL_SUPPLY_RESTORATION', 'INDUSTRIAL_METALS_STRENGTH',
+        'NZ_DAIRY_PRICES', 'FISCAL_TRADE_POLICY', 'UK_TARIFF_ESCALATION',
+    ]);
+    if (inferredTheme && deterministicDriverThemes.has(inferredTheme) && !isEconomicReleaseHeadline(headline)) {
+        category = 'DRIVER';
+        if (impact === 'Low' && !/\b(?:2027|longer term|long-term|lower real yields?)\b/i.test(headline)) impact = 'Medium';
     }
 
     // Drop OIL tags with no crude / ME-energy basis (stops N Korea→OIL, local fire→OIL, etc.).
@@ -1755,12 +1898,19 @@ export function sanitizeClassification(
         }
     }
 
+    // Geo WATCH statements can have no direct asset at all (regional talks,
+    // strategic rhetoric, coordination). Preserve them as auditable geo rows
+    // instead of dropping them to IRRELEVANT before the watch-state return.
+    if (category === 'IRRELEVANT' && inferGeoState(headline) !== 'IRRELEVANT' && !isScheduledDataReleaseHeadline(headline)) {
+        category = 'GEOPOLITICAL';
+    }
+
     // Universal §4 C: conflict / Hormuz / military → GEOPOLITICAL with OIL.
     if (isGeopoliticalConflictHeadline(headline) && !isScheduledDataReleaseHeadline(headline)) {
         if (category === 'IRRELEVANT' || category === 'ECONOMIC') category = 'GEOPOLITICAL';
         else if (
             category === 'DRIVER' &&
-            /\b(centcom|irgc|missile|strike|hormuz|tanker|airspace|patriot|blockade|troops)\b/i.test(headline)
+            (inferGeoState(headline) !== 'IRRELEVANT' || /\b(centcom|irgc|missile|strike|striking|hormuz|tanker|airspace|patriot|blockade|troops|sanction|kushner|mou|backchannel|talks?|negotiat|gaza)\b/i.test(headline))
         ) {
             category = 'GEOPOLITICAL';
         }
@@ -1797,23 +1947,37 @@ export function sanitizeClassification(
         return { asset: a.asset, bias: aligned.bias, score: aligned.score };
     });
 
-    // FFE Catalyst Driver Scoring Rules are the final authority. They replace broad
-    // FX-wrap/OIL tagging with one event-level, eight-currency score set.
-    assets = applyFfeCatalystRules(headline, assets);
+    // FFE Catalyst Driver Scoring Rules are the final authority. The provider identifies the
+    // cause; this deterministic engine owns transmission and numeric signs.
+    const decision = deriveFfeDecision(headline, category, impact, assets);
+    assets = (decision.transmittedAssetSignals.length ? decision.transmittedAssetSignals : applyFfeCatalystRules(headline, assets)) as ClassifiedAsset[];
     if (assets.length === 0) {
+        if (decision.geoState === 'WATCH' && category === 'GEOPOLITICAL') {
+            const watchImpact: NewsImpact = impact === 'Low' ? 'Medium' : impact;
+            return {
+                category: 'GEOPOLITICAL',
+                impact: watchImpact,
+                assets: [],
+                summary: ensureReasonSummary(summary, headline, watchImpact, [], 'GEOPOLITICAL'),
+                catalystVisible: false,
+            };
+        }
         return {
             category: 'IRRELEVANT',
             impact: 'Low',
             assets: [],
             summary: 'No clear, market-moving Catalyst Driver',
+            catalystVisible: false,
         };
     }
-    category = isConfirmedGeoOrRiskOff(headline) || hasClearDeEscalation(headline) ? 'GEOPOLITICAL' : 'DRIVER';
+    category = decision.geoState !== 'IRRELEVANT' || isConfirmedGeoOrRiskOff(headline) || hasClearDeEscalation(headline)
+        ? 'GEOPOLITICAL'
+        : 'DRIVER';
     impact = catalystImpactForScore(Math.max(...assets.map((asset) => Math.abs(asset.score))));
 
     summary = ensureReasonSummary(summary, headline, impact, assets, category);
 
-    return { category, impact, assets, summary };
+    return { category, impact, assets, summary, catalystVisible: catalystVisibilityForTheme(decision.driverTheme, headline) };
 }
 
 function coerceResult(
@@ -1862,6 +2026,7 @@ function coerceResult(
         assets,
         summary: String(r.summary ?? ''),
     });
+    const decision = deriveFfeDecision(headline, sanitized.category, sanitized.impact, sanitized.assets);
 
     return {
         index,
@@ -1869,6 +2034,15 @@ function coerceResult(
         impact: sanitized.impact,
         assets: sanitized.assets,
         summary: sanitized.summary,
+        driverTheme: String(r.driverTheme ?? decision.driverTheme ?? inferCausalTheme(headline, sanitized.category) ?? ''),
+        causalThemeId: String(r.causalThemeId ?? decision.causalThemeId ?? ''),
+        geoState: (String(r.geoState ?? decision.geoState ?? inferGeoState(headline)).toUpperCase() as GeoState),
+        semanticDirection: (String(r.semanticDirection ?? decision.semanticDirection ?? 'NEUTRAL').toUpperCase() as SemanticDirection),
+        semanticStrength: (String(r.semanticStrength ?? decision.semanticStrength ?? 'NONE').toUpperCase() as SemanticStrength),
+        directAssetSignals: decision.directAssetSignals,
+        transmittedAssetSignals: decision.transmittedAssetSignals,
+        signValidationStatus: decision.signValidationStatus,
+        catalystVisible: sanitized.catalystVisible,
     };
 }
 

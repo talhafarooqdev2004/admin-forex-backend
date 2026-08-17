@@ -41,6 +41,12 @@ import {
     marketBusinessDayKey,
     previousMarketBusinessDayKey,
 } from '../utils/marketBusinessDay.util.js';
+import {
+    aggregateUniqueCausalThemes,
+    deriveFfeDecision,
+    FFE_TRACKED_ASSETS,
+    type FfeAssetSignal,
+} from './ffeDecisionEngine.service.js';
 
 /**
  * AI batch size per call. We loop until every fresh RSS item is classified in this ingest
@@ -82,6 +88,8 @@ export type CatalystBoardRow = {
     bearishCount: number;
     /** Doc §23: sum of unique driver impact scores. */
     driverScore: number;
+    /** Ordered causal-theme ids used for the audit/factors dialog. */
+    themes?: string[];
 };
 
 export type MarketDriverNewsRow = {
@@ -94,6 +102,12 @@ export type MarketDriverNewsRow = {
     assets: ClassifiedAsset[];
     publishedAt: string | null;
     createdAt: string;
+    driverTheme: string | null;
+    causalThemeId: string | null;
+    geoState: string | null;
+    directAssetSignals: ClassifiedAsset[];
+    transmittedAssetSignals: ClassifiedAsset[];
+    signValidationStatus: string;
 };
 
 export type MarketDriverDiagnosticRow = MarketDriverNewsRow & {
@@ -106,6 +120,17 @@ export type MarketDriverDiagnosticRow = MarketDriverNewsRow & {
     coverageRepairCompleted: boolean;
     boardLocked: boolean;
     duplicateOf: string | null;
+    eventDuplicateOf: string | null;
+    driverTheme: string | null;
+    causalThemeId: string | null;
+    macroEventKey: string | null;
+    geoState: string | null;
+    semanticDirection: string | null;
+    semanticStrength: string | null;
+    directAssetSignals: ClassifiedAsset[];
+    transmittedAssetSignals: ClassifiedAsset[];
+    signValidationStatus: string;
+    historicalReconstruction: boolean;
     displayEligible: boolean;
     visibilityReason: string;
 };
@@ -122,7 +147,7 @@ function decisionMetadata(headline: string, classification: { category: string; 
     const category = String(classification.category).toUpperCase();
     const assets = Array.isArray(classification.assets) ? classification.assets : [];
     const tracked = assets.filter((asset) => (CATALYST_CURRENCIES as readonly string[]).includes(asset.asset));
-    if (category === 'ECONOMIC') return { code: 'ECONOMIC_RELEASE', reason: 'Classified as an economic-calendar release; News Headline/Catalyst rules exclude it.', secondary: [] };
+    if (category === 'ECONOMIC') return { code: 'ECONOMIC_MACRO_ONLY', reason: 'Persisted as scheduled economic evidence for Macro Scoreboard; excluded from independent Catalyst scoring.', secondary: ['MACRO_ONLY', 'NOT_CATALYST_VISIBLE'] };
     if (category === 'IRRELEVANT') return { code: 'IRRELEVANT', reason: 'Classifier and post-classification rules marked this item irrelevant to tracked market drivers.', secondary: [] };
     if (classification.impact === 'Low') return { code: 'LOW_IMPACT', reason: 'Low-impact item; low-impact news is not admitted to the visible driver board.', secondary: [] };
     if (!tracked.length) return { code: 'NO_TRACKED_ASSET_MAPPING', reason: 'No tracked currency received a mapped asset score.', secondary: [] };
@@ -336,6 +361,7 @@ export async function realignTodaysMarketDriverScores(now: Date = new Date()): P
             assets: assetsIn,
             summary: item.summary ?? '',
         });
+        const decision = deriveFfeDecision(item.headline, sanitized.category, sanitized.impact, sanitized.assets as unknown as FfeAssetSignal[]);
 
         // Promotion: if sanitize makes this (unlocked) row board-visible, lock it now (an ADD).
         const nowVisible = isBoardVisibleClassification({
@@ -360,6 +386,15 @@ export async function realignTodaysMarketDriverScores(now: Date = new Date()): P
                 impact: sanitized.impact,
                 summary: sanitized.summary,
                 assets: sanitized.assets as unknown as object,
+                driver_theme: decision.driverTheme,
+                causal_theme_id: decision.causalThemeId,
+                macro_event_key: decision.macroEventKey,
+                geo_state: decision.geoState,
+                semantic_direction: decision.semanticDirection,
+                semantic_strength: decision.semanticStrength,
+                direct_asset_signals: decision.directAssetSignals as unknown as object,
+                transmitted_asset_signals: decision.transmittedAssetSignals as unknown as object,
+                sign_validation_status: decision.signValidationStatus,
                 classification_completed: true,
                 semantic_dedup_completed: !nowVisible,
                 // board_locked only ever goes false→true; never written false here.
@@ -409,6 +444,7 @@ export async function applyFfeCatalystRulesToCurrentDay(now: Date = new Date()):
             assets,
             summary: item.summary ?? '',
         });
+        const decision = deriveFfeDecision(item.headline, sanitized.category, sanitized.impact, sanitized.assets as unknown as FfeAssetSignal[]);
         const isVisible = isBoardVisibleClassification({ ...sanitized, duplicateOf: null });
         await prisma.marketDriverNews.update({
             where: { id: item.id },
@@ -417,6 +453,15 @@ export async function applyFfeCatalystRulesToCurrentDay(now: Date = new Date()):
                 impact: sanitized.impact,
                 summary: sanitized.summary,
                 assets: sanitized.assets as unknown as object,
+                driver_theme: decision.driverTheme,
+                causal_theme_id: decision.causalThemeId,
+                macro_event_key: decision.macroEventKey,
+                geo_state: decision.geoState,
+                semantic_direction: decision.semanticDirection,
+                semantic_strength: decision.semanticStrength,
+                direct_asset_signals: decision.directAssetSignals as unknown as object,
+                transmitted_asset_signals: decision.transmittedAssetSignals as unknown as object,
+                sign_validation_status: decision.signValidationStatus,
                 duplicate_of: null,
                 board_locked: isVisible,
                 classification_completed: true,
@@ -470,6 +515,7 @@ export async function reclassifyTodaysMarketDriverNews(): Promise<{ updated: num
                 assets: c.assets,
                 duplicateOf: null,
             });
+            const semanticDecision = deriveFfeDecision(row.headline, c.category, c.impact, c.assets as unknown as FfeAssetSignal[]);
             await prisma.marketDriverNews.update({
                 where: { id: row.id },
                 data: {
@@ -477,6 +523,15 @@ export async function reclassifyTodaysMarketDriverNews(): Promise<{ updated: num
                     impact: c.impact,
                     summary: c.summary,
                     assets: c.assets as unknown as object,
+                    driver_theme: semanticDecision.driverTheme,
+                    causal_theme_id: semanticDecision.causalThemeId,
+                    macro_event_key: semanticDecision.macroEventKey,
+                    geo_state: semanticDecision.geoState,
+                    semantic_direction: semanticDecision.semanticDirection,
+                    semantic_strength: semanticDecision.semanticStrength,
+                    direct_asset_signals: semanticDecision.directAssetSignals as unknown as object,
+                    transmitted_asset_signals: semanticDecision.transmittedAssetSignals as unknown as object,
+                    sign_validation_status: semanticDecision.signValidationStatus,
                     // Clear stale duplicate links before the dedicated dedup pass below.
                     duplicate_of: null,
                     classification_completed: true,
@@ -1192,6 +1247,15 @@ async function runMarketDriverIngest(rawItems: unknown[], options: MarketDriverI
                 classification_completed: boolean;
                 semantic_dedup_completed: boolean;
                 coverage_repair_completed: boolean;
+                driver_theme: string | null;
+                causal_theme_id: string | null;
+                macro_event_key: string | null;
+                geo_state: string | null;
+                semantic_direction: string | null;
+                semantic_strength: string | null;
+                direct_asset_signals: object;
+                transmitted_asset_signals: object;
+                sign_validation_status: string;
                 final_decision_code: string;
                 final_decision_reason: string;
                 secondary_reasons: string[];
@@ -1215,6 +1279,7 @@ async function runMarketDriverIngest(rawItems: unknown[], options: MarketDriverI
                     duplicateOf: null,
                 });
                 const primary = pickPrimaryAsset(c.assets)?.asset ?? null;
+                const semanticDecision = deriveFfeDecision(item.title, c.category, c.impact, c.assets as unknown as FfeAssetSignal[]);
 
                 // Admission dedup, in precedence order: model/within-batch → normalized text →
                 // deterministic same-event vs already-locked principals (catches paraphrases
@@ -1234,6 +1299,13 @@ async function runMarketDriverIngest(rawItems: unknown[], options: MarketDriverI
 
                 const boardLocked = Boolean(item.existingLocked) || (!duplicateOf && visibleByClass);
                 const decision = decisionMetadata(item.title, c, duplicateOf, boardLocked);
+                const finalDecision = semanticDecision.signValidationStatus === 'FAILED'
+                    ? {
+                        code: 'SIGN_VALIDATION_FAILED',
+                        reason: 'Semantic direction and deterministic transmission disagreed; row is withheld until corrected.',
+                        secondary: ['SIGN_VALIDATION_FAILED', ...decision.secondary],
+                    }
+                    : decision;
 
                 if (!duplicateOf) normalizedToId.set(normalized, id);
                 if (boardLocked) {
@@ -1269,9 +1341,18 @@ async function runMarketDriverIngest(rawItems: unknown[], options: MarketDriverI
                     // A provider-classified duplicate has already completed its semantic decision.
                     semantic_dedup_completed: Boolean(duplicateOf) || !visibleByClass,
                     coverage_repair_completed: true,
-                    final_decision_code: decision.code,
-                    final_decision_reason: decision.reason,
-                    secondary_reasons: decision.secondary,
+                    driver_theme: semanticDecision.driverTheme,
+                    causal_theme_id: semanticDecision.causalThemeId,
+                    macro_event_key: semanticDecision.macroEventKey,
+                    geo_state: semanticDecision.geoState,
+                    semantic_direction: semanticDecision.semanticDirection,
+                    semantic_strength: semanticDecision.semanticStrength,
+                    direct_asset_signals: semanticDecision.directAssetSignals as unknown as object,
+                    transmitted_asset_signals: semanticDecision.transmittedAssetSignals as unknown as object,
+                    sign_validation_status: semanticDecision.signValidationStatus,
+                    final_decision_code: finalDecision.code,
+                    final_decision_reason: finalDecision.reason,
+                    secondary_reasons: finalDecision.secondary,
                     decision_ingest_id: options.ingestId ?? options.queuedJobId ?? null,
                     classification_job_id: job.id,
                     classification_provider: null,
@@ -1298,6 +1379,15 @@ async function runMarketDriverIngest(rawItems: unknown[], options: MarketDriverI
                         impact: row.impact,
                         summary: row.summary,
                         assets: row.assets,
+                        driver_theme: row.driver_theme,
+                        causal_theme_id: row.causal_theme_id,
+                        macro_event_key: row.macro_event_key,
+                        geo_state: row.geo_state,
+                        semantic_direction: row.semantic_direction,
+                        semantic_strength: row.semantic_strength,
+                        direct_asset_signals: row.direct_asset_signals,
+                        transmitted_asset_signals: row.transmitted_asset_signals,
+                        sign_validation_status: row.sign_validation_status,
                         duplicate_of: row.duplicate_of,
                         board_locked: row.board_locked,
                         classification_completed: true,
@@ -1486,6 +1576,7 @@ async function reclassifyFeedMatchedForEmptyBoard(
             assets: c.assets,
             duplicateOf: null,
         });
+        const semanticDecision = deriveFfeDecision(row.headline, c.category, c.impact, c.assets as unknown as FfeAssetSignal[]);
         await prisma.marketDriverNews.update({
             where: { id: row.id },
             data: {
@@ -1493,6 +1584,15 @@ async function reclassifyFeedMatchedForEmptyBoard(
                 impact: c.impact,
                 summary: c.summary,
                 assets: c.assets as unknown as object,
+                driver_theme: semanticDecision.driverTheme,
+                causal_theme_id: semanticDecision.causalThemeId,
+                macro_event_key: semanticDecision.macroEventKey,
+                geo_state: semanticDecision.geoState,
+                semantic_direction: semanticDecision.semanticDirection,
+                semantic_strength: semanticDecision.semanticStrength,
+                direct_asset_signals: semanticDecision.directAssetSignals as unknown as object,
+                transmitted_asset_signals: semanticDecision.transmittedAssetSignals as unknown as object,
+                sign_validation_status: semanticDecision.signValidationStatus,
                 duplicate_of: null,
                 classification_completed: true,
                 semantic_dedup_completed: !nowVisible,
@@ -1603,37 +1703,23 @@ function collapseSameEventEntries(
 }
 
 function aggregateCatalystBoard(items: Awaited<ReturnType<typeof loadBoardItemsForDay>>): CatalystBoardRow[] {
-    const agg = new Map<TrackedAsset, CatalystBoardRow>(
-        BOARD_ASSET_ORDER.map((asset) => [asset, { asset, bullishCount: 0, bearishCount: 0, driverScore: 0 }]),
-    );
-
-    const byAsset = new Map<TrackedAsset, { headline: string; primary: ClassifiedAsset }[]>();
-    for (const asset of BOARD_ASSET_ORDER) byAsset.set(asset, []);
-
-    for (const item of items) {
-        const assets = (item.assets as unknown as ClassifiedAsset[]) ?? [];
-        for (const asset of assets) {
-            if (!BOARD_ASSET_ORDER.includes(asset.asset)) continue;
-            if (asset.score === 0) continue;
-            const list = byAsset.get(asset.asset);
-            if (list) list.push({ headline: item.headline, primary: asset });
-        }
-    }
-
-    for (const asset of BOARD_ASSET_ORDER) {
-        const row = agg.get(asset)!;
-        const collapsed = collapseSameEventEntries(byAsset.get(asset) ?? []);
-        for (const entry of collapsed) {
-            if (entry.primary.score > 0) row.bullishCount += 1;
-            else if (entry.primary.score < 0) row.bearishCount += 1;
-            row.driverScore += entry.primary.score;
-        }
-
-    }
+    const aggregates = aggregateUniqueCausalThemes(items.map((item) => ({
+        headline: item.headline,
+        causalThemeId: item.causal_theme_id,
+        duplicateOf: item.duplicate_of,
+        category: item.category,
+        assets: ((item.transmitted_asset_signals ?? item.assets) as unknown as FfeAssetSignal[]) ?? [],
+    })));
 
     return BOARD_ASSET_ORDER.map((asset) => {
-        const row = agg.get(asset)!;
-        return { ...row, driverScore: Number(row.driverScore.toFixed(1)) };
+        const row = aggregates.get(asset) ?? { bullishCount: 0, bearishCount: 0, driverScore: 0, themes: [] };
+        return {
+            asset,
+            bullishCount: row.bullishCount,
+            bearishCount: row.bearishCount,
+            driverScore: Number(row.driverScore.toFixed(2)),
+            themes: row.themes,
+        };
     });
 }
 
@@ -1661,6 +1747,12 @@ export async function getMarketDriverNews(dayKey: string = marketDayKey()): Prom
         assets: (item.assets as unknown as ClassifiedAsset[]) ?? [],
         publishedAt: item.published_at ? item.published_at.toISOString() : null,
         createdAt: item.created_at.toISOString(),
+        driverTheme: item.driver_theme,
+        causalThemeId: item.causal_theme_id,
+        geoState: item.geo_state,
+        directAssetSignals: (item.direct_asset_signals as unknown as ClassifiedAsset[]) ?? [],
+        transmittedAssetSignals: (item.transmitted_asset_signals as unknown as ClassifiedAsset[]) ?? [],
+        signValidationStatus: item.sign_validation_status ?? 'NOT_APPLICABLE',
     }));
 }
 
@@ -1674,6 +1766,9 @@ export async function getMarketDriverNewsDiagnostic(dayKey: string = marketDayKe
             category: true, impact: true, summary: true, assets: true, published_at: true, created_at: true,
             classification_completed: true, semantic_dedup_completed: true, coverage_repair_completed: true,
             board_locked: true, duplicate_of: true, day_key: true,
+            driver_theme: true, causal_theme_id: true, macro_event_key: true, geo_state: true,
+            semantic_direction: true, semantic_strength: true, direct_asset_signals: true,
+            transmitted_asset_signals: true, sign_validation_status: true,
         },
     });
     return rows.map((row) => {
@@ -1715,6 +1810,17 @@ export async function getMarketDriverNewsDiagnostic(dayKey: string = marketDayKe
             coverageRepairCompleted: row.coverage_repair_completed,
             boardLocked: row.board_locked,
             duplicateOf: row.duplicate_of,
+            eventDuplicateOf: row.duplicate_of,
+            driverTheme: row.driver_theme,
+            causalThemeId: row.causal_theme_id,
+            macroEventKey: row.macro_event_key,
+            geoState: row.geo_state,
+            semanticDirection: row.semantic_direction,
+            semanticStrength: row.semantic_strength,
+            directAssetSignals: (row.direct_asset_signals as unknown as ClassifiedAsset[]) ?? [],
+            transmittedAssetSignals: (row.transmitted_asset_signals as unknown as ClassifiedAsset[]) ?? [],
+            signValidationStatus: row.sign_validation_status ?? 'NOT_APPLICABLE',
+            historicalReconstruction: !row.driver_theme || !row.causal_theme_id,
             displayEligible,
             visibilityReason,
         };

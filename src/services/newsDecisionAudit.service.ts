@@ -19,7 +19,7 @@ export type NewsDecisionAuditFilters = {
 };
 
 const MAX_PAGE_SIZE = 5000;
-const REJECTION_CODES = new Set(['IRRELEVANT', 'ECONOMIC_RELEASE', 'TECHNICAL_OR_PRICE_FORECAST', 'LOW_IMPACT', 'NO_TRACKED_ASSET_MAPPING', 'ZERO_OR_NON_ACTIONABLE_ASSET_SCORE', 'CLASSIFIED_BUT_NOT_BOARD_LOCKED']);
+const REJECTION_CODES = new Set(['IRRELEVANT', 'ECONOMIC_MACRO_ONLY', 'ECONOMIC_RELEASE', 'TECHNICAL_OR_PRICE_FORECAST', 'LOW_IMPACT', 'NO_TRACKED_ASSET_MAPPING', 'ZERO_OR_NON_ACTIONABLE_ASSET_SCORE', 'CLASSIFIED_BUT_NOT_BOARD_LOCKED']);
 
 function boundsForDubaiDay(day: string): { from: Date; to: Date } {
     const [year, month, date] = day.split('-').map(Number);
@@ -36,9 +36,14 @@ function parseBool(value: unknown): boolean {
     return value === true || value === '1' || value === 'true';
 }
 
-export function fallbackDecision(row: { category: string; impact: string; assets: unknown; board_locked: boolean; duplicate_of: string | null }) {
+export function fallbackDecision(row: { category: string; impact: string; assets: unknown; board_locked: boolean; duplicate_of: string | null; causal_theme_id?: string | null; macro_event_key?: string | null }) {
     if (row.duplicate_of) return { code: 'SEMANTIC_DUPLICATE', reason: `Semantically duplicates canonical item ${row.duplicate_of}.`, secondary: [] };
-    if (row.category === 'ECONOMIC') return { code: 'ECONOMIC_RELEASE', reason: 'Historical row is classified as an economic release; exact original reason was not persisted.', secondary: [] };
+    if (row.category === 'ECONOMIC') {
+        const modernMacro = row.causal_theme_id != null || row.macro_event_key != null;
+        return modernMacro
+            ? { code: 'ECONOMIC_MACRO_ONLY', reason: 'Historical row is classified as scheduled economic evidence for Macro; exact original reason was not persisted.', secondary: ['HISTORICAL_RECONSTRUCTED', 'MACRO_ONLY'] }
+            : { code: 'ECONOMIC_RELEASE', reason: 'Historical row is classified as a scheduled economic release; exact original reason was not persisted.', secondary: ['HISTORICAL_RECONSTRUCTED', 'MACRO_ONLY'] };
+    }
     if (row.category === 'IRRELEVANT') return { code: 'IRRELEVANT', reason: 'Historical row is classified as irrelevant; exact original reason was not persisted.', secondary: [] };
     if (row.impact === 'Low') return { code: 'LOW_IMPACT', reason: 'Historical row is Low impact; exact original reason was not persisted.', secondary: [] };
     const assets = Array.isArray(row.assets) ? row.assets : [];
@@ -65,6 +70,9 @@ export async function getNewsDecisionAudit(filters: NewsDecisionAuditFilters) {
             classification_completed: true, semantic_dedup_completed: true, coverage_repair_completed: true,
             final_decision_code: true, final_decision_reason: true, secondary_reasons: true, decision_ingest_id: true,
             classification_job_id: true, classification_provider: true, classification_model: true,
+            driver_theme: true, causal_theme_id: true, macro_event_key: true, geo_state: true,
+            semantic_direction: true, semantic_strength: true, direct_asset_signals: true,
+            transmitted_asset_signals: true, sign_validation_status: true,
         },
     });
     const mapped: any[] = rows.map((row) => {
@@ -95,6 +103,16 @@ export async function getNewsDecisionAudit(filters: NewsDecisionAuditFilters) {
             semanticDedupCompleted: row.semantic_dedup_completed,
             coverageRepairCompleted: row.coverage_repair_completed,
             duplicateOf: row.duplicate_of,
+            eventDuplicateOf: row.duplicate_of,
+            driverTheme: row.driver_theme,
+            causalThemeId: row.causal_theme_id,
+            macroEventKey: row.macro_event_key,
+            geoState: row.geo_state,
+            semanticDirection: row.semantic_direction,
+            semanticStrength: row.semantic_strength,
+            directAssetSignals: Array.isArray(row.direct_asset_signals) ? row.direct_asset_signals : [],
+            transmittedAssetSignals: Array.isArray(row.transmitted_asset_signals) ? row.transmitted_asset_signals : [],
+            signValidationStatus: row.sign_validation_status ?? 'NOT_APPLICABLE',
             boardLocked: row.board_locked,
             displayEligible: visible,
             visibleDestinations: destinations,
@@ -105,7 +123,7 @@ export async function getNewsDecisionAudit(filters: NewsDecisionAuditFilters) {
             classificationJobId: row.classification_job_id,
             provider: row.classification_provider,
             model: row.classification_model,
-            historicalDetail: row.final_decision_code == null,
+            historicalDetail: row.final_decision_code == null || row.causal_theme_id == null,
         };
     }).filter((row) => {
         if (filters.asset && !row.assets.some((asset) => String((asset as Record<string, unknown>).asset ?? '').toUpperCase() === filters.asset!.toUpperCase())) return false;
@@ -127,7 +145,7 @@ export async function getNewsDecisionAudit(filters: NewsDecisionAuditFilters) {
             if (!publishedAt || Number.isNaN(publishedAt.getTime())) continue;
             const sourceKey = String(item.sourceKey ?? item.guid ?? '');
             if (rows.some((row) => row.source_key === sourceKey)) continue;
-            mapped.push({ id: `failed:${job.id}:${sourceKey}`, dayKey: filters.day, publishedAt: publishedAt.toISOString(), createdAt: job.created_at.toISOString(), source: item.source ?? null, sourceId: String(item.sourceId ?? 'unknown'), guid: String(item.guid ?? sourceKey), sourceKey, headline: String(item.title ?? ''), isNew: true, classification: '—', impact: '—', assets: [], classificationCompleted: false, semanticDedupCompleted: false, coverageRepairCompleted: false, duplicateOf: null, boardLocked: false, displayEligible: false, visibleDestinations: [], finalDecisionCode: 'CLASSIFICATION_FAILED', finalDecisionReason: job.last_error ? `Classification failed: ${job.last_error}` : 'Classification job failed before a classification decision was persisted.', secondaryReasons: [], ingestId: job.ingest_id, classificationJobId: job.id, provider: job.provider, model: job.model, historicalDetail: false });
+            mapped.push({ id: `failed:${job.id}:${sourceKey}`, dayKey: filters.day, publishedAt: publishedAt.toISOString(), createdAt: job.created_at.toISOString(), source: item.source ?? null, sourceId: String(item.sourceId ?? 'unknown'), guid: String(item.guid ?? sourceKey), sourceKey, headline: String(item.title ?? ''), isNew: true, classification: '—', impact: '—', assets: [], classificationCompleted: false, semanticDedupCompleted: false, coverageRepairCompleted: false, duplicateOf: null, eventDuplicateOf: null, driverTheme: null, causalThemeId: null, macroEventKey: null, geoState: null, semanticDirection: null, semanticStrength: null, directAssetSignals: [], transmittedAssetSignals: [], signValidationStatus: 'NOT_APPLICABLE', boardLocked: false, displayEligible: false, visibleDestinations: [], finalDecisionCode: 'CLASSIFICATION_FAILED', finalDecisionReason: job.last_error ? `Classification failed: ${job.last_error}` : 'Classification job failed before a classification decision was persisted.', secondaryReasons: [], ingestId: job.ingest_id, classificationJobId: job.id, provider: job.provider, model: job.model, historicalDetail: false });
         }
     }
     const uniqueSourceIdentities = new Set(rows.map((row) => row.source_key).filter(Boolean)).size;
@@ -145,7 +163,7 @@ export async function getNewsDecisionAudit(filters: NewsDecisionAuditFilters) {
         acceptedDriver: mapped.filter((r) => r.finalDecisionCode === 'DRIVER_ACCEPTED').length,
         acceptedGeopolitical: mapped.filter((r) => r.finalDecisionCode === 'GEOPOLITICAL_ACCEPTED').length,
         rejectedIrrelevant: mapped.filter((r) => r.finalDecisionCode === 'IRRELEVANT').length,
-        rejectedEconomic: mapped.filter((r) => r.finalDecisionCode === 'ECONOMIC_RELEASE').length,
+        rejectedEconomic: mapped.filter((r) => ['ECONOMIC_RELEASE', 'ECONOMIC_MACRO_ONLY'].includes(r.finalDecisionCode)).length,
         rejectedTechnicalForecast: mapped.filter((r) => r.finalDecisionCode === 'TECHNICAL_OR_PRICE_FORECAST').length,
         lowImpact: mapped.filter((r) => r.finalDecisionCode === 'LOW_IMPACT').length,
         noTrackedAssetOrActionableScore: mapped.filter((r) => ['NO_TRACKED_ASSET_MAPPING', 'ZERO_OR_NON_ACTIONABLE_ASSET_SCORE'].includes(r.finalDecisionCode)).length,
