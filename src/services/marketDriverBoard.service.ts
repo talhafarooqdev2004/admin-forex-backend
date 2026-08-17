@@ -96,6 +96,42 @@ export type MarketDriverNewsRow = {
     createdAt: string;
 };
 
+export type MarketDriverDiagnosticRow = MarketDriverNewsRow & {
+    sourceId: string;
+    guid: string;
+    sourceKey: string;
+    dayKey: string;
+    classificationCompleted: boolean;
+    semanticDedupCompleted: boolean;
+    coverageRepairCompleted: boolean;
+    boardLocked: boolean;
+    duplicateOf: string | null;
+    displayEligible: boolean;
+    visibilityReason: string;
+};
+
+type DecisionMetadata = {
+    code: string;
+    reason: string;
+    secondary: string[];
+};
+
+function decisionMetadata(headline: string, classification: { category: string; impact: string; assets: ClassifiedAsset[] }, duplicateOf: string | null, visible: boolean): DecisionMetadata {
+    if (duplicateOf) return { code: 'SEMANTIC_DUPLICATE', reason: `Semantically duplicates canonical item ${duplicateOf}.`, secondary: [] };
+    if (/\b(price|pair|forex|currency)\b.*\bforecast|forecast.*\b(price|pair|forex|currency)\b/i.test(headline)) return { code: 'TECHNICAL_OR_PRICE_FORECAST', reason: 'Rejected as a technical or pair-price forecast; production rules exclude speculative price forecasts.', secondary: [] };
+    const category = String(classification.category).toUpperCase();
+    const assets = Array.isArray(classification.assets) ? classification.assets : [];
+    const tracked = assets.filter((asset) => (CATALYST_CURRENCIES as readonly string[]).includes(asset.asset));
+    if (category === 'ECONOMIC') return { code: 'ECONOMIC_RELEASE', reason: 'Classified as an economic-calendar release; News Headline/Catalyst rules exclude it.', secondary: [] };
+    if (category === 'IRRELEVANT') return { code: 'IRRELEVANT', reason: 'Classifier and post-classification rules marked this item irrelevant to tracked market drivers.', secondary: [] };
+    if (classification.impact === 'Low') return { code: 'LOW_IMPACT', reason: 'Low-impact item; low-impact news is not admitted to the visible driver board.', secondary: [] };
+    if (!tracked.length) return { code: 'NO_TRACKED_ASSET_MAPPING', reason: 'No tracked currency received a mapped asset score.', secondary: [] };
+    if (!tracked.some((asset) => Number(asset.score) !== 0)) return { code: 'ZERO_OR_NON_ACTIONABLE_ASSET_SCORE', reason: 'Mapped assets had no non-zero actionable score.', secondary: [] };
+    if (visible && category === 'GEOPOLITICAL') return { code: 'GEOPOLITICAL_ACCEPTED', reason: 'Accepted as a geopolitical driver and locked for display.', secondary: ['VISIBLE_ON_NEWS_HEADLINE', 'VISIBLE_IN_GEOPOLITICAL'] };
+    if (visible && category === 'DRIVER') return { code: 'DRIVER_ACCEPTED', reason: 'Accepted as a market driver and locked for display.', secondary: ['VISIBLE_ON_NEWS_HEADLINE', 'VISIBLE_IN_CATALYST'] };
+    return { code: 'CLASSIFIED_BUT_NOT_BOARD_LOCKED', reason: 'Classification completed, but the final display eligibility rule did not lock this item.', secondary: ['HIDDEN_BY_DISPLAY_RULE'] };
+}
+
 function normalizeTitle(title: string): string {
     return title
         .toLowerCase()
@@ -1156,6 +1192,13 @@ async function runMarketDriverIngest(rawItems: unknown[], options: MarketDriverI
                 classification_completed: boolean;
                 semantic_dedup_completed: boolean;
                 coverage_repair_completed: boolean;
+                final_decision_code: string;
+                final_decision_reason: string;
+                secondary_reasons: string[];
+                decision_ingest_id: string | null;
+                classification_job_id: string;
+                classification_provider: string | null;
+                classification_model: string | null;
                 published_at: Date;
             }> = [];
 
@@ -1190,6 +1233,7 @@ async function runMarketDriverIngest(rawItems: unknown[], options: MarketDriverI
                 }
 
                 const boardLocked = Boolean(item.existingLocked) || (!duplicateOf && visibleByClass);
+                const decision = decisionMetadata(item.title, c, duplicateOf, boardLocked);
 
                 if (!duplicateOf) normalizedToId.set(normalized, id);
                 if (boardLocked) {
@@ -1225,6 +1269,13 @@ async function runMarketDriverIngest(rawItems: unknown[], options: MarketDriverI
                     // A provider-classified duplicate has already completed its semantic decision.
                     semantic_dedup_completed: Boolean(duplicateOf) || !visibleByClass,
                     coverage_repair_completed: true,
+                    final_decision_code: decision.code,
+                    final_decision_reason: decision.reason,
+                    secondary_reasons: decision.secondary,
+                    decision_ingest_id: options.ingestId ?? options.queuedJobId ?? null,
+                    classification_job_id: job.id,
+                    classification_provider: null,
+                    classification_model: null,
                     published_at: publishedAt,
                 });
             }
@@ -1252,6 +1303,13 @@ async function runMarketDriverIngest(rawItems: unknown[], options: MarketDriverI
                         classification_completed: true,
                         semantic_dedup_completed: row.semantic_dedup_completed,
                         coverage_repair_completed: true,
+                        final_decision_code: row.final_decision_code,
+                        final_decision_reason: row.final_decision_reason,
+                        secondary_reasons: row.secondary_reasons,
+                        decision_ingest_id: row.decision_ingest_id,
+                        classification_job_id: row.classification_job_id,
+                        classification_provider: row.classification_provider,
+                        classification_model: row.classification_model,
                         published_at: row.published_at,
                     },
                 });
@@ -1604,6 +1662,63 @@ export async function getMarketDriverNews(dayKey: string = marketDayKey()): Prom
         publishedAt: item.published_at ? item.published_at.toISOString() : null,
         createdAt: item.created_at.toISOString(),
     }));
+}
+
+/** Read-only admin diagnostic; deliberately does not run coverage repair or any AI work. */
+export async function getMarketDriverNewsDiagnostic(dayKey: string = marketDayKey()): Promise<MarketDriverDiagnosticRow[]> {
+    const rows = await prisma.marketDriverNews.findMany({
+        where: { day_key: dayKey },
+        orderBy: [{ created_at: 'asc' }, { id: 'asc' }],
+        select: {
+            id: true, headline: true, source: true, source_id: true, guid: true, source_key: true,
+            category: true, impact: true, summary: true, assets: true, published_at: true, created_at: true,
+            classification_completed: true, semantic_dedup_completed: true, coverage_repair_completed: true,
+            board_locked: true, duplicate_of: true, day_key: true,
+        },
+    });
+    return rows.map((row) => {
+        const assets = Array.isArray(row.assets) ? row.assets : [];
+        const hasTrackedScoredAsset = assets.some((asset) => {
+            if (!asset || typeof asset !== 'object') return false;
+            const candidate = asset as Record<string, unknown>;
+            return (CATALYST_CURRENCIES as readonly string[]).includes(String(candidate.asset ?? '').toUpperCase())
+                && Number(candidate.score) !== 0;
+        });
+        const displayEligible = row.board_locked && !row.duplicate_of && hasTrackedScoredAsset;
+        const visibilityReason = displayEligible
+            ? 'displayed'
+            : row.duplicate_of
+                ? 'duplicate'
+                : !row.classification_completed
+                    ? 'classification_incomplete'
+                    : !row.board_locked
+                        ? 'not_board_locked'
+                        : !hasTrackedScoredAsset
+                            ? 'no_scored_catalyst_asset'
+                            : 'not_display_eligible';
+        return {
+            id: row.id,
+            headline: row.headline,
+            source: row.source,
+            category: row.category,
+            impact: row.impact,
+            summary: row.summary,
+            assets: (row.assets as ClassifiedAsset[]) ?? [],
+            publishedAt: row.published_at?.toISOString() ?? null,
+            createdAt: row.created_at.toISOString(),
+            sourceId: row.source_id,
+            guid: row.guid,
+            sourceKey: row.source_key ?? '',
+            dayKey: row.day_key,
+            classificationCompleted: row.classification_completed,
+            semanticDedupCompleted: row.semantic_dedup_completed,
+            coverageRepairCompleted: row.coverage_repair_completed,
+            boardLocked: row.board_locked,
+            duplicateOf: row.duplicate_of,
+            displayEligible,
+            visibilityReason,
+        };
+    });
 }
 
 export type DayArchiveMeta = {

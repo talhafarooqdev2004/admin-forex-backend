@@ -631,6 +631,14 @@ model MarketDriverNews {
   semantic_dedup_started_at DateTime?
   semantic_dedup_worker_id String? @db.VarChar(120)
   coverage_repair_completed Boolean @default(true)
+  /// Stable, human-readable final processing decision for admin auditability.
+  final_decision_code String? @db.VarChar(60)
+  final_decision_reason String? @db.VarChar(1000)
+  secondary_reasons Json?
+  decision_ingest_id String? @db.VarChar(100)
+  classification_job_id String? @db.VarChar(50)
+  classification_provider String? @db.VarChar(30)
+  classification_model String? @db.VarChar(120)
   published_at   DateTime?
   created_at     DateTime @default(now())
 
@@ -641,6 +649,7 @@ model MarketDriverNews {
   @@index([semantic_dedup_completed, semantic_dedup_started_at], map: "market_driver_news_semantic_dedup_recovery_idx")
   @@unique([source_id, guid], map: "market_driver_news_source_id_guid_key")
   @@index([day_key, board_locked])
+  @@index([day_key, final_decision_code])
   @@map("market_driver_news")
 }
 

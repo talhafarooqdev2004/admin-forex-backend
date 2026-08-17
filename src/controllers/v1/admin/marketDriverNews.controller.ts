@@ -1,7 +1,7 @@
 import type { NextFunction, Request, Response } from 'express';
 import { HTTP_STATUS } from '../../../config/constants.js';
 import { successResponse } from '../../../utils/response.util.js';
-import { getMarketDriverNews, uaeDayKey } from '../../../services/marketDriverBoard.service.js';
+import { getMarketDriverNews, getMarketDriverNewsDiagnostic, uaeDayKey } from '../../../services/marketDriverBoard.service.js';
 import {
     getLastCoverageAudit,
     runMarketDriverCoverageAudit,
@@ -34,6 +34,18 @@ export const getMarketDriverCoverageStatus = async (req: Request, res: Response,
             ? await runMarketDriverCoverageAudit({ force: true })
             : (getLastCoverageAudit() ?? (await runMarketDriverCoverageAudit()));
         res.status(HTTP_STATUS.OK).json(successResponse('Coverage audit status', result));
+    } catch (error) {
+        next(error);
+    }
+};
+
+/** Admin-only, read-only source/visibility diagnostics. Never invokes coverage repair or AI. */
+export const getMarketDriverNewsDiagnosticRows = async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const dayParam = typeof req.query.day === 'string' ? req.query.day.trim() : '';
+        const dayKey = /^\d{4}-\d{2}-\d{2}$/.test(dayParam) ? dayParam : uaeDayKey();
+        const rows = await getMarketDriverNewsDiagnostic(dayKey);
+        res.status(HTTP_STATUS.OK).json(successResponse('Market driver diagnostics retrieved successfully', { dayKey, rows }));
     } catch (error) {
         next(error);
     }

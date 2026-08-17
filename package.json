@@ -26,7 +26,8 @@
     "test:restart-safety": "node --import tsx/esm test-restart-safety.ts",
     "test:ai-production-readiness": "node --import tsx/esm test-ai-production-readiness.ts",
     "test:market-driver-rollover": "node --import tsx/esm test-market-driver-rollover.ts",
-    "test:ai-usage-dashboard": "node --import tsx/esm test-ai-usage-dashboard.ts"
+    "test:ai-usage-dashboard": "node --import tsx/esm test-ai-usage-dashboard.ts",
+    "test:news-decision-audit": "node --import tsx/esm --test test-news-decision-audit.ts"
   },
   "keywords": [
     "forex",

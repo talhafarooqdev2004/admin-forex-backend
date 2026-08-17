@@ -8,6 +8,7 @@ import * as economicCalendarController from '../controllers/v1/public/economicCa
 import * as marketCatalystController from '../controllers/v1/public/marketCatalyst.controller.js';
 import * as marketDriverHistoryController from '../controllers/v1/public/marketDriverHistory.controller.js';
 import * as geopoliticalRiskController from '../controllers/v1/public/geopoliticalRisk.controller.js';
+import * as dailyMarketSnapshotController from '../controllers/v1/public/dailyMarketSnapshot.controller.js';
 
 const router = express.Router();
 
@@ -18,6 +19,7 @@ router.get('/news/investing', readLimiter, investingNewsController.getInvestingN
 router.get('/economic-calendar', readLimiter, economicCalendarController.getEconomicCalendar);
 router.get('/market-catalyst', readLimiter, marketCatalystController.getMarketCatalyst);
 router.get('/geopolitical-risk', readLimiter, geopoliticalRiskController.getGeopoliticalRisk);
+router.get('/daily-market-snapshot', readLimiter, dailyMarketSnapshotController.getDailyMarketSnapshotReadOnly);
 router.get('/market-driver-history', readLimiter, marketDriverHistoryController.listMarketDriverHistoryDays);
 router.get('/market-driver-history/:dayKey', readLimiter, marketDriverHistoryController.getMarketDriverHistoryDay);
 

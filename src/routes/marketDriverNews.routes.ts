@@ -21,4 +21,12 @@ router.get(
     marketDriverNewsController.getMarketDriverCoverageStatus,
 );
 
+router.get(
+    '/diagnostic',
+    readLimiter,
+    authMiddleware,
+    authorize('admin'),
+    marketDriverNewsController.getMarketDriverNewsDiagnosticRows,
+);
+
 export default router;

@@ -26,11 +26,11 @@ export type EconomicCalendarEvent = {
     id?: string | null;
 };
 
-type Snapshot = { data: EconomicCalendarEvent[]; scrapedAt: number };
+export type EconomicCalendarSnapshot = { data: EconomicCalendarEvent[]; scrapedAt: number };
 
 const SNAPSHOT_PATH = path.join(process.cwd(), 'data', 'economic-calendar-snapshot.json');
 
-let snapshot: Snapshot | null = null;
+let snapshot: EconomicCalendarSnapshot | null = null;
 
 function isValidImpact(value: unknown): value is EconomicCalendarEvent['impact'] {
     return value === 'Low' || value === 'Medium' || value === 'High';
@@ -70,7 +70,7 @@ function normalizeEvent(raw: unknown): EconomicCalendarEvent | null {
     };
 }
 
-function persistSnapshot(next: Snapshot): void {
+function persistSnapshot(next: EconomicCalendarSnapshot): void {
     try {
         fs.mkdirSync(path.dirname(SNAPSHOT_PATH), { recursive: true });
         fs.writeFileSync(SNAPSHOT_PATH, JSON.stringify(next), 'utf8');
@@ -81,7 +81,7 @@ function persistSnapshot(next: Snapshot): void {
     }
 }
 
-function loadPersistedSnapshot(): Snapshot | null {
+function loadPersistedSnapshot(): EconomicCalendarSnapshot | null {
     try {
         if (!fs.existsSync(SNAPSHOT_PATH)) return null;
         const raw = JSON.parse(fs.readFileSync(SNAPSHOT_PATH, 'utf8')) as {
@@ -188,7 +188,7 @@ export function applyEconomicCalendarSnapshot(
 }
 
 /** Last scraped snapshot, if any — instant, never triggers a scrape. */
-export function getEconomicCalendarSnapshot(): Snapshot | null {
+export function getEconomicCalendarSnapshot(): EconomicCalendarSnapshot | null {
     if (!snapshot?.data?.length) {
         const restored = loadPersistedSnapshot();
         if (restored) snapshot = restored;
