@@ -136,6 +136,11 @@ export const ENV = {
     ADMIN_EMAIL: process.env.ADMIN_EMAIL || 'forexfundamentaledge@gmail.com',
     GOOGLE_SHEETS_CREDENTIALS_PATH: process.env.GOOGLE_SHEETS_CREDENTIALS_PATH || './google-credentials.json',
     GOOGLE_SHEETS_ID: process.env.GOOGLE_SHEETS_ID || '1bNnoOYUdUm-AFMTL0LPRqsuId1KI3eHMAF-Wz275RGg',
+    /** FinancialJuice RSS fetch policy for admin inspection endpoints (mirrors forex-scraping). */
+    FJ_RSS_MAX_RETRIES: parseInteger(process.env.FJ_RSS_MAX_RETRIES, 3),
+    FJ_RSS_MIN_INTERVAL_MS: parseInteger(process.env.FJ_RSS_MIN_INTERVAL_MS, 60000),
+    FJ_RSS_BACKOFF_BASE_MS: parseInteger(process.env.FJ_RSS_BACKOFF_BASE_MS, 2000),
+    FJ_RSS_FETCH_TIMEOUT_MS: parseInteger(process.env.FJ_RSS_FETCH_TIMEOUT_MS, 15000),
     RETAIL_SENTIMENT_SHEET_NAME: process.env.RETAIL_SENTIMENT_SHEET_NAME || 'RETAIL SENTIMENTS 7',
     RETAIL_SENTIMENT_SHEET_RANGE: process.env.RETAIL_SENTIMENT_SHEET_RANGE || 'A4:D31',
     /** FX Analyzer: tab "New Sheet" — row 32 header, 33–60 data; col A + W–AE (synced into `fx_technical_trends`). */

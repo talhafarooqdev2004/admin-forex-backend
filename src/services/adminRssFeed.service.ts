@@ -3,21 +3,15 @@
  * Independent from the local forex-scraping FFE ChatGPT pipeline.
  */
 import { XMLParser } from 'fast-xml-parser';
-import { logger } from '../utils/logger.util.js';
 import {
     FFE_PROMO_HEADLINES,
     assembleFinancialJuiceEvidenceUnit,
     chronologicalSourceUnits,
     type ChronologicalSourceUnit,
 } from './ffeEvidencePreprocess.service.js';
+import { fetchFinancialJuiceRssXml } from './financialJuiceRssFetch.service.js';
 
 export const FINANCIAL_JUICE_RSS_URL = 'https://www.financialjuice.com/feed.ashx?xml=RSS';
-
-const FETCH_TIMEOUT_MS = 20_000;
-const MAX_RETRIES = 3;
-const BACKOFF_BASE_MS = 2000;
-const USER_AGENT =
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
 const rssParser = new XMLParser({ ignoreAttributes: false, trimValues: true });
 
@@ -30,10 +24,6 @@ export type AdminRssInspectionSnapshot = {
     financialjuice_count: number;
     fxstreet_count: number;
 };
-
-function sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 function stripHtml(value: unknown): string {
     return String(value || '')
@@ -206,80 +196,6 @@ export function retainNativeFeedUnits(normalizedItems: NormalizedRssItem[]) {
     }
 
     return { retained, excluded };
-}
-
-function validateRssXml(xml: string): string {
-    if (xml.includes('error code: 1015')) {
-        const error = new Error('RSS fetch rate-limited (1015)') as Error & { status?: number; retryable?: boolean };
-        error.status = 429;
-        error.retryable = true;
-        throw error;
-    }
-    if (/just a moment|cf-browser-verification|security verification/i.test(xml)) {
-        throw new Error('RSS fetch hit Cloudflare challenge');
-    }
-    return xml;
-}
-
-async function performRssHttpFetch(url: string): Promise<string> {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    try {
-        const res = await fetch(url, {
-            signal: controller.signal,
-            headers: {
-                'User-Agent': USER_AGENT,
-                Accept: 'application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8',
-            },
-        });
-
-        if (res.status === 429) {
-            const error = new Error('RSS fetch returned 429') as Error & { status?: number; retryable?: boolean };
-            error.status = 429;
-            error.retryable = true;
-            throw error;
-        }
-        if (!res.ok) {
-            throw new Error(`RSS fetch returned ${res.status}`);
-        }
-
-        return validateRssXml(await res.text());
-    } finally {
-        clearTimeout(timeout);
-    }
-}
-
-async function fetchFinancialJuiceRssXml(
-    url: string,
-    { logLabel = 'AdminRssNews' }: { logLabel?: string } = {},
-): Promise<string> {
-    let lastError: Error | null = null;
-
-    for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt += 1) {
-        try {
-            const xml = await performRssHttpFetch(url);
-            if (attempt > 1) {
-                logger.info(`[${logLabel}] RSS fetch succeeded on attempt ${attempt}/${MAX_RETRIES + 1}`);
-            }
-            return xml;
-        } catch (error) {
-            lastError = error instanceof Error ? error : new Error(String(error));
-            const retryable = (lastError as Error & { retryable?: boolean }).retryable === true
-                && (lastError as Error & { status?: number }).status === 429;
-            const retriesRemaining = MAX_RETRIES + 1 - attempt;
-
-            if (!retryable || retriesRemaining <= 0) {
-                logger.error(`[${logLabel}] RSS fetch failed: ${lastError.message}`);
-                throw lastError;
-            }
-
-            const waitMs = BACKOFF_BASE_MS * (2 ** (attempt - 1));
-            logger.warn(`[${logLabel}] HTTP 429 — retry ${attempt}/${MAX_RETRIES} in ${waitMs}ms`);
-            await sleep(waitMs);
-        }
-    }
-
-    throw lastError || new Error('RSS fetch failed');
 }
 
 /** Live RSS inspection for admin tools — same normalization as FFE pipeline, no scraper dependency. */

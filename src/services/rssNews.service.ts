@@ -97,7 +97,11 @@ export async function getAdminRssNews(businessDayInput?: string): Promise<AdminR
         fetchedAt = live.fetched_at;
         filteredUnits = filterUnitsByBusinessDay(live.source_units, businessDay);
     } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        const base = error instanceof Error ? error.message : String(error);
+        const status = (error as { status?: number }).status;
+        const message = status === 429
+            ? `${base}. FinancialJuice rate limit persisted after bounded retries — wait at least one minute before fetching again.`
+            : base;
         return buildUnavailableResponse(
             businessDay,
             `Live RSS fetch failed: ${message}`,
