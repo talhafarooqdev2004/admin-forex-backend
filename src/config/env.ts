@@ -105,6 +105,21 @@ export const ENV = {
     AI_GROQ_OUTPUT_PRICE_PER_MILLION: process.env.AI_GROQ_OUTPUT_PRICE_PER_MILLION || '0.60',
     AI_OPENAI_REASONING_EFFORT: process.env.AI_OPENAI_REASONING_EFFORT || 'none',
     AI_GROQ_REASONING_EFFORT: process.env.AI_GROQ_REASONING_EFFORT || 'low',
+    /** GPT-first full-session request timeout (reasoning models may need several minutes). */
+    FFE_GPT_FIRST_TIMEOUT_MS: parseInteger(process.env.FFE_GPT_FIRST_TIMEOUT_MS, 600000),
+    /** GPT-first full-session max output tokens (reasoning + JSON; 219/220 prompt needs headroom). */
+    FFE_GPT_FIRST_MAX_OUTPUT_TOKENS: parseInteger(process.env.FFE_GPT_FIRST_MAX_OUTPUT_TOKENS, 128000),
+    /**
+     * GPT-first analyst model. Pinned independently of OPENAI_CLASSIFICATION_MODEL
+     * so per-headline nano classification cannot silently become the session analyst.
+     */
+    FFE_GPT_FIRST_MODEL: process.env.FFE_GPT_FIRST_MODEL || 'gpt-5.4-mini',
+    /** GPT-first reasoning effort for full-session analysis. */
+    FFE_GPT_FIRST_REASONING_EFFORT: process.env.FFE_GPT_FIRST_REASONING_EFFORT || 'high',
+    /** GPT-first OpenAI Responses background mode (long reasoning jobs). */
+    FFE_GPT_FIRST_USE_BACKGROUND: parseEnvBool(process.env.FFE_GPT_FIRST_USE_BACKGROUND, true),
+    /** Analysis mode: gpt_first (default) or hybrid (legacy per-headline pipeline). */
+    FFE_ANALYSIS_MODE: process.env.FFE_ANALYSIS_MODE || 'gpt_first',
     AI_GROQ_INCLUDE_REASONING: parseEnvBool(process.env.AI_GROQ_INCLUDE_REASONING, false),
     /** Informational dashboard thresholds; OpenAI Platform billing limits remain authoritative. */
     AI_USAGE_COST_ATTENTION_USD: parseNumber(process.env.AI_USAGE_COST_ATTENTION_USD, 2),
@@ -157,6 +172,8 @@ export const ENV = {
     SCORE_DASHBOARD_SHEET_RANGE: process.env.SCORE_DASHBOARD_SHEET_RANGE || 'A2:J30',
     /** Required for scraper webhooks; never fall back to a shared source-controlled secret. */
     SCRAPER_WEBHOOK_SECRET: process.env.SCRAPER_WEBHOOK_SECRET || '',
+    /** FFE news source is intentionally fixed; Economic Calendar has a separate source path. */
+    MARKET_DRIVER_SOURCE: 'financialjuice',
     /**
      * When true, loopback/private client IPs are stored as resolved rows with country
      * "Local or private network" (for local testing only). Default is false in all environments:

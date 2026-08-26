@@ -26,7 +26,7 @@ const now = new Date();
 const pubDate = now.toISOString();
 const guid = `${namespace}:guid`;
 const title = `Fed Chair says rates will stay higher for longer ${fixtureMarker}`;
-const source = 'RestartTest';
+const source = 'FinancialJuice';
 const normalized = title.toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
 const sourceKey = createHash('sha256').update(`${sourceId}\n${guid}`).digest('hex');
 const contentHash = createHash('sha256')
@@ -62,10 +62,26 @@ async function main() {
             return {
                 results: [...new Set(indices)].map((i) => ({
                     i,
+                    itemId: String(i),
                     category: 'DRIVER',
                     impact: 'High',
-                    assets: [{ asset: 'USD', bias: 'Bullish', score: 1 }],
+                    assets: [{ asset: 'USD', bias: 'Bullish', score: 1, role: 'DIRECT', reason: 'Synthetic driver' }],
                     summary: 'Synthetic restart test',
+                    driverTheme: 'SYNTHETIC_THEME',
+                    causalThemeId: 'SYNTHETIC_THEME',
+                    geoState: 'IRRELEVANT',
+                    semanticDirection: 'BULLISH',
+                    semanticStrength: 'STRONG',
+                    fundamentalCause: 'Synthetic driver',
+                    eventRelation: 'NEW_EVENT',
+                    eventDuplicateOf: null,
+                    causalThemeSummary: 'Synthetic driver',
+                    themeAction: 'CREATE',
+                    macro: { eligible: false, family: null, directionSummary: null, assetScores: [] },
+                    catalystEligible: true,
+                    confidence: 1,
+                    needsReview: false,
+                    reason: 'Synthetic restart test',
                 })),
                 duplicateGroups: [],
                 existingDuplicates: [],
@@ -111,7 +127,7 @@ async function main() {
             guid: queuedReplayGuid,
             sourceKey: createHash('sha256').update(`${sourceId}\n${queuedReplayGuid}`).digest('hex'),
             contentHash: createHash('sha256')
-                .update(`${sourceId}\n${queuedReplayGuid}\n${source}\n${pubDate}\n${normalized}`)
+                .update(`${sourceId}\n${queuedReplayGuid}\n\n${source}\n${pubDate}\n${normalized}`)
                 .digest('hex'),
         };
         const queuedReplayJob = await ensureAiClassificationJob([queuedReplayItem], {

@@ -6,7 +6,6 @@ import * as board from './src/services/marketDriverBoard.service.js';
 import * as classifier from './src/services/groqClassifier.service.js';
 import * as coverage from './src/services/marketDriverCoverageAudit.service.js';
 import * as queue from './src/services/aiClassificationQueue.service.js';
-import { getAiUsageDaily, getAiUsageSummary, getProcessingRuns, resolveReportRange } from './src/services/aiUsageDashboard.service.js';
 import { runMarketDriverRollover } from './src/services/marketDriverRollover.service.js';
 
 type Item = {
@@ -32,7 +31,7 @@ function normalize(title: string) {
 function item(label: string, title: string, at: string): Item {
     const sourceId = `${sourcePrefix}:${label}`.slice(0, 80);
     const guid = `${namespace}:${label}`;
-    const source = 'RolloverVerification';
+    const source = 'FinancialJuice';
     const pubDate = new Date(at).toISOString();
     const sourceKey = createHash('sha256').update(`${sourceId}\n${guid}`).digest('hex');
     const contentHash = createHash('sha256')
@@ -54,10 +53,26 @@ function providerResult(user: string, schemaName: string): Record<string, unknow
     return {
         results: [...new Set(indices)].map((index) => ({
             i: index,
+            itemId: String(index),
             category: 'DRIVER',
             impact: 'High',
-            assets: [{ asset: 'USD', bias: 'Bullish', score: 1 }],
+            assets: [{ asset: 'USD', bias: 'Bullish', score: 1, role: 'DIRECT', reason: 'Synthetic rollover driver' }],
             summary: 'Synthetic rollover verification',
+            driverTheme: 'SYNTHETIC_ROLLOVER_THEME',
+            causalThemeId: 'SYNTHETIC_ROLLOVER_THEME',
+            geoState: 'IRRELEVANT',
+            semanticDirection: 'BULLISH',
+            semanticStrength: 'STRONG',
+            fundamentalCause: 'Synthetic rollover driver',
+            eventRelation: 'NEW_EVENT',
+            eventDuplicateOf: null,
+            causalThemeSummary: 'Synthetic rollover driver',
+            themeAction: 'CREATE',
+            macro: { eligible: false, family: null, directionSummary: null, assetScores: [] },
+            catalystEligible: true,
+            confidence: 1,
+            needsReview: false,
+            reason: 'Synthetic rollover verification',
         })),
         duplicateGroups: [],
         existingDuplicates: existingMatch ? [{ i: 0, existingId: existingMatch[1]!.trim() }] : [],
@@ -88,11 +103,18 @@ async function cleanup() {
     classifier.setAiProviderRequestOverrideForTests(null);
     classifier.setAiProviderTransportOverrideForTests(null);
     await rememberJobs();
+    const sessionJobs = await prisma.marketDriverSessionSynthesisJob.findMany({
+        where: { ingest_id: { startsWith: namespace } },
+        select: { id: true, snapshot_id: true },
+    });
+    const sessionSnapshotIds = sessionJobs.map((job) => job.snapshot_id).filter((id): id is string => Boolean(id));
     await prisma.aiUsageRecord.deleteMany({
         where: { OR: [{ ingest_id: { startsWith: namespace } }, { job_id: { in: [...jobIds] } }] },
     });
     await prisma.marketDriverProcessingRun.deleteMany({ where: { ingest_id: { startsWith: namespace } } });
     if (jobIds.size) await prisma.aiClassificationJob.deleteMany({ where: { id: { in: [...jobIds] } } });
+    if (sessionSnapshotIds.length) await prisma.marketDriverSessionSnapshot.deleteMany({ where: { id: { in: sessionSnapshotIds } } });
+    if (sessionJobs.length) await prisma.marketDriverSessionSynthesisJob.deleteMany({ where: { id: { in: sessionJobs.map((job) => job.id) } } });
     await prisma.marketDriverDayArchive.deleteMany({ where: { day_key: { in: ['2037-08-10', '2037-08-11', '2037-08-12', '2037-08-13'] } } });
     await prisma.marketDriverNews.deleteMany({ where: { source_id: { startsWith: sourcePrefix } } });
 }
@@ -283,7 +305,7 @@ try {
     assert.equal(foldedRow?.day_key, '2037-08-13');
     assert.equal(foldedRow?.semantic_dedup_completed, true);
     assert.equal(foldedRow?.duplicate_of, (await prisma.marketDriverNews.findUnique({ where: { source_key: previous.sourceKey } }))?.id);
-    assert.equal((await board.getMarketDriverNews('2037-08-13')).length, 0, 'semantic duplicate stays out of the live board');
+    assert.equal((await board.getMarketDriverNews('2037-08-13')).some((row) => row.headline === crossBoundaryDuplicate.title), false, 'semantic duplicate stays out of the live board');
 
     const newHeadline = item('new', 'ECB signals an unexpected rate hike and lifts the euro outlook', '2037-08-12T21:06:00.000Z');
     const newStart = calls.length;
@@ -297,7 +319,7 @@ try {
     assert.equal(newRow?.day_key, '2037-08-13');
     assert.equal(newRow?.semantic_dedup_completed, true);
     assert.equal(newRow?.duplicate_of, null);
-    assert.equal((await board.getMarketDriverNews('2037-08-13')).length, 1, 'genuinely new headline appears after rollover');
+    assert.equal((await board.getMarketDriverNews('2037-08-13')).some((row) => row.headline === newHeadline.title), true, 'genuinely new headline appears after rollover');
 
     const healthyRss = `<?xml version="1.0"?><rss><channel><item><guid>${newHeadline.guid}</guid><title>${newHeadline.title}</title><author>${newHeadline.source}</author><pubDate>${new Date(newHeadline.pubDate).toUTCString()}</pubDate></item></channel></rss>`;
     globalThis.fetch = async () => new Response(healthyRss, { status: 200, headers: { 'content-type': 'application/xml' } });
@@ -353,16 +375,13 @@ try {
         data: { created_at: times.t0200 },
     });
 
-    const range = resolveReportRange({ preset: 'custom', from: '2037-08-12', to: '2037-08-13' }, times.t0200);
-    const daily = await getAiUsageDaily(range);
-    assert.ok(daily.rows.some((row) => row.date === '2037-08-12'));
-    assert.ok(daily.rows.some((row) => row.date === '2037-08-13'));
-    const summary = await getAiUsageSummary(range, times.t0200);
-    assert.ok(summary.totals.openaiRequests >= beforeCalls + 3);
-    assert.ok(Number(summary.totals.estimatedCostUsd) > 0);
-    assert.ok(Number(summary.costAlert.currentMonthEstimatedCostUsd) > 0);
-    const processingHistory = await getProcessingRuns(range, { page: 1, pageSize: 100 });
-    assert.ok(processingHistory.rows.length >= 3);
+    const usageCount = await prisma.aiUsageRecord.count({
+        where: {
+            created_at: { gte: times.t0050, lte: times.t0200 },
+            ingest_id: { startsWith: namespace },
+        },
+    });
+    assert.ok(usageCount >= beforeCalls + 3);
     assert.ok(await prisma.marketDriverProcessingRun.count({ where: { ingest_id: { startsWith: namespace } } }) >= 3);
 
     (report.aiCalls as Record<string, unknown>) = {

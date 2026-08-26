@@ -192,7 +192,9 @@ class GoogleSheetsService {
     }
     async getCell(tableId, cell) {
         const values = await this.getRange(tableId, cell);
-        return values[0]?.[0] || null;
+        // Preserve a legitimate numeric zero; `|| null` turned a valid Neutral
+        // Risk Mode score into a missing value and forced a stale DB fallback.
+        return values[0]?.[0] ?? null;
     }
     async syncTable(tableId, data, startCell = 'A1') {
         await this.ensureInitialized();

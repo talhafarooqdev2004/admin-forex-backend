@@ -4,7 +4,14 @@ import { ENV } from '../config/env.js';
 import { logger } from '../utils/logger.util.js';
 
 export type AiProvider = 'openai' | 'groq';
-export type AiOperationType = 'classification' | 'semantic_dedup' | 'coverage_repair';
+export type AiOperationType =
+    | 'classification'
+    | 'semantic_dedup'
+    | 'coverage_repair'
+    | 'semantic_adjudication'
+    | 'geo_risk_evaluation'
+    | 'session_synthesis'
+    | 'session_review';
 
 export type ProviderUsage = {
     inputTokens?: number | null;

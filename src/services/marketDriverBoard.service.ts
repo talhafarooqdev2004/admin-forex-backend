@@ -17,12 +17,10 @@ import {
 import {
     classifyHeadlines,
     findBatchDuplicateMap,
+    FFE_ANALYST_PROMPT_VERSION,
     groqDailyLimitRemainingMs,
     isBoardVisibleClassification,
     isGroqDailyLimited,
-    likelySameEvent,
-    oilCatalystCluster,
-    sanitizeClassification,
     CATALYST_CURRENCIES,
     TRACKED_ASSETS,
     type AssetBias,
@@ -43,10 +41,16 @@ import {
 } from '../utils/marketBusinessDay.util.js';
 import {
     aggregateUniqueCausalThemes,
-    deriveFfeDecision,
-    FFE_TRACKED_ASSETS,
     type FfeAssetSignal,
 } from './ffeDecisionEngine.service.js';
+import {
+    getCanonicalEventBoard,
+    loadCanonicalEventContexts,
+    loadCanonicalThemes,
+    persistCanonicalDecision,
+    type CanonicalThemeContext,
+} from './canonicalThemeRegistry.service.js';
+import { synthesizeFfeSessionIfChanged } from './ffeSessionBrain.service.js';
 
 /**
  * AI batch size per call. We loop until every fresh RSS item is classified in this ingest
@@ -82,6 +86,8 @@ export function dayKeyFromPubDate(pubDate: string | null | undefined): string | 
     return marketDayKey(d);
 }
 
+export const FFE_NEWS_SOURCE = 'FinancialJuice';
+
 export type CatalystBoardRow = {
     asset: TrackedAsset;
     bullishCount: number;
@@ -108,6 +114,12 @@ export type MarketDriverNewsRow = {
     directAssetSignals: ClassifiedAsset[];
     transmittedAssetSignals: ClassifiedAsset[];
     signValidationStatus: string;
+    fundamentalCause: string | null;
+    observedMarketReaction: string | null;
+    eventType: string | null;
+    eventRelation: string | null;
+    canonicalEventId: string | null;
+    currentAssetContributions: ClassifiedAsset[];
 };
 
 export type MarketDriverDiagnosticRow = MarketDriverNewsRow & {
@@ -141,9 +153,59 @@ type DecisionMetadata = {
     secondary: string[];
 };
 
+function aiDecisionFromClassification(classification: ClassifiedHeadline) {
+    return {
+        driverTheme: classification.driverTheme ?? null,
+        causalThemeId: classification.causalThemeId ?? null,
+        macroEventKey: classification.macro?.family ?? null,
+        geoState: classification.geoState ?? 'IRRELEVANT',
+        semanticDirection: classification.semanticDirection ?? 'NEUTRAL',
+        semanticStrength: classification.semanticStrength ?? 'NONE',
+        directAssetSignals: classification.directAssetSignals ?? [],
+        transmittedAssetSignals: classification.transmittedAssetSignals ?? [],
+        signValidationStatus: classification.signValidationStatus ?? 'PASS',
+    };
+}
+
+function aiProvenanceData(classification: ClassifiedHeadline) {
+    return {
+        fundamental_cause: classification.fundamentalCause ?? null,
+        event_relation: classification.eventRelation ?? 'NEW_EVENT',
+        event_duplicate_of: classification.eventDuplicateOf ?? null,
+        event_type: classification.eventType ?? null,
+        observed_market_reaction: classification.observedMarketReaction ?? null,
+        event_severity: classification.eventSeverity ?? null,
+        event_credibility: classification.eventCredibility ?? null,
+        event_freshness: classification.eventFreshness ?? null,
+        event_persistence: classification.eventPersistence ?? null,
+        transmission_reason: classification.transmissionReason ?? null,
+        counter_evidence: (classification.counterEvidence ?? []) as unknown as object,
+        current_asset_contributions: (classification.currentAssetContributions ?? []) as unknown as object,
+        supporting_guid_ids: (classification.supportingGuidIds ?? []) as unknown as object,
+        confirmation_only: ['SAME_EVENT', 'CONFIRMATION', 'PRICE_REACTION', 'HISTORICAL_COMMENTARY', 'MACRO_RELEASE', 'FORECAST_UPCOMING', 'IRRELEVANT'].includes(String(classification.eventRelation)),
+        macro_actual: classification.macroValues?.actual ?? null,
+        macro_forecast: classification.macroValues?.forecast ?? null,
+        macro_previous: classification.macroValues?.previous ?? null,
+        causal_theme_summary: classification.causalThemeSummary ?? null,
+        theme_action: classification.themeAction ?? 'NONE',
+        catalyst_eligible: Boolean(classification.catalystEligible),
+        confidence: Number(classification.confidence ?? 0),
+        needs_review: Boolean(classification.needsReview),
+        decision_source: classification.decisionSource ?? 'ai_primary',
+        prompt_version: classification.promptVersion ?? FFE_ANALYST_PROMPT_VERSION,
+        semantic_decided_at: new Date(),
+        macro_eligible: Boolean(classification.macro?.eligible),
+        macro_family: classification.macro?.family ?? null,
+        macro_direction_summary: classification.macro?.directionSummary ?? null,
+        macro_asset_scores: (classification.macro?.assetScores ?? []) as unknown as object,
+        decision_reason: String(classification.reason ?? classification.summary ?? '').slice(0, 1000),
+        structural_validation_status: classification.structuralValidationStatus ?? 'PASS',
+    };
+}
+
 function decisionMetadata(headline: string, classification: { category: string; impact: string; assets: ClassifiedAsset[] }, duplicateOf: string | null, visible: boolean): DecisionMetadata {
+    void headline;
     if (duplicateOf) return { code: 'SEMANTIC_DUPLICATE', reason: `Semantically duplicates canonical item ${duplicateOf}.`, secondary: [] };
-    if (/\b(price|pair|forex|currency)\b.*\bforecast|forecast.*\b(price|pair|forex|currency)\b/i.test(headline)) return { code: 'TECHNICAL_OR_PRICE_FORECAST', reason: 'Rejected as a technical or pair-price forecast; production rules exclude speculative price forecasts.', secondary: [] };
     const category = String(classification.category).toUpperCase();
     const assets = Array.isArray(classification.assets) ? classification.assets : [];
     const tracked = assets.filter((asset) => (CATALYST_CURRENCIES as readonly string[]).includes(asset.asset));
@@ -152,7 +214,7 @@ function decisionMetadata(headline: string, classification: { category: string; 
     if (classification.impact === 'Low') return { code: 'LOW_IMPACT', reason: 'Low-impact item; low-impact news is not admitted to the visible driver board.', secondary: [] };
     if (!tracked.length) return { code: 'NO_TRACKED_ASSET_MAPPING', reason: 'No tracked currency received a mapped asset score.', secondary: [] };
     if (!tracked.some((asset) => Number(asset.score) !== 0)) return { code: 'ZERO_OR_NON_ACTIONABLE_ASSET_SCORE', reason: 'Mapped assets had no non-zero actionable score.', secondary: [] };
-    if (visible && category === 'GEOPOLITICAL') return { code: 'GEOPOLITICAL_ACCEPTED', reason: 'Accepted as a geopolitical driver and locked for display.', secondary: ['VISIBLE_ON_NEWS_HEADLINE', 'VISIBLE_IN_GEOPOLITICAL'] };
+    if (visible && category === 'GEOPOLITICAL') return { code: 'GEOPOLITICAL_ACCEPTED', reason: 'AI accepted this geopolitical driver and it was locked for display.', secondary: ['VISIBLE_ON_NEWS_HEADLINE', 'VISIBLE_IN_GEOPOLITICAL'] };
     if (visible && category === 'DRIVER') return { code: 'DRIVER_ACCEPTED', reason: 'Accepted as a market driver and locked for display.', secondary: ['VISIBLE_ON_NEWS_HEADLINE', 'VISIBLE_IN_CATALYST'] };
     return { code: 'CLASSIFIED_BUT_NOT_BOARD_LOCKED', reason: 'Classification completed, but the final display eligibility rule did not lock this item.', secondary: ['HIDDEN_BY_DISPLAY_RULE'] };
 }
@@ -178,6 +240,18 @@ export type RssItem = {
     existingLocked?: boolean;
 };
 
+/** FinancialJuice is the only live news-feed source admitted to FFE Catalyst analysis. */
+export function isAllowedMarketDriverSource(source: unknown): boolean {
+    const normalized = String(source ?? '').trim().toLowerCase();
+    return normalized === ENV.MARKET_DRIVER_SOURCE;
+}
+
+function liveNewsSourceWhere(dayKey: string): { source?: string } {
+    void dayKey;
+    // Historical FXStreet rows remain stored for audit, but never enter an FFE board/read path.
+    return { source: FFE_NEWS_SOURCE };
+}
+
 /** A currently-shown (locked) board headline, used as an admission-dedup target for new items. */
 type LockedPrincipal = { id: string; headline: string; primary: string | null };
 
@@ -188,16 +262,11 @@ type LockedPrincipal = { id: string; headline: string; primary: string | null };
  * only (admission) — never used to demote something already shown.
  */
 function matchLockedPrincipal(headline: string, primary: string | null, lockedPrincipals: LockedPrincipal[]): string | null {
-    if (!primary) return null;
-    for (const p of lockedPrincipals) {
-        if (p.primary !== primary) continue;
-        if (likelySameEvent(p.headline, headline)) return p.id;
-        if (primary === 'OIL') {
-            const a = oilCatalystCluster(p.headline);
-            const b = oilCatalystCluster(headline);
-            if (a && b && a === b) return p.id;
-        }
-    }
+    // Semantic same-event admission is now an AI eventRelation decision. Exact/source identity
+    // remains enforced by source_key and the database unique constraint.
+    void headline;
+    void primary;
+    void lockedPrincipals;
     return null;
 }
 
@@ -208,12 +277,29 @@ function normalizeSourceId(value: unknown, source: string | null): string {
     return (fromSource || 'unknown').slice(0, 80);
 }
 
-function sourceIdentity(sourceId: string, guid: string, source: string | null, title: string, pubDate: string | null) {
+function normalizeSourceUrl(value: unknown): string {
+    const raw = String(value ?? '').trim();
+    if (!raw) return '';
+    try {
+        const url = new URL(raw);
+        url.hash = '';
+        url.hostname = url.hostname.toLowerCase();
+        if ((url.protocol === 'http:' && url.port === '80') || (url.protocol === 'https:' && url.port === '443')) {
+            url.port = '';
+        }
+        return url.toString().replace(/\/$/, '');
+    } catch {
+        return raw.toLowerCase().replace(/\s+/g, '');
+    }
+}
+
+function sourceIdentity(sourceId: string, guid: string, source: string | null, title: string, pubDate: string | null, url?: unknown) {
+    const normalizedUrl = normalizeSourceUrl(url);
     const stableIdentifier = guid.trim() || createHash('sha256')
-        .update(`${sourceId}\n${source ?? ''}\n${pubDate ?? ''}\n${normalizeTitle(title)}`)
+        .update(`${normalizedUrl}\n${sourceId}\n${source ?? ''}\n${pubDate ?? ''}\n${normalizeTitle(title)}`)
         .digest('hex');
     const sourceKey = createHash('sha256').update(`${sourceId}\n${stableIdentifier}`).digest('hex');
-    const contentHash = createHash('sha256').update(`${sourceId}\n${stableIdentifier}\n${source ?? ''}\n${pubDate ?? ''}\n${normalizeTitle(title)}`).digest('hex');
+    const contentHash = createHash('sha256').update(`${sourceId}\n${stableIdentifier}\n${normalizedUrl}\n${source ?? ''}\n${pubDate ?? ''}\n${normalizeTitle(title)}`).digest('hex');
     return { stableIdentifier, sourceKey, contentHash };
 }
 
@@ -226,18 +312,28 @@ function normalizeRssItems(rawItems: unknown[]): RssItem[] {
         const title = String(it.title ?? '')
             .replace(/^FinancialJuice:\s*/i, '')
             .trim();
-        const source = it.source == null || it.source === '' ? 'FinancialJuice' : String(it.source).trim();
+        const rawSource = it.source == null || it.source === '' ? FFE_NEWS_SOURCE : String(it.source).trim();
+        // Source filtering is deliberately before any persistent lookup, queue creation, or AI
+        // call. Historical non-FinancialJuice rows remain readable; new rows cannot enter FFE.
+        if (!isAllowedMarketDriverSource(rawSource)) continue;
+        const source = FFE_NEWS_SOURCE;
         const sourceId = normalizeSourceId(it.sourceId ?? it.feedId, source);
         const rawGuid = String(it.guid ?? '').trim();
-        const identity = sourceIdentity(sourceId, rawGuid, source, title, it.pubDate == null || it.pubDate === '' ? null : String(it.pubDate).trim());
+        const rawUrl = it.link ?? it.url ?? '';
+        const identity = sourceIdentity(sourceId, rawGuid, source, title, it.pubDate == null || it.pubDate === '' ? null : String(it.pubDate).trim(), rawUrl);
         const guid = identity.stableIdentifier;
-        if (!title || !guid || seen.has(identity.sourceKey)) continue;
-        seen.add(identity.sourceKey);
+        // Durable queue payloads already contain the exact source/version identity used when
+        // their job was created. Preserve it across a worker restart; fresh scraper payloads
+        // without these fields use the GUID-first/URL-aware identity calculated above.
+        const sourceKey = String(it.sourceKey ?? '').trim() || identity.sourceKey;
+        const contentHash = String(it.contentHash ?? '').trim() || identity.contentHash;
+        if (!title || !guid || seen.has(sourceKey)) continue;
+        seen.add(sourceKey);
         out.push({
             guid: guid.slice(0, 500),
             sourceId,
-            sourceKey: identity.sourceKey,
-            contentHash: identity.contentHash,
+            sourceKey: sourceKey.slice(0, 800),
+            contentHash: contentHash.slice(0, 64),
             title,
             source,
             pubDate: it.pubDate == null || it.pubDate === '' ? null : String(it.pubDate).trim(),
@@ -254,6 +350,20 @@ function normalizeRssItems(rawItems: unknown[]): RssItem[] {
  * dedup context so cost grows with arrivals rather than the whole day.
  */
 const MAX_EXISTING_TOPICS = 50;
+
+async function loadCanonicalThemesSafely(dayKey: string, source?: string): Promise<CanonicalThemeContext[]> {
+    try {
+        return await loadCanonicalThemes(dayKey, source);
+    } catch (error) {
+        // A rolling deploy can briefly run the old schema before the additive migration lands.
+        // Keep headline ingestion idempotent and auditable; the registry activates as soon as
+        // the local migration is applied.
+        logger.warn('[MarketDriver] Canonical theme registry unavailable; using legacy row fallback', {
+            error: error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240),
+        });
+        return [];
+    }
+}
 
 /**
  * Follows a possibly-chained duplicate reference (batch item A duplicates batch item B, which
@@ -297,7 +407,7 @@ export async function realignMarketDriverDayKeysByPubDate(now: Date = new Date()
     const candidates = await prisma.marketDriverNews.findMany({
         // Locked rows are frozen: a headline shown on today's board stays on today's board even
         // if its pubDate would re-key it. Only re-key rows that were never shown.
-        where: { day_key: { gte: lookback }, published_at: { not: null }, board_locked: false },
+        where: { day_key: { gte: lookback }, source: FFE_NEWS_SOURCE, published_at: { not: null }, board_locked: false },
         select: { id: true, day_key: true, published_at: true },
     });
 
@@ -326,6 +436,11 @@ export async function realignMarketDriverDayKeysByPubDate(now: Date = new Date()
  * impact↔score coupling, non-crude energy → IRRELEVANT, weak OIL tags dropped, weak summaries fixed.
  */
 export async function realignTodaysMarketDriverScores(now: Date = new Date()): Promise<number> {
+    // Classification decisions are immutable AI provenance. Numeric/semantic rewrites of stored
+    // rows are intentionally disabled; an operator must request an explicit AI reprocess instead.
+    void now;
+    return 0;
+    /*
     const dayKey = marketDayKey(now);
     const items = await prisma.marketDriverNews.findMany({
         // Locked (already-shown) rows are frozen — re-sanitizing could empty assets / drop to
@@ -361,7 +476,17 @@ export async function realignTodaysMarketDriverScores(now: Date = new Date()): P
             assets: assetsIn,
             summary: item.summary ?? '',
         });
-        const decision = deriveFfeDecision(item.headline, sanitized.category, sanitized.impact, sanitized.assets as unknown as FfeAssetSignal[]);
+        const decision = {
+            driverTheme: null,
+            causalThemeId: null,
+            macroEventKey: null,
+            geoState: null,
+            semanticDirection: null,
+            semanticStrength: null,
+            directAssetSignals: sanitized.assets,
+            transmittedAssetSignals: sanitized.assets,
+            signValidationStatus: 'PASS',
+        };
 
         // Promotion: if sanitize makes this (unlocked) row board-visible, lock it now (an ADD).
         const nowVisible = isBoardVisibleClassification({
@@ -408,7 +533,7 @@ export async function realignTodaysMarketDriverScores(now: Date = new Date()): P
         logger.info(`[MarketDriver] Sanitized ${updated} stored headline(s) to match doc rules`);
     }
     const deduped = await markTodaysDeterministicDuplicates();
-    return updated + deduped;
+    return updated + deduped; */
 }
 
 /**
@@ -418,6 +543,10 @@ export async function realignTodaysMarketDriverScores(now: Date = new Date()): P
  * worker re-check only the newly reprocessed visible rows.
  */
 export async function applyFfeCatalystRulesToCurrentDay(now: Date = new Date()): Promise<{ updated: number; visible: number }> {
+    // Legacy deterministic migration entry point: never rewrite historical decisions in place.
+    void now;
+    return { updated: 0, visible: 0 };
+    /*
     const dayKey = marketDayKey(now);
     const items = await prisma.marketDriverNews.findMany({
         where: { day_key: dayKey },
@@ -444,7 +573,17 @@ export async function applyFfeCatalystRulesToCurrentDay(now: Date = new Date()):
             assets,
             summary: item.summary ?? '',
         });
-        const decision = deriveFfeDecision(item.headline, sanitized.category, sanitized.impact, sanitized.assets as unknown as FfeAssetSignal[]);
+        const decision = {
+            driverTheme: null,
+            causalThemeId: null,
+            macroEventKey: null,
+            geoState: null,
+            semanticDirection: null,
+            semanticStrength: null,
+            directAssetSignals: sanitized.assets,
+            transmittedAssetSignals: sanitized.assets,
+            signValidationStatus: 'PASS',
+        };
         const isVisible = isBoardVisibleClassification({ ...sanitized, duplicateOf: null });
         await prisma.marketDriverNews.update({
             where: { id: item.id },
@@ -475,7 +614,7 @@ export async function applyFfeCatalystRulesToCurrentDay(now: Date = new Date()):
         if (isVisible) visible += 1;
     }
     logger.info(`[MarketDriver] Explicit FFE Catalyst rulebook apply: ${updated} rows, ${visible} visible`);
-    return { updated, visible };
+    return { updated, visible }; */
 }
 
 const RECLASSIFY_BATCH = 10;
@@ -489,7 +628,7 @@ export async function reclassifyTodaysMarketDriverNews(): Promise<{ updated: num
     const items = await prisma.marketDriverNews.findMany({
         // Never reclassify a locked (shown) row — it is frozen for the day. Only revisit rows
         // that were never shown; if reclassify makes one visible it gets locked (an ADD).
-        where: { day_key: dayKey, board_locked: false },
+        where: { day_key: dayKey, source: FFE_NEWS_SOURCE, board_locked: false },
         orderBy: { created_at: 'asc' },
         select: { id: true, headline: true, published_at: true },
     });
@@ -515,7 +654,7 @@ export async function reclassifyTodaysMarketDriverNews(): Promise<{ updated: num
                 assets: c.assets,
                 duplicateOf: null,
             });
-            const semanticDecision = deriveFfeDecision(row.headline, c.category, c.impact, c.assets as unknown as FfeAssetSignal[]);
+            const semanticDecision = aiDecisionFromClassification(c);
             await prisma.marketDriverNews.update({
                 where: { id: row.id },
                 data: {
@@ -532,6 +671,7 @@ export async function reclassifyTodaysMarketDriverNews(): Promise<{ updated: num
                     direct_asset_signals: semanticDecision.directAssetSignals as unknown as object,
                     transmitted_asset_signals: semanticDecision.transmittedAssetSignals as unknown as object,
                     sign_validation_status: semanticDecision.signValidationStatus,
+                    ...aiProvenanceData(c),
                     // Clear stale duplicate links before the dedicated dedup pass below.
                     duplicate_of: null,
                     classification_completed: true,
@@ -562,6 +702,7 @@ export async function markTodaysSemanticDuplicates(): Promise<number> {
     const principals = await prisma.marketDriverNews.findMany({
         where: {
             day_key: dayKey,
+            source: FFE_NEWS_SOURCE,
             duplicate_of: null,
             category: { in: BOARD_CATEGORIES },
         },
@@ -635,6 +776,7 @@ export async function markRecentSemanticDuplicates(
         where: {
             id: { in: candidateIds },
             day_key: { in: candidateDays },
+            source: FFE_NEWS_SOURCE,
             duplicate_of: null,
             category: { in: BOARD_CATEGORIES },
             semantic_dedup_completed: false,
@@ -674,6 +816,7 @@ export async function markRecentSemanticDuplicates(
         where: {
             day_key: { in: candidateDays },
             id: { notIn: claimedIds },
+            source: FFE_NEWS_SOURCE,
             duplicate_of: null,
             category: { in: BOARD_CATEGORIES },
             published_at: { gte: since, lte: now },
@@ -747,6 +890,7 @@ export async function resumeIncompleteMarketDriverSemanticDedup(limit = 500, now
     const pending = await prisma.marketDriverNews.findMany({
         where: {
             day_key: { in: [dayKey, previousDay] },
+            source: FFE_NEWS_SOURCE,
             classification_completed: true,
             semantic_dedup_completed: false,
             duplicate_of: null,
@@ -766,6 +910,11 @@ export async function resumeIncompleteMarketDriverSemanticDedup(limit = 500, now
  * Only links rows that share the same primary asset (never hide GOLD behind an OIL principal).
  */
 export async function markTodaysDeterministicDuplicates(now: Date = new Date()): Promise<number> {
+    // Kept as a compatibility entry point for old operators; semantic deduplication is no longer
+    // performed by headline fingerprints. The AI eventRelation result is persisted at ingest.
+    void now;
+    return 0;
+    /*
     const dayKey = marketDayKey(now);
     const principals = await prisma.marketDriverNews.findMany({
         where: {
@@ -804,6 +953,7 @@ export async function markTodaysDeterministicDuplicates(now: Date = new Date()):
         logger.info(`[MarketDriver] Deterministic §3 dedup marked ${marked} duplicate(s) (locked rows untouched)`);
     }
     return marked;
+    */
 }
 
 /** Shared classify lock — webhook ingest + coverage-audit heal must never run AI in parallel. */
@@ -937,6 +1087,20 @@ export async function ingestMarketDriverRssItems(rawItems: unknown[], options: M
         );
         try {
             const result = await runMarketDriverIngest(rawItems, ingestOptions);
+            // Session Brain reviews the changed canonical ledger once per fingerprint. It is an
+            // audit/resolution artifact; the official Catalyst board is reconstructed from the
+            // persisted active canonical-event contributions. A missing/temporarily unavailable
+            // additive migration must not turn ingestion into a fatal failure.
+            if (result.stored > 0 && result.classifyFailed !== true) {
+                await synthesizeFfeSessionIfChanged(marketDayKey(ingestOptions.now ?? new Date()), {
+                    ingestId: ingestOptions.ingestId,
+                    now: ingestOptions.now ?? new Date(),
+                }).catch((error) => {
+                    logger.warn('[MarketDriver] Session Brain synthesis deferred/failed; retaining last valid board', {
+                        error: error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240),
+                    });
+                });
+            }
             await finishProcessingRun(ingestOptions.ingestId, {
                 itemsFetched: result.received,
                 newItems: result.fresh,
@@ -1125,7 +1289,7 @@ async function runMarketDriverIngest(rawItems: unknown[], options: MarketDriverI
     if (fresh.length > 0) {
         // Semantic dedup context (doc §3): principals from live + previous UAE day.
         const todaysPrincipals = await prisma.marketDriverNews.findMany({
-            where: { day_key: { in: [dayKey, yesterday] }, duplicate_of: null, published_at: { not: null } },
+                where: { day_key: { in: [dayKey, yesterday] }, source: FFE_NEWS_SOURCE, duplicate_of: null, published_at: { not: null } },
             select: { id: true, headline: true, published_at: true },
             orderBy: { created_at: 'desc' },
             take: MAX_EXISTING_TOPICS,
@@ -1135,9 +1299,16 @@ async function runMarketDriverIngest(rawItems: unknown[], options: MarketDriverI
             text: r.headline,
             publishedAt: r.published_at,
         }));
+        let activeCanonicalThemes = await loadCanonicalThemesSafely(dayKey, FFE_NEWS_SOURCE);
+        let canonicalEventContexts = await loadCanonicalEventContexts(dayKey, FFE_NEWS_SOURCE).catch((error) => {
+            logger.warn('[MarketDriver] Canonical event context unavailable; resolver will keep non-NEW evidence review-only', {
+                error: error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240),
+            });
+            return [];
+        });
 
         const todaysNormalized = await prisma.marketDriverNews.findMany({
-            where: { day_key: { in: [dayKey, yesterday] }, published_at: { not: null } },
+            where: { day_key: { in: [dayKey, yesterday] }, source: FFE_NEWS_SOURCE, published_at: { not: null } },
             select: { id: true, normalized: true },
         });
         const normalizedToId = new Map(todaysNormalized.map((r) => [r.normalized, r.id]));
@@ -1147,7 +1318,7 @@ async function runMarketDriverIngest(rawItems: unknown[], options: MarketDriverI
         // are also the only valid fold targets: a visible new item may only be hidden as a
         // duplicate of an already-VISIBLE story, never folded into a hidden/IRRELEVANT row.
         const lockedRows = await prisma.marketDriverNews.findMany({
-            where: { day_key: { in: [dayKey, yesterday] }, board_locked: true, duplicate_of: null },
+            where: { day_key: { in: [dayKey, yesterday] }, source: FFE_NEWS_SOURCE, board_locked: true, duplicate_of: null },
             select: { id: true, headline: true, assets: true },
         });
         const lockedPrincipals: LockedPrincipal[] = lockedRows.map((r) => ({
@@ -1192,6 +1363,18 @@ async function runMarketDriverIngest(rawItems: unknown[], options: MarketDriverI
                     operationType: options.operationType ?? 'classification',
                     jobId: job.id,
                     ingestId: options.ingestId,
+                    existingThemes: activeCanonicalThemes.map((theme) => ({
+                        id: theme.id,
+                        themeKey: theme.themeKey,
+                        label: theme.label,
+                        summary: theme.summary,
+                        status: theme.status,
+                        geoState: theme.geoState,
+                        assets: theme.assetContributions,
+                        score: theme.assetContributions.reduce((sum, asset) => sum + asset.score, 0),
+                        lastUpdatedAt: theme.lastUpdatedAt,
+                        supportingEventIds: theme.supportingEventIds,
+                    })),
                 },
             );
             if (classified.length === 0) {
@@ -1256,6 +1439,39 @@ async function runMarketDriverIngest(rawItems: unknown[], options: MarketDriverI
                 direct_asset_signals: object;
                 transmitted_asset_signals: object;
                 sign_validation_status: string;
+                fundamental_cause: string | null;
+                observed_market_reaction: string | null;
+                event_type: string | null;
+                event_severity: number | null;
+                event_credibility: number | null;
+                event_freshness: number | null;
+                event_persistence: number | null;
+                transmission_reason: string | null;
+                counter_evidence: object;
+                current_asset_contributions: object;
+                supporting_guid_ids: object;
+                confirmation_only: boolean;
+                macro_actual: string | null;
+                macro_forecast: string | null;
+                macro_previous: string | null;
+                event_relation: string | null;
+                event_duplicate_of: string | null;
+                canonical_event_id: string | null;
+                canonical_theme_id: string | null;
+                causal_theme_summary: string | null;
+                theme_action: string | null;
+                catalyst_eligible: boolean;
+                confidence: number;
+                needs_review: boolean;
+                decision_source: string;
+                prompt_version: string;
+                semantic_decided_at: Date;
+                macro_eligible: boolean;
+                macro_family: string | null;
+                macro_direction_summary: string | null;
+                macro_asset_scores: object;
+                decision_reason: string;
+                structural_validation_status: string;
                 final_decision_code: string;
                 final_decision_reason: string;
                 secondary_reasons: string[];
@@ -1277,9 +1493,10 @@ async function runMarketDriverIngest(rawItems: unknown[], options: MarketDriverI
                     impact: c.impact,
                     assets: c.assets,
                     duplicateOf: null,
+                    catalystEligible: c.catalystEligible,
                 });
                 const primary = pickPrimaryAsset(c.assets)?.asset ?? null;
-                const semanticDecision = deriveFfeDecision(item.title, c.category, c.impact, c.assets as unknown as FfeAssetSignal[]);
+                const semanticDecision = aiDecisionFromClassification(c);
 
                 // Admission dedup, in precedence order: model/within-batch → normalized text →
                 // deterministic same-event vs already-locked principals (catches paraphrases
@@ -1321,6 +1538,86 @@ async function runMarketDriverIngest(rawItems: unknown[], options: MarketDriverI
                     throw new Error(`Invalid pubDate passed strict RSS filter for guid ${item.guid}`);
                 }
 
+                let canonicalEventId: string | null = null;
+                let canonicalThemeId: string | null = null;
+                try {
+                    const canonical = await persistCanonicalDecision({
+                        dayKey: storeDay,
+                        sourceId: item.sourceId,
+                        guid: item.guid,
+                        headlineId: id,
+                        headline: item.title,
+                        normalizedSignature: item.contentHash,
+                        publishedAt,
+                        eventRelation: c.eventRelation ?? 'NEW_EVENT',
+                        category: c.category,
+                        geoState: c.geoState ?? null,
+                        eventDuplicateOf: c.eventDuplicateOf
+                            ?? (c.duplicateOfBatchIndex == null ? c.duplicateOfExistingId : batchIds[c.duplicateOfBatchIndex] ?? null)
+                            ?? duplicateOf,
+                        legacyThemeAction: c.themeAction,
+                        themeDecision: c.themeDecision ? {
+                            action: c.themeDecision.action,
+                            themeId: c.themeDecision.themeId,
+                            themeKey: c.themeDecision.themeKey,
+                            label: c.themeDecision.label,
+                            summary: c.themeDecision.summary,
+                            reason: c.themeDecision.reason,
+                            status: c.themeDecision.status,
+                            assetContributions: c.themeDecision.assetContributions,
+                            confidence: c.confidence ?? 0,
+                        } : undefined,
+                        activeThemes: activeCanonicalThemes,
+                        canonicalEvents: canonicalEventContexts,
+                        directAssets: semanticDecision.directAssetSignals as ClassifiedAsset[],
+                        transmittedAssets: semanticDecision.transmittedAssetSignals as ClassifiedAsset[],
+                        causalThemeId: semanticDecision.causalThemeId,
+                        driverTheme: semanticDecision.driverTheme,
+                        summary: c.summary,
+                        confidence: c.confidence,
+                        driverState: {
+                            eventType: c.eventType,
+                            fundamentalCause: c.fundamentalCause,
+                            observedMarketReaction: c.observedMarketReaction,
+                            eventStrength: c.eventStrength,
+                            severity: c.eventSeverity,
+                            credibility: c.eventCredibility,
+                            freshness: c.eventFreshness,
+                            persistence: c.eventPersistence,
+                            geoState: c.geoState,
+                            transmissionReason: c.transmissionReason,
+                            counterEvidence: c.counterEvidence,
+                            affectedAssets: c.assets,
+                            currentAssetContributions: duplicateOf ? [] : c.currentAssetContributions,
+                            supportingGuidIds: c.supportingGuidIds,
+                            confirmationGuidIds: c.confirmationGuidIds,
+                            catalystEligible: c.catalystEligible,
+                            independent: !duplicateOf && (c.eventRelation === 'NEW_EVENT' || c.eventRelation === 'EVENT_UPDATE' || c.eventRelation === 'STRENGTHENING_EVIDENCE' || c.eventRelation === 'WEAKENING_EVIDENCE'),
+                            valid: c.signValidationStatus !== 'FAILED',
+                            provider: c.provider,
+                            model: c.model,
+                            promptVersion: c.promptVersion,
+                        },
+                    });
+                    canonicalEventId = canonical.eventId;
+                    canonicalThemeId = canonical.themeId;
+                    if (canonical.principalEventId && !c.eventDuplicateOf) c.eventDuplicateOf = canonical.principalEventId;
+                    // The persisted resolver is authoritative for relation/state eligibility;
+                    // the raw AI row remains intact for audit but cannot reintroduce a rejected
+                    // contribution or mint an evidence-only event.
+                    if (canonical.relation) c.eventRelation = canonical.relation;
+                    if (canonical.currentAssetContributions) c.currentAssetContributions = canonical.currentAssetContributions;
+                    if (canonical.catalystEligible != null) c.catalystEligible = canonical.catalystEligible;
+                    if (canonical.valid === false) c.signValidationStatus = 'FAILED';
+                    if (canonical.evidenceOnly) c.catalystVisible = false;
+                } catch (error) {
+                    // The registry is additive. A migration race must not turn an otherwise
+                    // valid idempotent headline insert into a fatal ingest failure.
+                    logger.warn('[MarketDriver] Canonical registry write skipped', {
+                        error: error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240),
+                    });
+                }
+
                 rows.push({
                     id,
                     guid: item.guid,
@@ -1350,13 +1647,48 @@ async function runMarketDriverIngest(rawItems: unknown[], options: MarketDriverI
                     direct_asset_signals: semanticDecision.directAssetSignals as unknown as object,
                     transmitted_asset_signals: semanticDecision.transmittedAssetSignals as unknown as object,
                     sign_validation_status: semanticDecision.signValidationStatus,
+                    fundamental_cause: c.fundamentalCause ?? null,
+                    observed_market_reaction: c.observedMarketReaction ?? null,
+                    event_type: c.eventType ?? null,
+                    event_severity: c.eventSeverity ?? null,
+                    event_credibility: c.eventCredibility ?? null,
+                    event_freshness: c.eventFreshness ?? null,
+                    event_persistence: c.eventPersistence ?? null,
+                    transmission_reason: c.transmissionReason ?? null,
+                    counter_evidence: c.counterEvidence as unknown as object,
+                    current_asset_contributions: c.currentAssetContributions as unknown as object,
+                    supporting_guid_ids: c.supportingGuidIds as unknown as object,
+                    confirmation_only: Boolean(duplicateOf) || ['SAME_EVENT', 'CONFIRMATION', 'PRICE_REACTION', 'HISTORICAL_COMMENTARY', 'MACRO_RELEASE', 'FORECAST_UPCOMING', 'IRRELEVANT'].includes(String(c.eventRelation)),
+                    macro_actual: c.macroValues?.actual ?? null,
+                    macro_forecast: c.macroValues?.forecast ?? null,
+                    macro_previous: c.macroValues?.previous ?? null,
+                    event_relation: c.eventRelation ?? 'NEW_EVENT',
+                    event_duplicate_of: c.eventDuplicateOf
+                        ?? (c.duplicateOfBatchIndex == null ? c.duplicateOfExistingId : batchIds[c.duplicateOfBatchIndex] ?? null)
+                        ?? duplicateOf,
+                    canonical_event_id: canonicalEventId,
+                    canonical_theme_id: canonicalThemeId,
+                    causal_theme_summary: c.causalThemeSummary ?? null,
+                    theme_action: c.themeAction ?? 'NONE',
+                    catalyst_eligible: Boolean(c.catalystEligible),
+                    confidence: Number(c.confidence ?? 0),
+                    needs_review: Boolean(c.needsReview),
+                    decision_source: c.decisionSource ?? 'ai_primary',
+                    prompt_version: c.promptVersion ?? FFE_ANALYST_PROMPT_VERSION,
+                    semantic_decided_at: new Date(),
+                    macro_eligible: Boolean(c.macro?.eligible),
+                    macro_family: c.macro?.family ?? null,
+                    macro_direction_summary: c.macro?.directionSummary ?? null,
+                    macro_asset_scores: (c.macro?.assetScores ?? []) as unknown as object,
+                    decision_reason: String((c as ClassifiedHeadline & { reason?: string }).reason ?? c.summary ?? '').slice(0, 1000),
+                    structural_validation_status: c.structuralValidationStatus ?? 'PASS',
                     final_decision_code: finalDecision.code,
                     final_decision_reason: finalDecision.reason,
                     secondary_reasons: finalDecision.secondary,
                     decision_ingest_id: options.ingestId ?? options.queuedJobId ?? null,
                     classification_job_id: job.id,
-                    classification_provider: null,
-                    classification_model: null,
+                    classification_provider: c.provider ?? null,
+                    classification_model: c.model ?? null,
                     published_at: publishedAt,
                 });
             }
@@ -1388,6 +1720,39 @@ async function runMarketDriverIngest(rawItems: unknown[], options: MarketDriverI
                         direct_asset_signals: row.direct_asset_signals,
                         transmitted_asset_signals: row.transmitted_asset_signals,
                         sign_validation_status: row.sign_validation_status,
+                        fundamental_cause: row.fundamental_cause,
+                        observed_market_reaction: row.observed_market_reaction,
+                        event_type: row.event_type,
+                        event_severity: row.event_severity,
+                        event_credibility: row.event_credibility,
+                        event_freshness: row.event_freshness,
+                        event_persistence: row.event_persistence,
+                        transmission_reason: row.transmission_reason,
+                        counter_evidence: row.counter_evidence,
+                        current_asset_contributions: row.current_asset_contributions,
+                        supporting_guid_ids: row.supporting_guid_ids,
+                        confirmation_only: row.confirmation_only,
+                        macro_actual: row.macro_actual,
+                        macro_forecast: row.macro_forecast,
+                        macro_previous: row.macro_previous,
+                        event_relation: row.event_relation,
+                        event_duplicate_of: row.event_duplicate_of,
+                        canonical_event_id: row.canonical_event_id,
+                        canonical_theme_id: row.canonical_theme_id,
+                        causal_theme_summary: row.causal_theme_summary,
+                        theme_action: row.theme_action,
+                        catalyst_eligible: row.catalyst_eligible,
+                        confidence: row.confidence,
+                        needs_review: row.needs_review,
+                        decision_source: row.decision_source,
+                        prompt_version: row.prompt_version,
+                        semantic_decided_at: row.semantic_decided_at,
+                        macro_eligible: row.macro_eligible,
+                        macro_family: row.macro_family,
+                        macro_direction_summary: row.macro_direction_summary,
+                        macro_asset_scores: row.macro_asset_scores,
+                        decision_reason: row.decision_reason,
+                        structural_validation_status: row.structural_validation_status,
                         duplicate_of: row.duplicate_of,
                         board_locked: row.board_locked,
                         classification_completed: true,
@@ -1440,6 +1805,8 @@ async function runMarketDriverIngest(rawItems: unknown[], options: MarketDriverI
                     ...existingTopics,
                 ].slice(0, MAX_EXISTING_TOPICS);
             }
+            activeCanonicalThemes = await loadCanonicalThemesSafely(dayKey, FFE_NEWS_SOURCE);
+            canonicalEventContexts = await loadCanonicalEventContexts(dayKey, FFE_NEWS_SOURCE).catch(() => canonicalEventContexts);
 
             if (i + CLASSIFY_BATCH_SIZE < fresh.length) {
                 await new Promise((r) => setTimeout(r, CLASSIFY_BATCH_GAP_MS));
@@ -1461,15 +1828,9 @@ async function runMarketDriverIngest(rawItems: unknown[], options: MarketDriverI
         }
     }
 
-    // Production recovery: feed guids already in DB (stored=0) but live board empty
-    // (all IRRELEVANT / Low / wrong day). Reclassify a small batch so News Headline fills.
-    let reclassified = 0;
-    const boardCount = await countLiveBoardItems(dayKey);
-    // Never use a scraper replay as a reason to reclassify every stored RSS row. The recovery
-    // pass is eligible only when this ingest actually supplied a new/content-changed item.
-    if (boardCount === 0 && deferredCount === 0 && fresh.length > 0) {
-        reclassified = await reclassifyFeedMatchedForEmptyBoard(dayKey, guids, options);
-    }
+    // A zero-board result is not permission to reclassify stored rows. Recovery is explicit and
+    // operator-triggered; automatic ingest/restart must never create a second paid classification.
+    const reclassified = 0;
 
     const deterministicDupes = await markTodaysDeterministicDuplicates(now);
     // Bounded AI same-briefing pass — only newly inserted rows are candidates, so this does not
@@ -1512,7 +1873,7 @@ async function runMarketDriverIngest(rawItems: unknown[], options: MarketDriverI
 
 async function countLiveBoardItems(dayKey: string): Promise<number> {
     return prisma.marketDriverNews.count({
-        where: { day_key: dayKey, board_locked: true, duplicate_of: null },
+        where: { day_key: dayKey, ...liveNewsSourceWhere(dayKey), board_locked: true, duplicate_of: null },
     });
 }
 
@@ -1530,6 +1891,7 @@ async function reclassifyFeedMatchedForEmptyBoard(
         // Only unlockeds may be rewritten; visibility becomes an ADD via board_locked.
         where: {
             day_key: dayKey,
+            source: FFE_NEWS_SOURCE,
             guid: { in: feedGuids },
             published_at: { not: null },
             board_locked: false,
@@ -1576,7 +1938,7 @@ async function reclassifyFeedMatchedForEmptyBoard(
             assets: c.assets,
             duplicateOf: null,
         });
-        const semanticDecision = deriveFfeDecision(row.headline, c.category, c.impact, c.assets as unknown as FfeAssetSignal[]);
+        const semanticDecision = aiDecisionFromClassification(c);
         await prisma.marketDriverNews.update({
             where: { id: row.id },
             data: {
@@ -1593,6 +1955,7 @@ async function reclassifyFeedMatchedForEmptyBoard(
                 direct_asset_signals: semanticDecision.directAssetSignals as unknown as object,
                 transmitted_asset_signals: semanticDecision.transmittedAssetSignals as unknown as object,
                 sign_validation_status: semanticDecision.signValidationStatus,
+                ...aiProvenanceData(c),
                 duplicate_of: null,
                 classification_completed: true,
                 semantic_dedup_completed: !nowVisible,
@@ -1629,7 +1992,7 @@ export async function refreshMarketDriverBoard(): Promise<boolean> {
  */
 async function loadBoardItemsForDay(dayKey: string) {
     const items = await prisma.marketDriverNews.findMany({
-        where: { day_key: dayKey, board_locked: true, duplicate_of: null },
+        where: { day_key: dayKey, ...liveNewsSourceWhere(dayKey), board_locked: true, duplicate_of: null },
         orderBy: { created_at: 'desc' },
     });
     return items.filter((item) => {
@@ -1645,7 +2008,7 @@ async function loadBoardItemsForDay(dayKey: string) {
  */
 export async function repairLockedDuplicates(): Promise<number> {
     const result = await prisma.marketDriverNews.updateMany({
-        where: { board_locked: true, NOT: { duplicate_of: null } },
+        where: { source: FFE_NEWS_SOURCE, board_locked: true, NOT: { duplicate_of: null } },
         data: { board_locked: false },
     });
     if (result.count > 0) {
@@ -1681,25 +2044,9 @@ function pickPrimaryAsset(assets: ClassifiedAsset[]): ClassifiedAsset | null {
 function collapseSameEventEntries(
     entries: { headline: string; primary: ClassifiedAsset }[],
 ): { headline: string; primary: ClassifiedAsset }[] {
-    const principals: { headline: string; primary: ClassifiedAsset }[] = [];
-    for (const entry of entries) {
-        const idx = principals.findIndex((p) => {
-            if (entry.primary.asset === 'OIL' && p.primary.asset === 'OIL') {
-                const ca = oilCatalystCluster(p.headline);
-                const cb = oilCatalystCluster(entry.headline);
-                if (ca && cb && ca === cb) return true;
-            }
-            return likelySameEvent(p.headline, entry.headline);
-        });
-        if (idx < 0) {
-            principals.push(entry);
-            continue;
-        }
-        if (Math.abs(entry.primary.score) > Math.abs(principals[idx]!.primary.score)) {
-            principals[idx] = entry;
-        }
-    }
-    return principals;
+    // The caller supplies AI event/theme decisions; preserve rows here and let the database
+    // duplicate_of relation plus causalThemeId aggregation perform the only grouping.
+    return entries;
 }
 
 function aggregateCatalystBoard(items: Awaited<ReturnType<typeof loadBoardItemsForDay>>): CatalystBoardRow[] {
@@ -1717,7 +2064,7 @@ function aggregateCatalystBoard(items: Awaited<ReturnType<typeof loadBoardItemsF
             asset,
             bullishCount: row.bullishCount,
             bearishCount: row.bearishCount,
-            driverScore: Number(row.driverScore.toFixed(2)),
+            driverScore: row.driverScore,
             themes: row.themes,
         };
     });
@@ -1730,8 +2077,43 @@ export function previousUaeDayKey(date: Date = new Date()): string {
 
 /** Per-asset bullish/bearish counts + driver score. Defaults to the current UAE market day. */
 export async function getCatalystBoard(dayKey: string = marketDayKey()): Promise<CatalystBoardRow[]> {
-    const items = await loadBoardItemsForDay(dayKey);
-    return aggregateCatalystBoard(items);
+    // GPT-first mode: read accepted full-session analysis (no hybrid semantic post-processing).
+    if (process.env.FFE_ANALYSIS_MODE !== 'hybrid') {
+        try {
+            const { getGptFirstCatalystBoard } = await import('./ffeGptFirstProduction.service.js');
+            const gptFirstBoard = await getGptFirstCatalystBoard(dayKey);
+            if (gptFirstBoard) return gptFirstBoard;
+        } catch (error) {
+            logger.warn('[MarketDriver] GPT-first board read failed; falling back to canonical ledger', {
+                error: error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240),
+            });
+        }
+    }
+    try {
+        // Official Catalyst authority is the persisted canonical-event ledger. Session Brain
+        // snapshots are review/resolution artifacts and cannot replace this arithmetic.
+        const canonicalEvents = await getCanonicalEventBoard(
+            dayKey,
+            FFE_NEWS_SOURCE,
+        );
+        if (canonicalEvents) {
+            return BOARD_ASSET_ORDER.map((asset) => {
+                const row = canonicalEvents.get(asset);
+                return row
+                    ? { asset, bullishCount: row.bullishCount, bearishCount: row.bearishCount, driverScore: row.driverScore, themes: [...new Set(row.themes)] }
+                    : { asset, bullishCount: 0, bearishCount: 0, driverScore: 0, themes: [] };
+            });
+        }
+    } catch (error) {
+        logger.warn('[MarketDriver] Canonical event board unavailable; checking canonical theme board fallback', {
+            error: error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240),
+        });
+    }
+    // Do not resurrect the pre-contract headline-row sum as an official Catalyst result. A
+    // missing/unmigrated canonical registry is a safe zero-board condition until the additive
+    // migration is available; raw headline rows can still be read through the News/audit paths.
+    logger.warn('[MarketDriver] No canonical Catalyst state available; returning a zero board rather than summing raw headlines', { dayKey });
+    return BOARD_ASSET_ORDER.map((asset) => ({ asset, bullishCount: 0, bearishCount: 0, driverScore: 0, themes: [] }));
 }
 
 /** Full deduplicated driver headlines for the admin News / Market Drivers table (doc §34). */
@@ -1753,6 +2135,12 @@ export async function getMarketDriverNews(dayKey: string = marketDayKey()): Prom
         directAssetSignals: (item.direct_asset_signals as unknown as ClassifiedAsset[]) ?? [],
         transmittedAssetSignals: (item.transmitted_asset_signals as unknown as ClassifiedAsset[]) ?? [],
         signValidationStatus: item.sign_validation_status ?? 'NOT_APPLICABLE',
+        fundamentalCause: item.fundamental_cause,
+        observedMarketReaction: item.observed_market_reaction,
+        eventType: item.event_type,
+        eventRelation: item.event_relation,
+        canonicalEventId: item.canonical_event_id,
+        currentAssetContributions: (item.current_asset_contributions as unknown as ClassifiedAsset[]) ?? [],
     }));
 }
 
@@ -1766,9 +2154,12 @@ export async function getMarketDriverNewsDiagnostic(dayKey: string = marketDayKe
             category: true, impact: true, summary: true, assets: true, published_at: true, created_at: true,
             classification_completed: true, semantic_dedup_completed: true, coverage_repair_completed: true,
             board_locked: true, duplicate_of: true, day_key: true,
-            driver_theme: true, causal_theme_id: true, macro_event_key: true, geo_state: true,
+            driver_theme: true, causal_theme_id: true, macro_event_key: true, geo_state: true, event_duplicate_of: true,
             semantic_direction: true, semantic_strength: true, direct_asset_signals: true,
             transmitted_asset_signals: true, sign_validation_status: true,
+            canonical_event_id: true, canonical_theme_id: true,
+            fundamental_cause: true, observed_market_reaction: true, event_type: true, event_relation: true,
+            current_asset_contributions: true,
         },
     });
     return rows.map((row) => {
@@ -1810,7 +2201,7 @@ export async function getMarketDriverNewsDiagnostic(dayKey: string = marketDayKe
             coverageRepairCompleted: row.coverage_repair_completed,
             boardLocked: row.board_locked,
             duplicateOf: row.duplicate_of,
-            eventDuplicateOf: row.duplicate_of,
+            eventDuplicateOf: row.event_duplicate_of ?? row.duplicate_of,
             driverTheme: row.driver_theme,
             causalThemeId: row.causal_theme_id,
             macroEventKey: row.macro_event_key,
@@ -1820,6 +2211,12 @@ export async function getMarketDriverNewsDiagnostic(dayKey: string = marketDayKe
             directAssetSignals: (row.direct_asset_signals as unknown as ClassifiedAsset[]) ?? [],
             transmittedAssetSignals: (row.transmitted_asset_signals as unknown as ClassifiedAsset[]) ?? [],
             signValidationStatus: row.sign_validation_status ?? 'NOT_APPLICABLE',
+            fundamentalCause: row.fundamental_cause,
+            observedMarketReaction: row.observed_market_reaction,
+            eventType: row.event_type,
+            eventRelation: row.event_relation,
+            canonicalEventId: row.canonical_event_id,
+            currentAssetContributions: (row.current_asset_contributions as unknown as ClassifiedAsset[]) ?? [],
             historicalReconstruction: !row.driver_theme || !row.causal_theme_id,
             displayEligible,
             visibilityReason,

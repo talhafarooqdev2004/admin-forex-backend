@@ -52,7 +52,7 @@ async function runUaeMidnightArchiveTick(trigger: 'startup' | 'scheduled' | 'cat
 }
 
 /**
- * Self-healing News Headline coverage audit: compares live FJ/FXStreet feeds against today's
+ * Self-healing News Headline coverage audit: compares the live FinancialJuice feed against today's
  * board and auto-fixes any rule-required item that is missing or hidden (misclassified /
  * wrongly deduped). Replaces the manual daily feed-vs-board check entirely; a FAIL in the
  * logs (or GET /admin/market-driver-news/coverage) is the only signal that needs a human.

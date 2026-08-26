@@ -75,17 +75,32 @@ async function main() {
         const beforeHasPrincipal = before.some((r) => r.id === lockedId);
         assert.equal(beforeHasPrincipal, true, 'locked principal must appear on News Headline');
 
-        // Mid-day deterministic dedup must fold the unlocked paraphrase, never the locked principal.
+        // The AI-first engine must not invent a semantic duplicate from a deterministic
+        // fingerprint pass. AI eventRelation is the authority for this decision.
         const marked = await markTodaysDeterministicDuplicates();
-        assert.ok(marked >= 1, `expected ≥1 deterministic duplicate mark, got ${marked}`);
+        assert.equal(marked, 0, 'deterministic semantic dedup must remain disabled');
 
         const principal = await prisma.marketDriverNews.findUniqueOrThrow({ where: { id: lockedId } });
-        const paraphrase = await prisma.marketDriverNews.findUniqueOrThrow({ where: { id: unlockedParaphraseId } });
+        let paraphrase = await prisma.marketDriverNews.findUniqueOrThrow({ where: { id: unlockedParaphraseId } });
 
         assert.equal(principal.board_locked, true, 'principal stays locked');
         assert.equal(principal.duplicate_of, null, 'locked principal must never get duplicate_of');
-        assert.equal(paraphrase.duplicate_of, lockedId, 'unlocked paraphrase folds into locked principal');
+        assert.equal(paraphrase.duplicate_of, null, 'unclassified paraphrase is not folded by code');
         assert.equal(paraphrase.board_locked, false, 'paraphrase must not lock after being folded');
+
+        // Simulate the durable result of the AI semantic pass. Subsequent mechanics must
+        // preserve that decision and never demote the locked principal.
+        paraphrase = await prisma.marketDriverNews.update({
+            where: { id: unlockedParaphraseId },
+            data: {
+                duplicate_of: lockedId,
+                event_relation: 'SAME_EVENT',
+                event_duplicate_of: lockedId,
+                semantic_dedup_completed: true,
+                decision_source: 'ai_primary',
+            },
+        });
+        assert.equal(paraphrase.duplicate_of, lockedId, 'AI SAME_EVENT decision folds paraphrase');
 
         // Simulate legacy bug: locked + duplicate_of together — repair must unlock it.
         await prisma.marketDriverNews.update({

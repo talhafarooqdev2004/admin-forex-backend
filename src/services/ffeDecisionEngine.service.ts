@@ -32,6 +32,8 @@ export type FfeAssetSignal = {
     asset: FfeTrackedAsset;
     bias: 'Bullish' | 'Bearish' | 'Neutral' | 'Mixed';
     score: number;
+    role?: 'DIRECT' | 'TRANSMITTED' | 'CONFIRMATION';
+    reason?: string;
 };
 
 export type FfeDecisionMetadata = {
@@ -559,7 +561,6 @@ export function applyDeterministicTransmission(
             return { direct, transmitted: theme === 'PERSIAN_GULF_SUPPLY_RISK' ? [signal('OIL', 0.25)] : [], geoState, theme, validation: 'PASS' };
         }
         const oilMagnitude = /(?:standoff|supply concerns?|supply risks?|prices? elevated)/.test(h) && (theme === 'IRAN_US_OIL_SUPPLY_RISK' || theme === 'OIL_SUPPLY_RISK') ? 0.5
-            : theme === 'IRAN_HORMUZ_ESCALATION' ? 0.75
             : theme === 'IRAN_BLOCKADE_ESCALATION' || theme === 'HORMUZ_BLOCKADE_RISK' ? 0.5
             : theme === 'HORMUZ_TRANSIT_DISRUPTION' ? 0.75
             : theme === 'PERSIAN_GULF_SUPPLY_RISK' ? 0.25
@@ -568,14 +569,14 @@ export function applyDeterministicTransmission(
             : String(impact).toLowerCase() === 'medium'
                 ? 0.5
                 : /\b(major|severe|sharp|material|confirmed|surge|spike|disruption|disrupt)\b/.test(h) ? 0.75 : 0.25;
-        const oil = rising && !falling ? oilMagnitude : falling && !rising ? (theme === 'HORMUZ_OPEN_DEESCALATION' || /hormuz .*open|oil prices? .*coming down/.test(h) ? -0.5 : -0.25) : (theme === 'IRAN_BLOCKADE_ESCALATION' || theme === 'IRAN_HORMUZ_ESCALATION' ? 0.5 : 0.25);
+        const oil = rising && !falling ? oilMagnitude : falling && !rising ? (theme === 'HORMUZ_OPEN_DEESCALATION' || /hormuz .*open|oil prices? .*coming down/.test(h) ? -0.5 : -0.25) : (theme === 'IRAN_BLOCKADE_ESCALATION' ? 0.5 : 0.25);
         transmitted.push(signal('OIL', geoState === 'DE_ESCALATION' ? -Math.abs(oil) : oil));
         const cadThemes = new Set(['OIL_SUPPLY_RISK', 'IRAN_US_OIL_SUPPLY_RISK', 'MIDDLE_EAST_OIL_SUPPLY_RISK', 'MIDDLE_EAST_OIL_SUPPLY_DISRUPTION', 'HORMUZ_TRANSIT_DISRUPTION']);
         if (Math.abs(oil) >= 0.5 && geoState !== 'DE_ESCALATION' && cadThemes.has(theme)) transmitted.push(signal('CAD', oil >= 0 ? 0.25 : -0.25));
         if (geoState === 'DE_ESCALATION' && theme === 'HORMUZ_OPEN_DEESCALATION') transmitted.push(signal('CAD', -0.25));
         const goldRiskThemes = new Set(['HORMUZ_TRANSIT_DISRUPTION', 'IRAN_BLOCKADE_ESCALATION', 'HORMUZ_BLOCKADE_RISK', 'IRAN_HORMUZ_ESCALATION']);
         if (rising && !falling && goldRiskThemes.has(theme)) {
-            const goldMagnitude = theme === 'IRAN_HORMUZ_ESCALATION' || (theme === 'HORMUZ_TRANSIT_DISRUPTION' && broadRiskOff(text)) ? 0.5 : 0.25;
+            const goldMagnitude = theme === 'HORMUZ_TRANSIT_DISRUPTION' && broadRiskOff(text) ? 0.5 : 0.25;
             transmitted.push(signal('GOLD', goldMagnitude));
         }
         if (rising && !falling && ['IRAN_BLOCKADE_ESCALATION', 'IRAN_HORMUZ_ESCALATION'].includes(theme) && /\b(?:haven|safe haven|risk[- ]off|sanction|threat)\b/.test(h)) transmitted.push(signal('CHF', 0.25));
@@ -662,7 +663,7 @@ export function deriveFfeDecision(
 }
 
 export function aggregateUniqueCausalThemes(
-    rows: Array<{ headline: string; causalThemeId?: string | null; assets: FfeAssetSignal[]; duplicateOf?: string | null; category?: string }>,
+    rows: Array<{ headline?: string; causalThemeId?: string | null; assets: FfeAssetSignal[]; duplicateOf?: string | null; category?: string }>,
 ): Map<FfeTrackedAsset, { bullishCount: number; bearishCount: number; driverScore: number; themes: string[] }> {
     const result = new Map<FfeTrackedAsset, { bullishCount: number; bearishCount: number; driverScore: number; themes: string[] }>();
     for (const asset of FFE_TRACKED_ASSETS) result.set(asset, { bullishCount: 0, bearishCount: 0, driverScore: 0, themes: [] });
@@ -673,7 +674,11 @@ export function aggregateUniqueCausalThemes(
         const signals = dedupeSignals(row.assets);
         for (const item of signals) {
             if (item.score === 0) continue;
-            const theme = row.causalThemeId || themeFingerprint(null, row.headline) || `ROW:${normalizeHeadline(row.headline).slice(0, 80)}`;
+            if ((item as FfeAssetSignal & { role?: string }).role === 'CONFIRMATION') continue;
+            // Causal theme identity is AI-owned. Rows without an AI theme are auditable but cannot
+            // contribute a second implicit keyword/fingerprint theme.
+            const theme = row.causalThemeId;
+            if (!theme) continue;
             const identity = `${item.asset}|${theme}`;
             if (seen.has(identity)) continue;
             seen.add(identity);

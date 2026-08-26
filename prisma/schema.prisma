@@ -625,12 +625,51 @@ model MarketDriverNews {
   macro_event_key String? @db.VarChar(80)
   /// ESCALATION | DE_ESCALATION | WATCH | IRRELEVANT; determined before asset transmission.
   geo_state      String?  @db.VarChar(20)
+  geo_components Json?
   semantic_direction String? @db.VarChar(12)
   semantic_strength String? @db.VarChar(12)
   /// Direct provider signals and code-derived/transmitted signals remain separately auditable.
   direct_asset_signals Json?
   transmitted_asset_signals Json?
   sign_validation_status String? @default("NOT_APPLICABLE") @db.VarChar(20)
+  /// AI Analyst semantic provenance. Historical rows remain nullable and are never rewritten.
+  fundamental_cause String? @db.VarChar(500)
+  event_relation String? @db.VarChar(20)
+  event_duplicate_of String? @db.VarChar(50)
+  /// Contract-level causal state retained on the raw row for audit/replay.
+  event_type String? @db.VarChar(40)
+  observed_market_reaction String? @db.VarChar(500)
+  event_strength String? @db.VarChar(20)
+  event_severity Float?
+  event_credibility Float?
+  event_freshness Float?
+  event_persistence Float?
+  transmission_reason String? @db.VarChar(1000)
+  counter_evidence Json?
+  current_asset_contributions Json?
+  supporting_guid_ids Json?
+  confirmation_only Boolean @default(false)
+  macro_actual String? @db.VarChar(120)
+  macro_forecast String? @db.VarChar(120)
+  macro_previous String? @db.VarChar(120)
+  /// Code-generated canonical event identity. This is narrower than a causal theme.
+  canonical_event_id String? @db.VarChar(140)
+  /// Code-generated canonical causal-theme identity used for theme-level scoring.
+  canonical_theme_id String? @db.VarChar(140)
+  causal_theme_summary String? @db.VarChar(500)
+  theme_action String? @db.VarChar(24)
+  catalyst_eligible Boolean?
+  confidence Float?
+  needs_review Boolean @default(false)
+  decision_source String? @db.VarChar(24)
+  prompt_version String? @db.VarChar(80)
+  semantic_decided_at DateTime?
+  macro_eligible Boolean?
+  macro_family String? @db.VarChar(120)
+  macro_direction_summary String? @db.VarChar(500)
+  macro_asset_scores Json?
+  decision_reason String? @db.VarChar(1000)
+  structural_validation_status String? @db.VarChar(20)
   /// Set when this item was folded into an earlier one (soft dedup); such rows don't score.
   duplicate_of   String?  @db.VarChar(50)
   /// Once a row is shown on the News Headline board it is LOCKED for the rest of the UAE market
@@ -666,7 +705,135 @@ model MarketDriverNews {
   @@index([causal_theme_id])
   @@index([macro_event_key])
   @@index([geo_state])
+  @@index([event_relation])
+  @@index([canonical_event_id])
+  @@index([canonical_theme_id])
+  @@index([causal_theme_id, catalyst_eligible])
+  @@index([needs_review, classification_completed])
+  canonicalEvent MarketDriverCanonicalEvent? @relation("MarketDriverNewsCanonicalEvent", fields: [canonical_event_id], references: [id], onDelete: SetNull)
+  canonicalTheme MarketDriverCanonicalTheme? @relation("MarketDriverNewsCanonicalTheme", fields: [canonical_theme_id], references: [id], onDelete: SetNull)
   @@map("market_driver_news")
+}
+
+/// Durable event registry. Different headlines can refer to the same event/update while
+/// retaining every raw MarketDriverNews row for audit/history.
+model MarketDriverCanonicalEvent {
+  id                      String   @id @db.VarChar(140)
+  day_key                 String   @db.VarChar(10)
+  source_id               String   @db.VarChar(80)
+  source_guid             String   @db.VarChar(500)
+  normalized_signature    String   @db.Char(64)
+  headline                String   @db.VarChar(1000)
+  relation                String   @default("NEW_EVENT") @db.VarChar(20)
+  status                  String   @default("ACTIVE") @db.VarChar(20)
+  canonical_theme_id      String?  @db.VarChar(140)
+  event_type              String?  @db.VarChar(40)
+  fundamental_cause       String?  @db.VarChar(500)
+  observed_market_reaction String? @db.VarChar(500)
+  event_strength          String?  @db.VarChar(20)
+  severity                Float?
+  credibility             Float?
+  freshness               Float?
+  persistence             Float?
+  geo_state               String?  @db.VarChar(20)
+  transmission_reason     String?  @db.VarChar(1000)
+  affected_assets         Json?
+  current_asset_contributions Json?
+  counter_evidence       Json?
+  supporting_guid_ids    Json?
+  confirmation_guid_ids  Json?
+  update_history         Json?
+  catalyst_eligible      Boolean  @default(true)
+  independent            Boolean  @default(true)
+  valid                  Boolean  @default(true)
+  provider               String?  @db.VarChar(30)
+  model                  String?  @db.VarChar(120)
+  prompt_version         String?  @db.VarChar(80)
+  decision_at            DateTime?
+  first_seen_at           DateTime @default(now())
+  last_seen_at            DateTime @default(now())
+  supporting_headline_ids Json?
+  metadata                Json?
+  headlines               MarketDriverNews[] @relation("MarketDriverNewsCanonicalEvent")
+
+  @@unique([source_id, source_guid], map: "market_driver_canonical_event_source_guid_key")
+  @@index([day_key, status])
+  @@index([canonical_theme_id])
+  @@index([day_key, status, valid, independent], map: "market_driver_canonical_events_active_arithmetic_idx")
+  @@index([day_key, event_type])
+  @@map("market_driver_canonical_events")
+}
+
+/// Current state of one code-generated causal driver cluster. Numeric Catalyst aggregation reads
+/// this table once per theme; it never sums headline rows.
+model MarketDriverCanonicalTheme {
+  id                      String   @id @db.VarChar(140)
+  day_key                 String   @db.VarChar(10)
+  theme_key               String   @db.VarChar(180)
+  label                   String   @db.VarChar(180)
+  summary                 String   @db.VarChar(1000)
+  theme_type              String   @default("DRIVER") @db.VarChar(30)
+  status                  String   @default("ACTIVE") @db.VarChar(20)
+  geo_state               String?  @db.VarChar(20)
+  direct_evidence         Json?
+  asset_contributions     Json
+  confidence              Float    @default(0)
+  first_seen_at           DateTime @default(now())
+  last_updated_at         DateTime @default(now())
+  latest_version          Int      @default(1)
+  supporting_event_ids    Json?
+  supporting_headline_ids Json?
+  headlines               MarketDriverNews[] @relation("MarketDriverNewsCanonicalTheme")
+  revisions               MarketDriverCanonicalThemeRevision[]
+
+  @@unique([day_key, theme_key, theme_type], map: "market_driver_canonical_theme_key")
+  @@index([day_key, status])
+  @@index([day_key, last_updated_at])
+  @@map("market_driver_canonical_themes")
+}
+
+/// Append-only state history for joins, updates, reversals, and confirmations.
+model MarketDriverCanonicalThemeRevision {
+  id                     String   @id @default(cuid())
+  theme_id               String   @db.VarChar(140)
+  version                Int
+  action                 String   @db.VarChar(30)
+  status                 String   @db.VarChar(20)
+  summary                String   @db.VarChar(1000)
+  geo_state              String?  @db.VarChar(20)
+  asset_contributions    Json
+  confidence             Float    @default(0)
+  reason                 String?  @db.VarChar(1000)
+  headline_ids           Json?
+  event_ids              Json?
+  created_at              DateTime @default(now())
+  theme                  MarketDriverCanonicalTheme @relation(fields: [theme_id], references: [id], onDelete: Cascade)
+
+  @@unique([theme_id, version], map: "market_driver_canonical_theme_revision_version_key")
+  @@index([theme_id, created_at])
+  @@map("market_driver_canonical_theme_revisions")
+}
+
+/// Cached AI geopolitical evaluation. The live page reads this cache; it never calls AI.
+model GeopoliticalRiskEvaluation {
+  id              String   @id @default(cuid())
+  day_key         String   @db.VarChar(10)
+  theme_fingerprint String @db.Char(64)
+  components      Json
+  score           Float
+  band            String   @db.VarChar(20)
+  explanation     String?  @db.VarChar(1000)
+  event_count     Int      @default(0)
+  provider        String?  @db.VarChar(30)
+  model           String?  @db.VarChar(120)
+  prompt_version  String?  @db.VarChar(80)
+  decision_source String   @default("ai") @db.VarChar(24)
+  evaluated_at    DateTime @default(now())
+  created_at      DateTime @default(now())
+
+  @@unique([day_key, theme_fingerprint], map: "geo_risk_day_theme_fingerprint_key")
+  @@index([day_key, evaluated_at])
+  @@map("geopolitical_risk_evaluations")
 }
 
 /// Finalized UAE-day snapshot for Historical Analysis (doc §2).
@@ -684,6 +851,62 @@ model MarketDriverDayArchive {
   created_at      DateTime @default(now())
 
   @@map("market_driver_day_archive")
+}
+
+/// Versioned, complete session-level AI view. The stored JSON is a replacement snapshot used by
+/// Daily Market View and future Fundamental Analysis; historical snapshots remain reusable and
+/// never require re-calling AI after rollover.
+model MarketDriverSessionSnapshot {
+  id                  String   @id @default(cuid())
+  day_key             String   @db.VarChar(10)
+  source              String   @db.VarChar(40)
+  ledger_fingerprint  String   @db.Char(64)
+  version             Int
+  status              String   @default("VALID") @db.VarChar(20)
+  as_of               DateTime
+  prompt_version      String   @db.VarChar(80)
+  provider            String?  @db.VarChar(30)
+  model               String?  @db.VarChar(120)
+  snapshot            Json
+  catalyst_board      Json
+  macro_board         Json
+  driver_clusters     Json
+  geo_state           Json
+  confidence          Float    @default(0)
+  needs_review        Boolean  @default(false)
+  input_event_count   Int      @default(0)
+  input_theme_count   Int      @default(0)
+  created_at          DateTime @default(now())
+
+  @@unique([day_key, source, ledger_fingerprint], map: "market_driver_session_snapshot_day_source_fingerprint_key")
+  @@unique([day_key, source, version], map: "market_driver_session_snapshot_day_source_version_key")
+  @@index([day_key, source, status, version])
+  @@index([created_at])
+  @@map("market_driver_session_snapshots")
+}
+
+/// Durable idempotent lock for one complete Session Brain synthesis per evidence fingerprint.
+model MarketDriverSessionSynthesisJob {
+  id                 String   @id @default(cuid())
+  day_key            String   @db.VarChar(10)
+  source             String   @db.VarChar(40)
+  ledger_fingerprint String   @db.Char(64)
+  idempotency_key    String   @unique @db.VarChar(255)
+  ingest_id          String?  @db.VarChar(100)
+  status             String   @default("pending") @db.VarChar(20)
+  locked_at          DateTime?
+  worker_id          String?  @db.VarChar(120)
+  snapshot_id        String?  @db.VarChar(50)
+  error              String?  @db.VarChar(1000)
+  attempt_count      Int      @default(0)
+  completed_at       DateTime?
+  created_at         DateTime @default(now())
+  updated_at         DateTime @updatedAt
+
+  @@unique([day_key, source, ledger_fingerprint], map: "market_driver_session_job_day_source_fingerprint_key")
+  @@index([status, locked_at])
+  @@index([day_key, source, created_at])
+  @@map("market_driver_session_synthesis_jobs")
 }
 
 /// Durable work item for Market Driver classification/recovery. Payloads contain only public RSS

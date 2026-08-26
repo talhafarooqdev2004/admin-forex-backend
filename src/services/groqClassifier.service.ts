@@ -20,6 +20,34 @@ const OPENAI_CLIENT = ENV.OPENAI_API_KEY
     ? new OpenAI({ apiKey: ENV.OPENAI_API_KEY, timeout: REQUEST_TIMEOUT_MS, maxRetries: 0 })
     : null;
 
+function openAiClientForTimeout(timeoutMs: number): OpenAI {
+    if (!ENV.OPENAI_API_KEY) throw new Error('OpenAI API key is not configured');
+    if (timeoutMs <= REQUEST_TIMEOUT_MS) return OPENAI_CLIENT!;
+    return new OpenAI({ apiKey: ENV.OPENAI_API_KEY, timeout: timeoutMs, maxRetries: 0 });
+}
+
+async function waitForOpenAiResponse(
+    client: OpenAI,
+    initial: Record<string, unknown>,
+    deadlineMs: number,
+    startedAt: number,
+): Promise<Record<string, unknown>> {
+    let current = initial;
+    const responseId = typeof current.id === 'string' ? current.id : null;
+    if (!responseId) return current;
+
+    const pollIntervalMs = 5_000;
+    while (Date.now() - startedAt < deadlineMs) {
+        const status = typeof current.status === 'string' ? current.status : '';
+        if (status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'incomplete') {
+            return current;
+        }
+        await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+        current = await client.responses.retrieve(responseId) as unknown as Record<string, unknown>;
+    }
+    throw new Error(`OpenAI background response ${responseId} exceeded ${deadlineMs}ms deadline`);
+}
+
 /**
  * When Groq returns a daily token (TPD) 429, further short retries only burn the rest of the
  * budget and delay recovery. Pause all classify calls until this timestamp.
@@ -75,19 +103,75 @@ export type CatalystCurrency = (typeof CATALYST_CURRENCIES)[number];
 export type NewsCategory = 'ECONOMIC' | 'DRIVER' | 'GEOPOLITICAL' | 'IRRELEVANT';
 export type NewsImpact = 'High' | 'Medium' | 'Low';
 export type AssetBias = 'Bullish' | 'Bearish' | 'Neutral' | 'Mixed';
+/** Contract relationship between a headline and its canonical causal event. */
+export const FFE_EVENT_RELATIONS = [
+    'NEW_EVENT', 'SAME_EVENT', 'EVENT_UPDATE', 'STRENGTHENING_EVIDENCE',
+    'WEAKENING_EVIDENCE', 'REVERSAL', 'DE_ESCALATION', 'CONFIRMATION',
+    'PRICE_REACTION', 'HISTORICAL_COMMENTARY', 'MACRO_RELEASE', 'FORECAST_UPCOMING',
+    'IRRELEVANT',
+] as const;
+export type FfeEventRelation = (typeof FFE_EVENT_RELATIONS)[number];
+export const FFE_EVENT_TYPES = [
+    'GEOPOLITICAL', 'CENTRAL_BANK', 'RATE_REPRICING', 'YIELD_REPRICING',
+    'OIL_SUPPLY', 'CHINA_DEMAND', 'DAIRY', 'INTERVENTION', 'FISCAL_POLITICAL',
+    'MACRO_RELEASE', 'FORECAST', 'PRICE_REACTION', 'COMMENTARY', 'OTHER',
+] as const;
+export type FfeEventType = (typeof FFE_EVENT_TYPES)[number];
 
 export type ClassifiedAsset = {
     asset: TrackedAsset;
     bias: AssetBias;
     /** FFE Catalyst score: +1 / +0.5 / +0.25 / 0 / -0.25 / -0.5 / -1. */
     score: number;
+    /** AI-declared causal role; code never infers this from headline text. */
+    role?: 'DIRECT' | 'TRANSMITTED' | 'CONFIRMATION';
+    reason?: string;
 };
 
 /** An already-stored, non-duplicate headline from today the model can match new ones against. */
 export type ExistingTopic = { id: string; text: string; publishedAt?: Date | string | null };
 
+export type ExistingCanonicalTheme = {
+    id: string;
+    themeKey: string;
+    label: string;
+    summary: string;
+    status: 'ACTIVE' | 'RESOLVED' | 'REVERSED' | string;
+    geoState?: string | null;
+    assets: ClassifiedAsset[];
+    score?: number;
+    lastUpdatedAt?: Date | string | null;
+    supportingEventIds?: string[];
+    /** Full event-state context for the canonical resolver. Theme identity alone is not an
+     * event principal and must never be used as a substitute for one. */
+    events?: ExistingCanonicalEvent[];
+};
+
+export type ExistingCanonicalEvent = {
+    id: string;
+    themeId?: string | null;
+    relation?: string | null;
+    status: 'ACTIVE' | 'WATCH' | 'RESOLVED' | 'REVERSED' | string;
+    valid?: boolean;
+    independent?: boolean;
+    catalystEligible?: boolean;
+    eventType?: string | null;
+    headline: string;
+    fundamentalCause?: string | null;
+    observedMarketReaction?: string | null;
+    transmissionReason?: string | null;
+    normalizedSignature?: string | null;
+    sourceGuid?: string | null;
+    firstSeenAt?: Date | string | null;
+    lastSeenAt?: Date | string | null;
+    contributions: ClassifiedAsset[];
+    supportingGuids?: string[];
+    confirmationGuids?: string[];
+    counterEvidence?: string[];
+};
+
 /** Optional pub time so the LLM can tell same-briefing fragments from later separate developments. */
-export type HeadlineInput = { text: string; publishedAt?: Date | string | null };
+export type HeadlineInput = { text: string; publishedAt?: Date | string | null; actual?: string | null; forecast?: string | null; previous?: string | null };
 
 export type ClassifiedHeadline = {
     index: number;
@@ -110,18 +194,69 @@ export type ClassifiedHeadline = {
     signValidationStatus?: 'PASS' | 'CORRECTED' | 'FAILED' | 'NOT_APPLICABLE';
     /** Explicit semantic visibility decision for Catalyst (watch-only rows stay auditable). */
     catalystVisible?: boolean;
+    /** Canonical AI Analyst provenance contract. */
+    fundamentalCause?: string | null;
+    eventRelation?: FfeEventRelation;
+    eventDuplicateOf?: string | null;
+    eventType?: FfeEventType | string | null;
+    observedMarketReaction?: string | null;
+    eventStrength?: 'NONE' | 'WEAK' | 'MODERATE' | 'STRONG' | string | null;
+    eventSeverity?: number | null;
+    eventCredibility?: number | null;
+    eventFreshness?: number | null;
+    eventPersistence?: number | null;
+    transmissionReason?: string | null;
+    counterEvidence?: string[];
+    currentAssetContributions?: ClassifiedAsset[];
+    /**
+     * Deterministic contract-transmission family (e.g. OIL_SUPPLY_SHOCK, GEO_SYSTEMIC_ESCALATION,
+     * RATE_YIELD_REPRICING). Set only when application code applied the contract transmission table.
+     * The Catalyst board collapses all active drivers sharing a family to a single unique causal
+     * driver (client contract §30), preventing fragmented headlines from multiplying the score.
+     */
+    contractTransmissionFamily?: string | null;
+    supportingGuidIds?: string[];
+    confirmationGuidIds?: string[];
+    macroValues?: { actual: string | null; forecast: string | null; previous: string | null };
+    causalThemeSummary?: string | null;
+    themeAction?: 'CREATE' | 'UPDATE' | 'JOIN' | 'NEW_OPPOSING_THEME' | 'NONE';
+    themeDecision?: {
+        action: 'JOIN_EXISTING_THEME' | 'UPDATE_EXISTING_THEME' | 'REVERSE_EXISTING_THEME' | 'CREATE_NEW_THEME' | 'CONTEXT_ONLY' | 'MACRO_ONLY' | 'IRRELEVANT';
+        themeId: string | null;
+        themeKey: string | null;
+        label: string | null;
+        summary: string | null;
+        reason: string;
+        status: 'ACTIVE' | 'WATCH' | 'RESOLVED' | 'REVERSED';
+        assetContributions: ClassifiedAsset[];
+    };
+    macro?: {
+        eligible: boolean;
+        family: string | null;
+        directionSummary: string | null;
+        assetScores: Array<{ asset: TrackedAsset; score: number; reason: string }>;
+    };
+    catalystEligible?: boolean;
+    confidence?: number;
+    needsReview?: boolean;
+    reason?: string;
+    decisionSource?: 'ai_primary' | 'ai_fallback' | 'ai_adjudication' | 'test_override';
+    promptVersion?: string;
+    structuralValidationStatus?: 'PASS' | 'RETRY' | 'FAILED';
+    provider?: 'openai' | 'groq';
+    model?: string;
 };
 
 /**
  * Directional + asset + summary rules distilled from the automation-rules doc
- * (§1, §3, §4, §21–§25, §32, §34) + families observed on FinancialJuice + FXStreet feeds.
+ * (§1, §3, §4, §21–§25, §32, §34) + families observed on the FinancialJuice feed.
  *
  * DESIGN: the configured primary model is the classifier for ANY new wording; Groq is only the
  * bounded fallback. Sanitize is only a thin
  * universal safety net. Do NOT add person/event-specific code when a new headline appears —
  * improve this prompt / universal families instead.
  */
-const SYSTEM_PROMPT = `You are the Market Driver Board classifier for Forex Fundamental Edge.
+const LEGACY_SYSTEM_PROMPT = `You are the Market Driver Board classifier for Forex Fundamental Edge.
 
 ════════════════════════════════════════
 TRACKED ASSETS ONLY (doc §1) — nothing else goes on the News Headline board:
@@ -250,6 +385,124 @@ Respond ONLY with JSON:
 {"results":[{"i":0,"category":"...","impact":"...","assets":[{"asset":"...","bias":"...","score":0}],"summary":"...","driverTheme":"...","causalThemeId":"...","geoState":"IRRELEVANT","semanticDirection":"NEUTRAL","semanticStrength":"NONE"}],"duplicateGroups":[],"existingDuplicates":[]}
 Every input index must appear exactly once in "results".`;
 
+/** Versioned canonical FFE Analyst contract. Semantic decisions come from the model; the
+ * application only validates this shape, applies exact/source deduplication, and aggregates. */
+export const FFE_ANALYST_PROMPT_VERSION = 'ffe-analyst-v1.3.1-client-event-contract';
+const SYSTEM_PROMPT = `You are the FFE Analyst for Forex Fundamental Edge. You are the semantic authority
+for each headline, while application code is the deterministic authority for event state,
+transmission validation and Catalyst arithmetic. Read the complete headline and compact context;
+determine the fundamental cause, observed market reaction (separately), event type, event relation,
+causal theme, geopolitical state, freshness, strength, credibility, persistence, macro meaning,
+affected tracked assets, transmission reason and Catalyst eligibility. Do not use brittle keyword
+lookup as a substitute for semantic reasoning.
+
+Tracked assets: USD, EUR, GBP, JPY, CHF, CAD, AUD, NZD, GOLD, OIL. Use OIL only for crude/WTI/Brent
+or a directly stated crude-supply route. Use roles DIRECT, TRANSMITTED, or CONFIRMATION; CONFIRMATION
+does not count toward Catalyst totals. Scores are exactly one of -1, -0.5, -0.25, 0, 0.25, 0.5, 1.
+ECONOMIC releases with Actual/Forecast/Previous or a clearly measured scheduled print are Macro
+evidence; they are normally not Catalyst. Distinguish the release from later market commentary.
+Use semantic causality, not word overlap: same theme is not automatically the same event. A new
+event may JOIN an existing theme; use SAME_EVENT only for the same underlying announcement/outcome.
+When a relation is not NEW_EVENT, eventDuplicateOf MUST contain the exact existing canonical
+event id from the context (not a theme id). If no existing principal fits, do not invent an id:
+set needsReview=true and use an evidence-only/zero-contribution relation. A NEW_EVENT may mint
+one event only when it is a genuinely independent cause; later paraphrases, updates, reactions,
+and confirmations must point to the principal event and mutate its current state.
+Use exactly one eventRelation from NEW_EVENT, SAME_EVENT, EVENT_UPDATE, STRENGTHENING_EVIDENCE,
+WEAKENING_EVIDENCE, REVERSAL, DE_ESCALATION, CONFIRMATION, PRICE_REACTION, HISTORICAL_COMMENTARY,
+MACRO_RELEASE, FORECAST_UPCOMING or IRRELEVANT. Confirmations, price reactions, commentary,
+forecasts, scheduled Macro releases, duplicates and irrelevant rows have zero current Catalyst
+contribution.
+Assess geoState before asset mapping. Defensive exercises, routine visits, domestic politics and
+unresolved rhetoric are WATCH or IRRELEVANT unless the facts support escalation. A confirmed
+Hormuz/shipping escalation can directly affect OIL/GOLD before any broad FX transmission.
+Do not invent an existing internal theme id. Choose one semantic theme action:
+JOIN_EXISTING_THEME(themeId), UPDATE_EXISTING_THEME(themeId), REVERSE_EXISTING_THEME(themeId),
+CREATE_NEW_THEME (with a normalized themeKey/label and why no candidate fits), CONTEXT_ONLY,
+MACRO_ONLY, or IRRELEVANT. The internal ids in ACTIVE THEMES are code-generated and may only be
+referenced exactly. A confirmation/reaction updates or joins the cause and contributes zero new
+Catalyst score. Different events may join one broader causal theme; do not create one theme per
+speaker sentence or price reaction.
+
+Additional semantic boundaries: dovish central-bank guidance or faster rate cuts cannot be bullish
+for the currency whose expected policy rate is being reduced; classify it as Macro/policy context
+when appropriate and keep that currency bearish or neutral unless the headline supplies a separate
+offsetting cause. Technical price forecasts or support/resistance for an untracked asset (for
+example Silver/XAG) must not be proxied into GOLD or another tracked asset; with no tracked
+fundamental cause, return IRRELEVANT with an empty assets array.
+
+Universal FFE transmission calibration:
+- A scheduled Actual/Forecast/Previous release is Macro-only. Its measured surprise may score only
+  the directly affected currency and only once for that release family; related wire summaries,
+  duplicate value lines, and later price reactions are confirmation with zero new Catalyst score.
+- A broad geopolitical headline is not automatically a GOLD, OIL, or safe-haven signal. GOLD needs
+  explicit safe-haven/real-yield/USD evidence or a confirmed systemic escalation. JPY is not
+  bullish merely because a war headline exists; use a negative Japan/import or yield channel, or
+  a confirmed haven reaction, and otherwise leave it neutral.
+- OIL is directly directional only for crude/WTI/Brent, production, a named crude route, or a
+  confirmed shipping/supply disruption. Localized strikes, diplomatic visits, unconfirmed reports,
+  defensive exercises, and generic Middle-East rhetoric are WATCH/context and score OIL 0. A
+  confirmed Hormuz/crude-supply chain is one canonical theme: OIL can be bullish, CAD may receive
+  one transmitted confirmation, and the same theme's later confirmations must not add again.
+- Treat an actual operational attack, vessel hit/damage/casualty, route interruption, blockade or
+  confirmed strategic-shipping incident as operational evidence even when the headline does not
+  literally say “supply disruption” or “closure”. Such evidence must update the existing route
+  event from WATCH when appropriate and evaluate the direct OIL transmission; do not silently
+  convert a confirmed operational route event to a zero-score WATCH merely because the downstream
+  commodity impact is not yet quantified. Keep an early warning, threat alert, rumour or precaution
+  policy statement at WATCH/zero until an operational fact is actually reported.
+- For the confirmed Hormuz transmission table, use only the stated causal channels: USD/CHF may
+  be positive, AUD/NZD may be negative, EUR/GBP may be mildly negative, CAD is not an additional
+  independent shock, and JPY receives a haven contribution only when the headline confirms that
+  behavior. Do not invent cross-asset propagation for unrelated geo clusters.
+- Theme-level scores are state, not headline counts. JOIN/UPDATE/confirmation rows must preserve
+  the existing theme score unless the new event explicitly strengthens or reverses the cause.
+- Only ACTIVE, VALID, UNIQUE, INDEPENDENT canonical event contributions are summed. Preserve
+  opposing valid events instead of netting them away. Raw asset totals are not clamped to +/-1.
+  The Session Brain reviews/resolves event state but cannot replace this event-level arithmetic.
+
+For this FFE methodology, when the facts support the same causal cluster, prefer these stable
+theme keys rather than inventing one key per wire fragment:
+- GEO_HORMUZ_MIDDLE_EAST_ESCALATION: one Middle-East/Hormuz cluster. Its bounded transmission is
+  USD +0.5, CHF +0.5, EUR -0.25, GBP -0.25, AUD -0.5, NZD -0.5; CAD stays 0 directly and JPY is
+  added only when the headline confirms haven behavior. Keep OIL as a separate supply-shock theme.
+- OIL_SUPPLY_SHOCK: one crude/route/supply chain. Score OIL once (up to +1) and transmit CAD once
+  (+0.5 to +1) only when the evidence supports it; a later “CAD supported by oil” or Brent/WTI
+  price headline is confirmation, not a new theme.
+- USD_YIELD_REPRICING: one independently evidenced US-yield/rate-repricing cluster, normally
+  USD +0.5. A DXY/USD reaction line confirms it and scores zero.
+Create a different key only when the underlying cause is genuinely different; do not merge unrelated
+Russia/Ukraine, domestic, China-policy, or routine diplomatic context into these clusters.
+
+Calibration examples (generalize the causal relationship, do not create lookup rules):
+- “Australian Dollar gains as US Dollar struggles amid fading Fed rate hike bets” means USD bearish;
+- UK Claimant Count/wage releases with Actual and Forecast are ECONOMIC Macro-only;
+- a Pound-vs-Yen move after UK employment data remains UK labour/macro, not a Japan growth theme;
+- a Euro-vs-Pound move after UK unemployment is UK labour/macro, not ECB repricing;
+- a defensive Ulchi exercise with explicit non-escalation does not automatically score OIL;
+- US-Iran war worries are geopolitical/risk context, not automatically ECB policy;
+- a routine domestic visit does not create CAD or OIL impact;
+- confirmed Hormuz tanker/crude-supply escalation is directly bullish OIL before any broad FX effects;
+- a confirmed Hormuz closure/attack is one causal theme, not a separate OIL/GOLD theme for every
+  wire fragment; local Odesa/Yemen/Syria/UAE reports remain watch-only until a supply-route or
+  confirmed escalation link is present;
+- the client driver-cluster rule is: middle-east geo, crude supply shock, and US-yield repricing
+  are separate themes; price reactions and “supported by oil” summaries confirm those themes only;
+- faster ECB rate cuts are not bullish EUR, and a Silver/XAG technical forecast is not a GOLD driver.
+
+For every input index return exactly one result with this shape:
+{ itemId, category, fundamentalCause, observedMarketReaction, eventType, eventRelation,
+  eventStrength, eventSeverity, eventCredibility, eventFreshness, eventPersistence,
+  transmissionReason, counterEvidence, supportingGuidIds, confirmationGuidIds, macroValues,
+  eventDuplicateOf, causalThemeId,
+  causalThemeSummary, themeAction, geoState,
+  themeDecision:{action,themeId,themeKey,label,summary,reason,status,assetContributions},
+  macro:{eligible,family,directionSummary,assetScores:[{asset,score,reason}]},
+  assets:[{asset,score,bias,role,reason}], catalystEligible, confidence, needsReview, reason }
+
+Return JSON only. If uncertain, keep the item distinct, set needsReview=true, lower confidence, and
+explain the uncertainty. Never silently fall back to deterministic semantic rules.`;
+
 const DEDUP_ONLY_PROMPT = `You are an experienced wire editor detecting duplicate forex market headlines (doc §3).
 Applies to ANY topic/person/asset family — geopolitics, political speech, central-bank quotes,
 gold/oil price wraps, FX pair moves, economic data restatements. NOT "war/Trump/Fed only".
@@ -283,6 +536,40 @@ or the exact same single briefing? If yes, group them — do not require identic
 Return JSON only: {"duplicateGroups":[[principal, dup, ...], ...],"causalThemes":[{"i":0,"causalThemeId":"THEME"}]}
 Use [] if none.`;
 
+const ADJUDICATION_SYSTEM_PROMPT = `You are the bounded FFE Analyst adjudicator. Review proposed AI decisions for one
+or more headlines. Correct only material semantic contradictions: the proposed asset direction must
+    agree with the proposed macro direction, scheduled releases must not be Catalyst-only, technical or
+    untracked items must not receive tracked-asset Catalyst scores, dovish policy guidance cannot be
+    bullish for the currency being eased, and event relation/theme fields must
+be coherent. Re-read the headline; do not apply keyword lookup rules. A confirmed Hormuz/crude-supply
+disruption is directly bullish OIL; a defensive exercise without escalation is not an OIL Catalyst;
+explicit USD weakness must not be reported as a positive USD score. Do not score GOLD for every
+localized conflict, do not score JPY bullish without a confirmed haven/import/yield channel, and
+do not let a same-theme JOIN or confirmation add another Catalyst score. A scheduled release or
+its later commentary is Macro-only and a duplicate value line contributes zero new score. Return
+the same complete FFE Analyst result schema for every input. The result field \"i\" MUST equal the
+LOCAL_INDEX label supplied immediately before that input, must be an integer from 0 through N-1,
+and every local index must appear exactly once; never copy an original headline index or use the
+same index for multiple inputs. Include a short reason and set needsReview=true
+when uncertainty remains. For a Hormuz/Middle-East chain, preserve one geo cluster and one separate
+crude-supply cluster; for a US-yield/rate repricing chain, keep one USD theme and treat DXY/USD
+reaction lines as confirmation. Use exact active theme ids when a candidate is supplied.`;
+
+const GEO_RISK_SCHEMA: JsonSchema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+        directMilitaryEscalation: { type: 'number', minimum: 0, maximum: 0.2 },
+        energyHormuzRisk: { type: 'number', minimum: 0, maximum: 0.2 },
+        diplomaticDeterioration: { type: 'number', minimum: 0, maximum: 0.2 },
+        regionalSpillover: { type: 'number', minimum: 0, maximum: 0.2 },
+        sanctionsStrategicConfrontation: { type: 'number', minimum: 0, maximum: 0.2 },
+        deEscalationDeduction: { type: 'number', minimum: 0, maximum: 0.2 },
+        explanation: { type: 'string' },
+    },
+    required: ['directMilitaryEscalation', 'energyHormuzRisk', 'diplomaticDeterioration', 'regionalSpillover', 'sanctionsStrategicConfrontation', 'deEscalationDeduction', 'explanation'],
+};
+
 /** Dubai market-clock HH:MM for prompt lines (matches product day window). */
 function dubaiHhMm(publishedAt: Date | string | null | undefined): string | null {
     if (publishedAt == null || publishedAt === '') return null;
@@ -300,9 +587,28 @@ function dubaiHhMm(publishedAt: Date | string | null | undefined): string | null
     return `${hh}:${mm}`;
 }
 
+/** Retrieve every current ACTIVE/WATCH theme for the Dubai day. Relevance is decided by the model
+ * against the full canonical state; no 40-theme shortlist may hide an existing active driver. */
+function selectCanonicalThemeCandidates(
+    themes: ExistingCanonicalTheme[] | undefined,
+    headlines: string[],
+): ExistingCanonicalTheme[] {
+    if (!themes?.length) return [];
+    void headlines;
+    return themes
+        .filter((theme) => ['ACTIVE', 'WATCH'].includes(String(theme.status).toUpperCase()))
+        .sort((a, b) => new Date(String(b.lastUpdatedAt ?? 0)).getTime() - new Date(String(a.lastUpdatedAt ?? 0)).getTime());
+}
+
 function normalizeHeadlineInput(input: string | HeadlineInput): HeadlineInput {
     if (typeof input === 'string') return { text: input };
-    return { text: input.text, publishedAt: input.publishedAt };
+    return {
+        text: input.text,
+        publishedAt: input.publishedAt,
+        actual: input.actual ?? null,
+        forecast: input.forecast ?? null,
+        previous: input.previous ?? null,
+    };
 }
 
 function formatPromptHeadlineLine(index: number | string, input: string | HeadlineInput): string {
@@ -313,13 +619,26 @@ function formatPromptHeadlineLine(index: number | string, input: string | Headli
     return hhmm ? `${prefix} [${hhmm}] ${cleaned}` : `${prefix} ${cleaned}`;
 }
 
-type JsonSchema = { [key: string]: unknown };
-type ProviderResponse = {
+export type JsonSchema = { [key: string]: unknown };
+export type ProviderResponse = {
     parsed: Record<string, unknown>;
     provider: 'openai' | 'groq';
     model: string;
 };
-type RequestOptions = {
+export type AiEvaluationAttempt = {
+    provider: 'openai' | 'groq';
+    model: string;
+    operationType: AiOperationType;
+    requestStatus: 'success' | 'error';
+    usage: ProviderUsage;
+    isFallback: boolean;
+    errorKind?: string | null;
+    errorMessage?: string | null;
+};
+const aiEvaluationAttempts: AiEvaluationAttempt[] = [];
+export function resetAiEvaluationTelemetry(): void { aiEvaluationAttempts.length = 0; }
+export function getAiEvaluationTelemetry(): AiEvaluationAttempt[] { return aiEvaluationAttempts.map((row) => ({ ...row, usage: { ...row.usage } })); }
+export type StructuredJsonRequestOptions = {
     operationType: AiOperationType;
     jobId?: string | null;
     ingestId?: string | null;
@@ -327,7 +646,36 @@ type RequestOptions = {
     schemaName: string;
     maxOutputTokens: number;
     validate?: (value: Record<string, unknown>) => boolean;
+    /** Override the default OpenAI/Groq model for this request. */
+    model?: string;
+    /** Override OpenAI reasoning effort for this request. */
+    reasoningEffort?: 'none' | 'low' | 'medium' | 'high' | 'xhigh';
+    /** Per-request transport timeout (OpenAI client / Groq abort). */
+    requestTimeoutMs?: number;
+    /** Max transport attempts for this request (default: provider policy). Use 1 for long GPT-first sessions. */
+    transportMaxAttempts?: number;
+    /** Run OpenAI Responses API in background mode and poll until complete (long reasoning jobs). */
+    useBackground?: boolean;
+    /** Evaluation mode must not write provider usage or jobs to the application database. */
+    recordUsage?: boolean;
 };
+
+async function recordUsageIfEnabled(options: StructuredJsonRequestOptions, capture: Parameters<typeof recordAiUsage>[0]): Promise<void> {
+    if (options.recordUsage === false) {
+        aiEvaluationAttempts.push({
+            provider: capture.provider,
+            model: capture.model,
+            operationType: capture.operationType,
+            requestStatus: capture.requestStatus,
+            usage: capture.usage ?? {},
+            isFallback: capture.isFallback,
+            errorKind: capture.errorKind,
+            errorMessage: capture.errorMessage ?? null,
+        });
+        return;
+    }
+    await recordAiUsage(capture);
+}
 
 /**
  * The model can occasionally return a syntactically valid strict-schema response that is
@@ -354,7 +702,7 @@ function completeClassificationResponseError(value: Record<string, unknown>, exp
 type AiProviderRequestOverride = (
     system: string,
     user: string,
-    options: RequestOptions,
+    options: StructuredJsonRequestOptions,
 ) => Record<string, unknown> | null | Promise<Record<string, unknown> | null>;
 let aiProviderRequestOverride: AiProviderRequestOverride | null = null;
 
@@ -404,6 +752,7 @@ const CLASSIFICATION_RESPONSE_SCHEMA: JsonSchema = {
                 additionalProperties: false,
                 properties: {
                     i: { type: 'integer', minimum: 0 },
+                    itemId: { type: 'string' },
                     category: { type: 'string', enum: ['ECONOMIC', 'DRIVER', 'GEOPOLITICAL', 'IRRELEVANT'] },
                     impact: { type: 'string', enum: ['High', 'Medium', 'Low'] },
                     assets: {
@@ -415,8 +764,10 @@ const CLASSIFICATION_RESPONSE_SCHEMA: JsonSchema = {
                                 asset: { type: 'string', enum: [...TRACKED_ASSETS] },
                                 bias: { type: 'string', enum: ['Bullish', 'Bearish', 'Neutral', 'Mixed'] },
                                 score: { type: 'number' },
+                                role: { type: 'string', enum: ['DIRECT', 'TRANSMITTED', 'CONFIRMATION'] },
+                                reason: { type: 'string' },
                             },
-                            required: ['asset', 'bias', 'score'],
+                            required: ['asset', 'bias', 'score', 'role', 'reason'],
                         },
                     },
                     summary: { type: 'string' },
@@ -425,9 +776,91 @@ const CLASSIFICATION_RESPONSE_SCHEMA: JsonSchema = {
                     geoState: { type: 'string', enum: ['ESCALATION', 'DE_ESCALATION', 'WATCH', 'IRRELEVANT'] },
                     semanticDirection: { type: 'string', enum: ['BULLISH', 'BEARISH', 'NEUTRAL', 'MIXED'] },
                     semanticStrength: { type: 'string', enum: ['NONE', 'WEAK', 'MODERATE', 'STRONG'] },
+                    fundamentalCause: { type: 'string' },
+                    eventRelation: { type: 'string', enum: [...FFE_EVENT_RELATIONS] },
+                    eventDuplicateOf: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+                    eventType: { anyOf: [{ type: 'string', enum: [...FFE_EVENT_TYPES] }, { type: 'null' }] },
+                    observedMarketReaction: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+                    eventStrength: { anyOf: [{ type: 'string', enum: ['NONE', 'WEAK', 'MODERATE', 'STRONG'] }, { type: 'null' }] },
+                    eventSeverity: { anyOf: [{ type: 'number', minimum: 0, maximum: 1 }, { type: 'null' }] },
+                    eventCredibility: { anyOf: [{ type: 'number', minimum: 0, maximum: 1 }, { type: 'null' }] },
+                    eventFreshness: { anyOf: [{ type: 'number', minimum: 0, maximum: 1 }, { type: 'null' }] },
+                    eventPersistence: { anyOf: [{ type: 'number', minimum: 0, maximum: 1 }, { type: 'null' }] },
+                    transmissionReason: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+                    counterEvidence: { type: 'array', items: { type: 'string' } },
+                    supportingGuidIds: { type: 'array', items: { type: 'string' } },
+                    confirmationGuidIds: { type: 'array', items: { type: 'string' } },
+                    macroValues: {
+                        type: 'object', additionalProperties: false,
+                        properties: {
+                            actual: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+                            forecast: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+                            previous: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+                        },
+                        required: ['actual', 'forecast', 'previous'],
+                    },
+                    causalThemeSummary: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+                    themeAction: { type: 'string', enum: ['CREATE', 'UPDATE', 'JOIN', 'NEW_OPPOSING_THEME', 'NONE'] },
+                    themeDecision: {
+                        type: 'object',
+                        additionalProperties: false,
+                        properties: {
+                            action: { type: 'string', enum: ['JOIN_EXISTING_THEME', 'UPDATE_EXISTING_THEME', 'REVERSE_EXISTING_THEME', 'CREATE_NEW_THEME', 'CONTEXT_ONLY', 'MACRO_ONLY', 'IRRELEVANT'] },
+                            themeId: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+                            themeKey: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+                            label: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+                            summary: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+                            reason: { type: 'string' },
+                            status: { type: 'string', enum: ['ACTIVE', 'WATCH', 'RESOLVED', 'REVERSED'] },
+                            assetContributions: {
+                                type: 'array',
+                                items: {
+                                    type: 'object',
+                                    additionalProperties: false,
+                                    properties: {
+                                        asset: { type: 'string', enum: [...TRACKED_ASSETS] },
+                                        bias: { type: 'string', enum: ['Bullish', 'Bearish', 'Neutral', 'Mixed'] },
+                                        score: { type: 'number' },
+                                        role: { type: 'string', enum: ['DIRECT', 'TRANSMITTED', 'CONFIRMATION'] },
+                                        reason: { type: 'string' },
+                                    },
+                                    required: ['asset', 'bias', 'score', 'role', 'reason'],
+                                },
+                            },
+                        },
+                        required: ['action', 'themeId', 'themeKey', 'label', 'summary', 'reason', 'status', 'assetContributions'],
+                    },
+                    macro: {
+                        type: 'object',
+                        additionalProperties: false,
+                        properties: {
+                            eligible: { type: 'boolean' },
+                            family: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+                            directionSummary: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+                            assetScores: {
+                                type: 'array',
+                                items: {
+                                    type: 'object',
+                                    additionalProperties: false,
+                                    properties: {
+                                        asset: { type: 'string', enum: [...TRACKED_ASSETS] },
+                                        score: { type: 'number' },
+                                        reason: { type: 'string' },
+                                    },
+                                    required: ['asset', 'score', 'reason'],
+                                },
+                            },
+                        },
+                        required: ['eligible', 'family', 'directionSummary', 'assetScores'],
+                    },
+                    catalystEligible: { type: 'boolean' },
+                    confidence: { type: 'number', minimum: 0, maximum: 1 },
+                    needsReview: { type: 'boolean' },
+                    reason: { type: 'string' },
                 },
                 required: [
                     'i',
+                    'itemId',
                     'category',
                     'impact',
                     'assets',
@@ -437,6 +870,29 @@ const CLASSIFICATION_RESPONSE_SCHEMA: JsonSchema = {
                     'geoState',
                     'semanticDirection',
                     'semanticStrength',
+                    'fundamentalCause',
+                    'observedMarketReaction',
+                    'eventType',
+                    'eventRelation',
+                    'eventStrength',
+                    'eventSeverity',
+                    'eventCredibility',
+                    'eventFreshness',
+                    'eventPersistence',
+                    'transmissionReason',
+                    'counterEvidence',
+                    'supportingGuidIds',
+                    'confirmationGuidIds',
+                    'macroValues',
+                    'eventDuplicateOf',
+                    'causalThemeSummary',
+                    'themeAction',
+                    'themeDecision',
+                    'macro',
+                    'catalystEligible',
+                    'confidence',
+                    'needsReview',
+                    'reason',
                 ],
             },
         },
@@ -484,6 +940,15 @@ function classificationResponseSchema(expectedCount: number): JsonSchema {
     );
     delete schema.properties.results.items.properties.i.maximum;
     return schema as JsonSchema;
+}
+
+function classificationOutputTokens(expectedCount: number): number {
+    // gpt-5.4-mini/high-reasoning emits a complete 35-field result at materially more than
+    // the nano-era 700-token estimate. Under-budgeting a strict array truncates the response
+    // and causes the whole durable batch to be discarded. Keep the bound finite and derive it
+    // from the current batch size rather than allowing an unbounded model response.
+    const perResult = ENV.OPENAI_CLASSIFICATION_MODEL.includes('mini') ? 8_000 : 1_000;
+    return Math.max(ENV.AI_MAX_OUTPUT_TOKENS, Math.min(60_000, expectedCount * perResult));
 }
 
 const DEDUP_RESPONSE_SCHEMA: JsonSchema = {
@@ -596,12 +1061,12 @@ async function waitBeforeRetry(attempt: number, retryAfterMs?: number | null): P
     if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
 }
 
-async function requestJson(system: string, user: string, options: RequestOptions): Promise<ProviderResponse | null> {
+async function requestJson(system: string, user: string, options: StructuredJsonRequestOptions): Promise<ProviderResponse | null> {
     if (aiProviderRequestOverride) {
         const startedAt = Date.now();
         const parsed = await aiProviderRequestOverride(system, user, options);
         const valid = parsed !== null && (!options.validate || options.validate(parsed));
-        await recordAiUsage({
+        await recordUsageIfEnabled(options, {
             provider: 'openai',
             model: 'restart-test-synthetic',
             operationType: options.operationType,
@@ -633,14 +1098,22 @@ async function requestJson(system: string, user: string, options: RequestOptions
             continue;
         }
 
-        const model = provider === 'openai' ? ENV.OPENAI_CLASSIFICATION_MODEL : ENV.GROQ_FALLBACK_MODEL;
+        const model = options.model ?? (provider === 'openai' ? ENV.OPENAI_CLASSIFICATION_MODEL : ENV.GROQ_FALLBACK_MODEL);
+        const reasoningEffort = options.reasoningEffort ?? (provider === 'openai' ? ENV.AI_OPENAI_REASONING_EFFORT : ENV.AI_GROQ_REASONING_EFFORT);
         const maxAttempts = provider === 'openai'
             ? Math.max(1, ENV.AI_PRIMARY_MAX_ATTEMPTS)
             : Math.max(1, ENV.AI_FALLBACK_MAX_ATTEMPTS);
-        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        const effectiveMaxAttempts = Math.min(
+            maxAttempts,
+            Math.max(1, options.transportMaxAttempts ?? maxAttempts),
+        );
+        for (let attempt = 1; attempt <= effectiveMaxAttempts; attempt += 1) {
             const startedAt = Date.now();
             let usage: ProviderUsage = {};
             let requestId: string | null = null;
+            let responseStatus: string | null = null;
+            let responseOutputLength: number | null = null;
+            let responseIncompleteReason: string | null = null;
             try {
                 let parsed: Record<string, unknown> | null = null;
                 if (aiProviderTransportOverride) {
@@ -658,13 +1131,17 @@ async function requestJson(system: string, user: string, options: RequestOptions
                     usage = mocked.usage ?? {};
                     requestId = mocked.requestId ?? mocked.usage?.requestId ?? null;
                 } else if (provider === 'openai') {
-                    const response = await OPENAI_CLIENT!.responses.create({
+                    const requestTimeoutMs = Math.max(5_000, options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS);
+                    const openAiClient = openAiClientForTimeout(requestTimeoutMs);
+                    const useBackground = options.useBackground === true;
+                    let response = await openAiClient.responses.create({
                         model,
+                        background: useBackground,
                         input: [
                             { role: 'system', content: system },
                             { role: 'user', content: user },
                         ],
-                        reasoning: { effort: ENV.AI_OPENAI_REASONING_EFFORT as 'none' | 'low' | 'medium' | 'high' | 'xhigh' },
+                        reasoning: { effort: reasoningEffort as 'none' | 'low' | 'medium' | 'high' | 'xhigh' },
                         max_output_tokens: Math.max(128, options.maxOutputTokens),
                         text: {
                             format: {
@@ -675,15 +1152,26 @@ async function requestJson(system: string, user: string, options: RequestOptions
                             },
                         },
                     });
-                    const responseValue = response as unknown as Record<string, unknown>;
+                    let responseValue = response as unknown as Record<string, unknown>;
+                    if (useBackground) {
+                        responseValue = await waitForOpenAiResponse(openAiClient, responseValue, requestTimeoutMs, startedAt);
+                        response = responseValue as typeof response;
+                    }
+                    responseStatus = typeof responseValue.status === 'string' ? responseValue.status : null;
+                    responseIncompleteReason = typeof (responseValue.incomplete_details as { reason?: unknown } | null)?.reason === 'string'
+                        ? String((responseValue.incomplete_details as { reason: string }).reason)
+                        : null;
                     requestId = typeof responseValue._request_id === 'string'
                         ? responseValue._request_id
                         : (typeof responseValue.id === 'string' ? responseValue.id : null);
                     usage = parseUsage(responseValue.usage, requestId);
-                    parsed = parseJsonText(openAiText(response));
+                    const responseText = openAiText(response) ?? '';
+                    responseOutputLength = responseText.length;
+                    parsed = parseJsonText(responseText);
                 } else {
                     const controller = new AbortController();
-                    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+                    const requestTimeoutMs = Math.max(5_000, options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS);
+                    const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
                     try {
                         const response = await fetch(GROQ_URL, {
                             method: 'POST',
@@ -712,7 +1200,7 @@ async function requestJson(system: string, user: string, options: RequestOptions
                             if (status === 429) {
                                 const { dailyTpd, waitMs } = noteGroq429(body);
                                 logger.warn('[AIProvider] Groq request rate limited', { status, dailyTpd, attempt });
-                                await recordAiUsage({
+                                await recordUsageIfEnabled(options, {
                                     provider, model, operationType: options.operationType, jobId: options.jobId,
                                     ingestId: options.ingestId, usage: { ...usage, requestId }, requestStatus: 'error',
                                     latencyMs: Date.now() - startedAt, attemptNumber: attempt, isRetry: attempt > 1,
@@ -728,7 +1216,7 @@ async function requestJson(system: string, user: string, options: RequestOptions
                             }
                             const kind = retryableStatus(status) ? errorKind(null, status) : errorKind(null, status);
                             const message = `Groq returned HTTP ${status}`;
-                            await recordAiUsage({
+                            await recordUsageIfEnabled(options, {
                                 provider, model, operationType: options.operationType, jobId: options.jobId,
                                 ingestId: options.ingestId, usage: { ...usage, requestId }, requestStatus: 'error',
                                 latencyMs: Date.now() - startedAt, attemptNumber: attempt, isRetry: attempt > 1,
@@ -749,13 +1237,25 @@ async function requestJson(system: string, user: string, options: RequestOptions
                 }
 
                 const valid = parsed !== null && (!options.validate || options.validate(parsed));
-                await recordAiUsage({
+                await recordUsageIfEnabled(options, {
                     provider, model, operationType: options.operationType, jobId: options.jobId,
                     ingestId: options.ingestId, usage, requestStatus: valid ? 'success' : 'error',
                     latencyMs: Date.now() - startedAt, attemptNumber: attempt, isRetry: attempt > 1,
                     isFallback: provider === 'groq', errorKind: valid ? null : 'schema',
                     errorMessage: valid ? null : 'Provider response did not satisfy the required JSON schema',
                 });
+                if (!valid) {
+                    logger.warn('[AIProvider] Structured response rejected by application validator', {
+                        provider,
+                        model,
+                        operationType: options.operationType,
+                        schemaName: options.schemaName,
+                        parsedObject: Boolean(parsed),
+                        responseStatus,
+                        responseOutputLength,
+                        responseIncompleteReason,
+                    });
+                }
                 if (valid) {
                     logger.info('[AIProvider] Request complete', {
                         provider,
@@ -774,14 +1274,15 @@ async function requestJson(system: string, user: string, options: RequestOptions
                 const status = errorStatus(error);
                 const kind = errorKind(error, status);
                 const retryable = retryableStatus(status) || status === null;
-                await recordAiUsage({
+                await recordUsageIfEnabled(options, {
                     provider, model, operationType: options.operationType, jobId: options.jobId,
                     ingestId: options.ingestId, usage: { ...usage, requestId }, requestStatus: 'error',
                     latencyMs: Date.now() - startedAt, attemptNumber: attempt, isRetry: attempt > 1,
                     isFallback: provider === 'groq', errorKind: kind, errorMessage: safeProviderMessage(error),
                 });
                 logger.warn('[AIProvider] Provider request failed', { provider, model, kind, attempt });
-                if (!retryable || attempt >= maxAttempts) break;
+                const retryTransport = retryable && kind !== 'timeout' && attempt < effectiveMaxAttempts;
+                if (!retryTransport) break;
                 await waitBeforeRetry(attempt);
             }
         }
@@ -790,6 +1291,67 @@ async function requestJson(system: string, user: string, options: RequestOptions
         }
     }
     return null;
+}
+
+/**
+ * Shared provider boundary for versioned FFE semantic contracts.  The existing headline
+ * classifier and the Session Brain intentionally use the same bounded OpenAI-primary/Groq-
+ * fallback transport, usage accounting, test seams, and strict JSON-schema validation.
+ */
+export async function requestStructuredJson(
+    system: string,
+    user: string,
+    options: StructuredJsonRequestOptions,
+): Promise<ProviderResponse | null> {
+    return requestJson(system, user, options);
+}
+
+export type GeoRiskAiDecision = {
+    directMilitaryEscalation: number;
+    energyHormuzRisk: number;
+    diplomaticDeterioration: number;
+    regionalSpillover: number;
+    sanctionsStrategicConfrontation: number;
+    deEscalationDeduction: number;
+    explanation: string;
+    provider: 'openai' | 'groq';
+    model: string;
+};
+
+/** Evaluate only when the unique AI causal-theme set changes. Daily Market View never calls this. */
+export async function evaluateGeoRiskThemes(
+    themes: Array<{ causalThemeId: string; state: string; summary: string; assets: ClassifiedAsset[] }>,
+    options: { jobId?: string | null; ingestId?: string | null; recordUsage?: boolean } = {},
+): Promise<GeoRiskAiDecision | null> {
+    if (!themes.length) return null;
+    const response = await requestJson(
+        'You are the FFE geopolitical risk evaluator. Use only the already AI-classified unique causal themes below. Return the five bounded component scores and a concise explanation. Do not infer from application keywords; defensive exercises and routine visits do not create escalation, while confirmed Hormuz/crude shipping escalation may score energy risk. Code will perform only max-component arithmetic and clamping.',
+        themes.map((theme, index) => `${index}. theme=${theme.causalThemeId} state=${theme.state} summary=${theme.summary} assets=${JSON.stringify(theme.assets)}`).join('\n'),
+        {
+            operationType: 'geo_risk_evaluation',
+            jobId: options.jobId,
+            ingestId: options.ingestId,
+            schema: GEO_RISK_SCHEMA,
+            schemaName: 'ffe_geo_risk_evaluation',
+            maxOutputTokens: Math.max(512, ENV.AI_DEDUP_MAX_OUTPUT_TOKENS),
+            recordUsage: options.recordUsage,
+            validate: (value) => typeof value.explanation === 'string',
+        },
+    );
+    if (!response) return null;
+    const value = response.parsed;
+    const bounded = (key: string) => Math.max(0, Math.min(0.2, Number(value[key] ?? 0)));
+    return {
+        directMilitaryEscalation: bounded('directMilitaryEscalation'),
+        energyHormuzRisk: bounded('energyHormuzRisk'),
+        diplomaticDeterioration: bounded('diplomaticDeterioration'),
+        regionalSpillover: bounded('regionalSpillover'),
+        sanctionsStrategicConfrontation: bounded('sanctionsStrategicConfrontation'),
+        deEscalationDeduction: bounded('deEscalationDeduction'),
+        explanation: String(value.explanation ?? '').slice(0, 1000),
+        provider: response.provider,
+        model: response.model,
+    };
 }
 
 /**
@@ -819,9 +1381,7 @@ export async function findBatchDuplicateMap(
         },
     );
     const parsed = response?.parsed ?? null;
-    if (!parsed) {
-        // Fall through to deterministic backstop even when both providers are unavailable.
-    } else {
+    if (parsed) {
         for (const groupRaw of Array.isArray(parsed.duplicateGroups) ? parsed.duplicateGroups : []) {
             if (!Array.isArray(groupRaw) || groupRaw.length < 2) continue;
             const group = groupRaw
@@ -831,18 +1391,6 @@ export async function findBatchDuplicateMap(
             const principal = group[0]!;
             for (const idx of group.slice(1)) {
                 if (idx !== principal && !out.has(idx)) out.set(idx, principal);
-            }
-        }
-    }
-
-    // Token-overlap + fingerprint backstop for near-paraphrases the model misses.
-    for (let i = 0; i < normalized.length; i++) {
-        if (out.has(i)) continue;
-        for (let j = 0; j < i; j++) {
-            if (out.has(j)) continue;
-            if (likelySameEvent(normalized[i]!.text, normalized[j]!.text)) {
-                out.set(i, j);
-                break;
             }
         }
     }
@@ -1592,7 +2140,7 @@ function isScheduledDataReleaseHeadline(headline: string): boolean {
 }
 
 /**
- * FX market commentary / pair wraps that appear on FinancialJuice Forex tab (FXStreet).
+ * FX market commentary / pair wraps that appear on the FinancialJuice Forex tab.
  * These are Market Drivers (doc §4 B), not Currency Health economic releases.
  */
 function isFxMarketCommentaryHeadline(headline: string): boolean {
@@ -1754,12 +2302,14 @@ export function isBoardVisibleClassification(input: {
     assets: ClassifiedAsset[];
     duplicateOf?: string | null;
     catalystVisible?: boolean;
+    catalystEligible?: boolean;
 }): boolean {
     if (input.duplicateOf) return false;
     if (input.catalystVisible === false) return false;
+    if (input.catalystEligible === false) return false;
     if (!['DRIVER', 'GEOPOLITICAL'].includes(String(input.category).toUpperCase())) return false;
     return Array.isArray(input.assets) && input.assets.some(
-        (asset) => CATALYST_CURRENCIES.includes(asset.asset as CatalystCurrency) && asset.score !== 0,
+        (asset) => asset.role !== 'CONFIRMATION' && CATALYST_CURRENCIES.includes(asset.asset as CatalystCurrency) && asset.score !== 0,
     );
 }
 
@@ -1778,7 +2328,9 @@ function catalystVisibilityForTheme(theme: string | null, headline: string): boo
 }
 
 /**
- * Post-LLM sanitizer — UNIVERSAL doc rules only.
+ * Legacy test fixture helper. Production classification uses normalizeAiClassification below;
+ * this historical deterministic reference is retained only so the frozen Aug17 oracle can be
+ * compared without rewriting stored production rows.
  * Recovers Groq drift so FJ/FXS headlines that belong on the board are not lost to
  * ECONOMIC / IRRELEVANT / Low mislabels. Do not add person- or event-specific one-offs here.
  */
@@ -1980,70 +2532,707 @@ export function sanitizeClassification(
     return { category, impact, assets, summary, catalystVisible: catalystVisibilityForTheme(decision.driverTheme, headline) };
 }
 
+/**
+ * Structural-only normalization for the production AI path.  This function deliberately does
+ * not inspect headline text: semantic category, causality, geo state, event relation, roles and
+ * scores are model decisions.  It only enforces enums, tracked assets, score bounds and the
+ * structural rule that IRRELEVANT/CONFIRMATION rows cannot contribute Catalyst score.
+ */
+export function normalizeAiClassification(
+    raw: unknown,
+    index: number,
+    headline = '',
+): Omit<ClassifiedHeadline, 'duplicateOfExistingId' | 'duplicateOfBatchIndex'> | null {
+    if (!raw || typeof raw !== 'object') return null;
+    const r = raw as Record<string, unknown>;
+    const enumValue = <T extends string>(value: unknown, allowed: readonly T[], fallback: T): T => {
+        const candidate = String(value ?? '').toUpperCase() as T;
+        return allowed.includes(candidate) ? candidate : fallback;
+    };
+    const category = enumValue(r.category, ['ECONOMIC', 'DRIVER', 'GEOPOLITICAL', 'IRRELEVANT'] as const, 'IRRELEVANT');
+    const impactToken = enumValue(r.impact, ['HIGH', 'MEDIUM', 'LOW'] as const, 'LOW');
+    const impact: NewsImpact = impactToken === 'HIGH' ? 'High' : impactToken === 'MEDIUM' ? 'Medium' : 'Low';
+    const bias = (value: unknown): AssetBias => {
+        const token = enumValue(value, ['BULLISH', 'BEARISH', 'NEUTRAL', 'MIXED'] as const, 'NEUTRAL');
+        return token === 'BULLISH' ? 'Bullish' : token === 'BEARISH' ? 'Bearish' : token === 'MIXED' ? 'Mixed' : 'Neutral';
+    };
+    const role = (value: unknown): 'DIRECT' | 'TRANSMITTED' | 'CONFIRMATION' => enumValue(value, ['DIRECT', 'TRANSMITTED', 'CONFIRMATION'] as const, 'DIRECT');
+    const rawScore = (value: unknown): number | null => {
+        const numeric = Number(value);
+        return Number.isFinite(numeric) ? numeric : null;
+    };
+    const score = (value: unknown): number => {
+        const numeric = rawScore(value);
+        if (numeric == null) return 0;
+        const bounded = Math.max(-1, Math.min(1, numeric));
+        return Math.round(bounded * 4) / 4;
+    };
+    const rawAssetRows = Array.isArray(r.assets)
+        ? r.assets.filter((x): x is Record<string, unknown> => Boolean(x && typeof x === 'object'))
+        : [];
+    let signBiasFailure = false;
+    let conditionalEvidence = false;
+    const assets: ClassifiedAsset[] = [];
+    const seen = new Set<string>();
+    for (const rawAsset of Array.isArray(r.assets) ? r.assets : []) {
+        if (!rawAsset || typeof rawAsset !== 'object') continue;
+        const a = rawAsset as Record<string, unknown>;
+        const asset = String(a.asset ?? '').toUpperCase().replace('OIL (WTI)', 'OIL').replace('WTI', 'OIL') as TrackedAsset;
+        if (!TRACKED_ASSETS.includes(asset) || seen.has(asset)) continue;
+        seen.add(asset);
+        let nextScore = score(a.score);
+        const nextRole = role(a.role);
+        const declaredBias = bias(a.bias);
+        const reason = String(a.reason ?? '').slice(0, 500);
+        const expectedBias: AssetBias = nextScore > 0 ? 'Bullish' : nextScore < 0 ? 'Bearish' : 'Neutral';
+        if (nextRole !== 'CONFIRMATION' && nextScore !== 0 && (declaredBias === 'Mixed' || declaredBias !== expectedBias)) {
+            // Never persist/display a signed contribution with an incompatible bias. Keep the
+            // evidence row for audit, but force the contradictory contribution to zero.
+            signBiasFailure = true;
+            nextScore = 0;
+        }
+        assets.push({ asset, bias: nextScore > 0 ? 'Bullish' : nextScore < 0 ? 'Bearish' : 'Neutral', score: nextScore, role: nextRole, reason });
+    }
+    const macroRaw = r.macro && typeof r.macro === 'object' ? r.macro as Record<string, unknown> : {};
+    const macroAssetScores = (Array.isArray(macroRaw.assetScores) ? macroRaw.assetScores : [])
+        .filter((v): v is Record<string, unknown> => Boolean(v && typeof v === 'object'))
+        .map((v) => ({
+            asset: String(v.asset ?? '').toUpperCase().replace('WTI', 'OIL') as TrackedAsset,
+            score: score(v.score),
+            reason: String(v.reason ?? '').slice(0, 500),
+        }))
+        .filter((v) => TRACKED_ASSETS.includes(v.asset));
+    const requestedRelation = enumValue(r.eventRelation, FFE_EVENT_RELATIONS, 'NEW_EVENT');
+    const fundamentalCause = String(r.fundamentalCause ?? '') || null;
+    const eventType = eventTypeFor(category, r.eventType);
+    const eventRelation = category === 'ECONOMIC' || eventType === 'MACRO_RELEASE'
+        ? 'MACRO_RELEASE'
+        : category === 'IRRELEVANT'
+            ? 'IRRELEVANT'
+            : eventType === 'FORECAST'
+                ? 'FORECAST_UPCOMING'
+                : eventType === 'PRICE_REACTION'
+                    ? 'PRICE_REACTION'
+                    : requestedRelation;
+    const observedMarketReaction = r.observedMarketReaction == null ? null : String(r.observedMarketReaction).slice(0, 500);
+    const eventStrength = enumValue(r.eventStrength, ['NONE', 'WEAK', 'MODERATE', 'STRONG'] as const, impact === 'High' ? 'STRONG' : impact === 'Medium' ? 'MODERATE' : 'WEAK');
+    const eventSeverity = boundedContractMetric(r.eventSeverity, impact === 'High' ? 1 : impact === 'Medium' ? 0.5 : 0.25);
+    const confidenceNumber = Number(r.confidence);
+    const confidence = Number.isFinite(confidenceNumber) ? Math.max(0, Math.min(1, confidenceNumber)) : 0;
+    const eventCredibility = boundedContractMetric(r.eventCredibility, confidence);
+    const eventFreshness = boundedContractMetric(r.eventFreshness, 1);
+    const eventPersistence = boundedContractMetric(r.eventPersistence, eventStrength === 'STRONG' ? 0.8 : eventStrength === 'MODERATE' ? 0.5 : 0.25);
+    const themeAction = enumValue(r.themeAction, ['CREATE', 'UPDATE', 'JOIN', 'NEW_OPPOSING_THEME', 'NONE'] as const, 'NONE');
+    const themeRaw = r.themeDecision && typeof r.themeDecision === 'object'
+        ? r.themeDecision as Record<string, unknown>
+        : {};
+    const canonicalThemeAction = enumValue(
+        themeRaw.action,
+        ['JOIN_EXISTING_THEME', 'UPDATE_EXISTING_THEME', 'REVERSE_EXISTING_THEME', 'CREATE_NEW_THEME', 'CONTEXT_ONLY', 'MACRO_ONLY', 'IRRELEVANT'] as const,
+        themeAction === 'JOIN' ? 'JOIN_EXISTING_THEME' : themeAction === 'UPDATE' ? 'UPDATE_EXISTING_THEME' : themeAction === 'CREATE' || themeAction === 'NEW_OPPOSING_THEME' ? 'CREATE_NEW_THEME' : category === 'ECONOMIC' ? 'MACRO_ONLY' : category === 'IRRELEVANT' ? 'IRRELEVANT' : 'CONTEXT_ONLY',
+    );
+    const canonicalThemeAssets = (Array.isArray(themeRaw.assetContributions) ? themeRaw.assetContributions : assets)
+        .filter((v): v is Record<string, unknown> => Boolean(v && typeof v === 'object'))
+        .map((v) => {
+            const asset = String(v.asset ?? '').toUpperCase().replace('WTI', 'OIL') as TrackedAsset;
+            const themeScore = score(v.score);
+            const themeRole = role(v.role);
+            return {
+                asset,
+                bias: bias(v.bias),
+                score: themeRole === 'CONFIRMATION' ? 0 : themeScore,
+                role: themeRole,
+                reason: String(v.reason ?? '').slice(0, 500),
+            } as ClassifiedAsset;
+        })
+        .filter((v) => TRACKED_ASSETS.includes(v.asset));
+    const geoState = enumValue(r.geoState, ['ESCALATION', 'DE_ESCALATION', 'WATCH', 'IRRELEVANT'] as const, 'IRRELEVANT') as GeoState;
+    const semanticDirection = enumValue(r.semanticDirection, ['BULLISH', 'BEARISH', 'NEUTRAL', 'MIXED'] as const, 'NEUTRAL') as SemanticDirection;
+    const semanticStrength = enumValue(r.semanticStrength, ['NONE', 'WEAK', 'MODERATE', 'STRONG'] as const, 'NONE') as SemanticStrength;
+    const transmissionReason = r.transmissionReason == null ? '' : String(r.transmissionReason).slice(0, 1000);
+    const counterEvidence = Array.isArray(r.counterEvidence) ? r.counterEvidence.map(String).slice(0, 32) : [];
+    const evidenceText = [headline, fundamentalCause ?? '', transmissionReason, ...counterEvidence, ...assets.map((asset) => asset.reason ?? '')].join(' ').toLowerCase();
+    const conditional = /\b(?:conditional|unconfirmed|unverified|rumou?r|speculat(?:ive|ion)|possible|potential|could|may|mulls?|mulling|prepar(?:e|ation)|planned|expected|sources?\s+(?:say|report)|reported)\b/.test(evidenceText);
+    const directShock = /\b(?:confirmed|hit|struck|attack(?:ed)?|damage|damaged|casualt(?:y|ies)|closed|blockade|blocked|interrupted|supply disruption|production cut|intervention|officially)\b/.test(evidenceText);
+    if (conditional) {
+        conditionalEvidence = true;
+        for (const asset of assets) {
+            if (asset.role === 'CONFIRMATION' || asset.score === 0) continue;
+            if (Math.abs(asset.score) >= 1) {
+                // A conditional/preparatory statement cannot carry the strongest score. If
+                // there is no confirmed direct shock, keep it watch-only rather than inventing
+                // an active Catalyst driver.
+                asset.score = directShock ? Math.sign(asset.score) * 0.5 : 0;
+                asset.bias = asset.score > 0 ? 'Bullish' : asset.score < 0 ? 'Bearish' : 'Neutral';
+            }
+        }
+    }
+    const contractFailure = contractTransmissionFailure(category, eventType, eventRelation, fundamentalCause ?? '', assets, transmissionReason);
+    const normalizedAssets = category === 'IRRELEVANT'
+        ? []
+        : assets.map((a) => ({ ...a, score: a.role === 'CONFIRMATION' || ZERO_CONTRIBUTION_RELATIONS.has(eventRelation) ? 0 : a.score }));
+    const structuralInvalid = category === 'IRRELEVANT' && assets.length > 0
+        || assets.some((a) => {
+            if (a.role === 'CONFIRMATION') return false;
+            const rawAsset = rawAssetRows.find((raw) => String(raw.asset ?? '').toUpperCase().replace('OIL (WTI)', 'OIL').replace('WTI', 'OIL') === a.asset);
+            const rawValue = rawAsset?.score;
+            return rawScore(rawValue) == null || ![-1, -0.5, -0.25, 0, 0.25, 0.5, 1].includes(Number(rawValue));
+        })
+        || contractFailure;
+    const reasonScoreFailure = assets.some((asset) => {
+        if (!asset.score || !asset.reason) return false;
+        const reason = asset.reason.toLowerCase();
+        const positive = /\b(?:bullish|supports?|supportive|higher|upside|strengthen|boost|benefit|rally)\b/.test(reason);
+        const negative = /\b(?:bearish|weighs?|negative|lower|downside|weakens?|drag|pressure|eases?|relief|falls?)\b/.test(reason);
+        return (asset.score > 0 && negative && !positive) || (asset.score < 0 && positive && !negative);
+    });
+    if (reasonScoreFailure) signBiasFailure = true;
+    const requestedCatalyst = Boolean(r.catalystEligible) && category !== 'ECONOMIC' && category !== 'IRRELEVANT';
+    const candidateContributions = normalizedAssets.filter((a) => a.role !== 'CONFIRMATION' && a.score !== 0);
+    // catalystEligible=true with no current contribution is invalid state. It is represented as
+    // review/watch evidence, never as an active zero-valued driver.
+    const catalystEligible = requestedCatalyst && !contractFailure && !structuralInvalid && candidateContributions.length > 0;
+
+    const macroValuesRaw = r.macroValues && typeof r.macroValues === 'object' ? r.macroValues as Record<string, unknown> : {};
+
+    // Deterministic contract transmission.
+    const contractDriver = ZERO_CONTRIBUTION_RELATIONS.has(eventRelation) || category === 'IRRELEVANT'
+        ? null
+        : deriveCommodityInventoryTransmission({ headline, actual: macroValuesRaw.actual as string | null, forecast: macroValuesRaw.forecast as string | null, previous: macroValuesRaw.previous as string | null })
+        ?? (category === 'ECONOMIC'
+            ? null
+            : deriveContractTransmission({
+                category,
+                eventType,
+                geoState,
+                headline,
+                evidenceText,
+                conditional: conditionalEvidence,
+                directShock,
+                modelAssets: assets,
+            }));
+
+    let validatedCatalystEligible: boolean;
+    let currentAssetContributions: ClassifiedAsset[];
+    let contractTransmissionApplied = false;
+    if (contractDriver && contractDriver.contributions.length > 0) {
+        // The contract transmission is internally sign-consistent and score-bounded by construction,
+        // so it recovers a valid driver even when the model dropped the event to watch/zero.
+        contractTransmissionApplied = true;
+        validatedCatalystEligible = true;
+        currentAssetContributions = contractDriver.contributions;
+    } else {
+        validatedCatalystEligible = catalystEligible && !signBiasFailure;
+        currentAssetContributions = structuralInvalid || category === 'ECONOMIC' || category === 'IRRELEVANT' || !validatedCatalystEligible
+            ? []
+            : candidateContributions;
+    }
+    return {
+        index,
+        category,
+        impact,
+        assets: normalizedAssets,
+        summary: String(r.summary ?? r.reason ?? '').slice(0, 1000),
+        reason: String(r.reason ?? r.summary ?? '').slice(0, 1000),
+        driverTheme: String(r.driverTheme ?? '') || null,
+        causalThemeId: String(r.causalThemeId ?? '') || null,
+        geoState,
+        semanticDirection,
+        semanticStrength,
+        directAssetSignals: normalizedAssets.filter((a) => a.role === 'DIRECT').map((a) => ({ asset: a.asset, bias: a.bias, score: a.score, role: a.role, reason: a.reason })),
+        transmittedAssetSignals: normalizedAssets.filter((a) => a.role === 'TRANSMITTED').map((a) => ({ asset: a.asset, bias: a.bias, score: a.score, role: a.role, reason: a.reason })),
+        signValidationStatus: contractTransmissionApplied ? 'PASS' : structuralInvalid || signBiasFailure ? 'FAILED' : 'PASS',
+        catalystVisible: contractTransmissionApplied || (validatedCatalystEligible && !contractFailure && normalizedAssets.some((a) => a.role !== 'CONFIRMATION' && a.score !== 0)),
+        fundamentalCause,
+        eventRelation,
+        eventDuplicateOf: r.eventDuplicateOf == null ? null : String(r.eventDuplicateOf),
+        eventType,
+        observedMarketReaction,
+        eventStrength,
+        eventSeverity,
+        eventCredibility,
+        eventFreshness,
+        eventPersistence,
+        transmissionReason: transmissionReason || null,
+        counterEvidence,
+        currentAssetContributions,
+        contractTransmissionFamily: contractTransmissionApplied && contractDriver ? contractDriver.family : null,
+        supportingGuidIds: Array.isArray(r.supportingGuidIds) ? r.supportingGuidIds.map(String).slice(0, 64) : [],
+        confirmationGuidIds: Array.isArray(r.confirmationGuidIds) ? r.confirmationGuidIds.map(String).slice(0, 64) : [],
+        macroValues: {
+            actual: macroValuesRaw.actual == null ? null : String(macroValuesRaw.actual).slice(0, 120),
+            forecast: macroValuesRaw.forecast == null ? null : String(macroValuesRaw.forecast).slice(0, 120),
+            previous: macroValuesRaw.previous == null ? null : String(macroValuesRaw.previous).slice(0, 120),
+        },
+        causalThemeSummary: r.causalThemeSummary == null ? null : String(r.causalThemeSummary).slice(0, 500),
+        themeAction,
+        themeDecision: {
+            action: canonicalThemeAction,
+            themeId: themeRaw.themeId == null ? null : String(themeRaw.themeId),
+            themeKey: themeRaw.themeKey == null ? (String(r.causalThemeId ?? '') || null) : String(themeRaw.themeKey),
+            label: themeRaw.label == null ? (String(r.driverTheme ?? '') || null) : String(themeRaw.label),
+            summary: themeRaw.summary == null ? (r.causalThemeSummary == null ? null : String(r.causalThemeSummary).slice(0, 1000)) : String(themeRaw.summary).slice(0, 1000),
+            reason: String(themeRaw.reason ?? r.reason ?? r.summary ?? '').slice(0, 1000),
+            status: enumValue(themeRaw.status, ['ACTIVE', 'WATCH', 'RESOLVED', 'REVERSED'] as const, 'ACTIVE'),
+            assetContributions: canonicalThemeAssets,
+        },
+        macro: {
+            eligible: Boolean(macroRaw.eligible),
+            family: macroRaw.family == null ? null : String(macroRaw.family),
+            directionSummary: macroRaw.directionSummary == null ? null : String(macroRaw.directionSummary).slice(0, 500),
+            assetScores: macroAssetScores,
+        },
+        catalystEligible: validatedCatalystEligible,
+        confidence,
+        // Low confidence/sign contradictions are reviewable; a model's conservative
+        // needsReview flag alone must not send nearly every normal row through another paid call.
+        needsReview: confidence < 0.45 || structuralInvalid || signBiasFailure || conditionalEvidence || !catalystEligible && requestedCatalyst,
+        decisionSource: 'ai_primary',
+        promptVersion: FFE_ANALYST_PROMPT_VERSION,
+        structuralValidationStatus: structuralInvalid ? 'FAILED' : 'PASS',
+    };
+}
+
+function hasAiDecisionContradiction(row: ClassifiedHeadline): boolean {
+    if (!row.macro) return false;
+    const macroByAsset = new Map(row.macro.assetScores.map((asset) => [asset.asset, asset.score]));
+    return row.assets.some((asset) => {
+        const macroScore = macroByAsset.get(asset.asset);
+        return macroScore != null && macroScore !== 0 && asset.score !== 0 && Math.sign(macroScore) !== Math.sign(asset.score);
+    });
+}
+
+/** The model's reason and signed contribution must agree; this is a structural semantic check,
+ * not a headline keyword-to-score rule. Contradictions are sent to one bounded adjudication pass. */
+function hasReasonScoreContradiction(row: ClassifiedHeadline): boolean {
+    return row.assets.some((asset) => {
+        if (!asset.score || !asset.reason) return false;
+        const reason = asset.reason.toLowerCase();
+        const positive = /\b(?:bullish|supports?|supportive|higher|upside|strengthen|boost|benefit)\b/.test(reason);
+        const negative = /\b(?:bearish|weighs?|negative|lower|downside|weakens?|drag|pressure|eases?|relief)\b/.test(reason);
+        if (positive && negative) return false;
+        return (asset.score > 0 && negative) || (asset.score < 0 && positive);
+    });
+}
+
+const ZERO_CONTRIBUTION_RELATIONS = new Set<FfeEventRelation>([
+    'SAME_EVENT', 'CONFIRMATION', 'PRICE_REACTION', 'HISTORICAL_COMMENTARY',
+    'MACRO_RELEASE', 'FORECAST_UPCOMING', 'IRRELEVANT', 'CONTEXT_ONLY' as FfeEventRelation,
+]);
+
+function boundedContractMetric(value: unknown, fallback: number): number {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : fallback;
+}
+
+function eventTypeFor(category: NewsCategory, value: unknown): FfeEventType {
+    const token = String(value ?? '').toUpperCase();
+    if (FFE_EVENT_TYPES.includes(token as FfeEventType)) return token as FfeEventType;
+    return category === 'ECONOMIC' ? 'MACRO_RELEASE' : category === 'GEOPOLITICAL' ? 'GEOPOLITICAL' : 'OTHER';
+}
+
+/**
+ * Contract hard gates. These are declared-cause/transmission checks, not a headline-to-score
+ * classifier. They prevent a structurally valid response from making an impossible transmission
+ * claim, while preserving the raw AI decision for audit and review.
+ */
+function contractTransmissionFailure(
+    category: NewsCategory,
+    eventType: FfeEventType,
+    eventRelation: FfeEventRelation,
+    fundamentalCause: string,
+    assets: ClassifiedAsset[],
+    transmissionReason = '',
+): boolean {
+    if (category === 'ECONOMIC' || category === 'IRRELEVANT' || ZERO_CONTRIBUTION_RELATIONS.has(eventRelation)) return false;
+    const cause = fundamentalCause.toLowerCase();
+    const declaredTransmission = transmissionReason.toLowerCase();
+    const currencyAssets = new Set(['USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD', 'NZD']);
+    for (const asset of assets) {
+        if (asset.role === 'CONFIRMATION' || asset.score === 0) continue;
+        if ((/dovish|eas(?:e|ing)|rate cuts?|cutting rates?|falling hike probability|lower hike probability/.test(cause)
+            && currencyAssets.has(asset.asset) && asset.score > 0)
+            || (/hawkish|tighten(?:ing)?|rate hikes?|higher hike probability/.test(cause)
+                && currencyAssets.has(asset.asset) && asset.score < 0)) return true;
+        if (asset.asset === 'OIL' && !(/oil|crude|wti|brent|hormuz|strait|shipping|supply|production|inventory|export/.test(cause)
+            || eventType === 'OIL_SUPPLY')) return true;
+        if ((asset.asset === 'AUD' || asset.asset === 'NZD') && /\bchina\b/.test(cause)
+            && !/demand|growth|imports?|exports?|industrial|commodity|metals?/.test(cause)) return true;
+        if ((asset.asset === 'JPY' || asset.asset === 'CHF' || asset.asset === 'GOLD')
+            && category === 'GEOPOLITICAL'
+            && !/haven|safe|risk[- ]off|real yield|gold|safe[- ]haven/.test(cause)) return true;
+        const reason = `${declaredTransmission} ${asset.reason ?? ''}`;
+        const genericOnly = /\b(?:risk sentiment|liquidity plumbing|counterpart(?:y)?|country association|broad spillover|possible transmission|may transmit|generic)\b/.test(reason)
+            && !/\b(?:yield|rate|policy|safe.?haven|risk[- ]off|shipping|crude|oil|supply|trade|import|export|terms[- ]of[- ]trade|intervention|route|insurance|production)\b/.test(reason);
+        if (genericOnly) return true;
+    }
+    return false;
+}
+
+/**
+ * Deterministic FFE contract transmission (client contract §12–§24, developer instruction §5/§11).
+ *
+ * The model is the semantic authority: it decides the fundamental cause, event type, geopolitical
+ * state and whether the evidence is confirmed vs conditional. THIS function is the deterministic
+ * application-code authority for which tracked assets a recognized contract driver transmits to and
+ * with what sign/magnitude. It exists because a probabilistic classifier cannot reliably enumerate
+ * six-to-ten correct per-asset contributions for every event; leaving that to the model produced a
+ * board that swung run-to-run with no code change. When a headline resolves to one of the contract's
+ * standard causal families we replace the model's ad-hoc asset list with the contract transmission
+ * table so the same news always yields the same, explainable, reconstructable driver — exactly the
+ * behaviour the client GPT reproduces.
+ *
+ * It returns null for anything outside the recognized families, leaving the model's own contributions
+ * untouched. It is generic (keyed on semantic cause families, never on a date, GUID or headline text
+ * literal) and it never fabricates a strong contribution from conditional/unconfirmed evidence.
+ */
+export function deriveContractTransmission(input: {
+    category: NewsCategory;
+    eventType: FfeEventType;
+    geoState: GeoState;
+    headline: string;
+    evidenceText: string;
+    conditional: boolean;
+    directShock: boolean;
+    modelAssets: ClassifiedAsset[];
+}): { contributions: ClassifiedAsset[]; family: string } | null {
+    const { category, eventType, geoState } = input;
+    if (category === 'ECONOMIC' || category === 'IRRELEVANT') return null;
+    const text = `${input.headline} ${input.evidenceText}`.toLowerCase();
+
+    // Conditional / preparatory / rumour language with no confirmed operational shock stays weak.
+    // Never synthesize a full contract transmission from an unconfirmed "mulls/plans/threat" line.
+    if (input.conditional && !input.directShock) return null;
+
+    const dirShock = input.directShock;
+
+    // (1) Crude supply / strategic-route disruption → OIL supply driver (§22, §18, §16, §14).
+    //     A confirmed vessel hit / route interruption / blockade / export halt transmits OIL up to
+    //     +1, CAD +0.5..+1, JPY -0.5 (importer/terms-of-trade), EUR -0.25 (importer/growth). A
+    //     confirmed reopening / clearance / restoration reverses the sign.
+    const crudeContext = /\b(crude|wti|brent|oil|opec|petroleum|tanker|tankers|refiner|pipeline|oilfield|oil field|export terminal|lng)\b/.test(text)
+        || /\b(strait of hormuz|hormuz|red sea|shipping route|strategic (?:shipping|route)|chokepoint)\b/.test(text);
+    const disruption = /\b(disrupt|closure|closed|blockade|block(?:ed|ing)?|attack|hit|struck|damage|casualt|halt|suspend|seiz|mine|projectile|explosion|interrupt|export (?:ban|halt|cut))\b/.test(text);
+    const restoration = /\b(reopen|re-open|restor|resum|cleared|removed|lifted|eased|de-?escalat|ceasefire|open(?:ed|ing)? (?:again|to traffic|normally))\b/.test(text);
+    if (crudeContext && dirShock && (disruption || restoration)) {
+        const bullish = disruption && !restoration;
+        const major = /\b(major|sustained|closure|closed|blockade|shut|halt|casualt|sank|sunk|severe|significant|damage)/.test(text);
+        const contributions = bullish
+            ? [
+                catalystAsset('OIL', major ? 1 : 0.5),
+                catalystAsset('CAD', major ? 1 : 0.5),
+                catalystAsset('JPY', -0.5),
+                catalystAsset('EUR', -0.25),
+            ]
+            : [
+                catalystAsset('OIL', major ? -1 : -0.5),
+                catalystAsset('CAD', major ? -1 : -0.5),
+                catalystAsset('JPY', 0.25),
+            ];
+        return { contributions, family: 'OIL_SUPPLY_SHOCK' };
+    }
+
+    // (2) Systemic geopolitical currency transmission is a REGIME-level quantity (§24, §35: "Geo is a
+    //     dominant-theme regime assessment. Do not sum every headline."). It is NOT scored per
+    //     headline here — otherwise the earlier oil-supply branch shadows most Middle-East escalations
+    //     and the only headlines reaching a per-event geo branch are scattered de-escalations, which
+    //     inverts the sign. The single net geo risk-premium driver is derived once from the final geo
+    //     regime by deriveGeoRiskPremium() and injected into Catalyst aggregation.
+
+    // (3) Central-bank / rate / yield repricing → the directly repriced currency (§12, §13).
+    //     A confirmed US-yield / Fed repricing also transmits to GOLD once (§21).
+    if (eventType === 'CENTRAL_BANK' || eventType === 'RATE_REPRICING' || eventType === 'YIELD_REPRICING') {
+        const hawkish = /\b(hawkish|tighten|rate hike|higher for longer|hike probability rising|cut probability falling|yields? (?:rise|higher|repric(?:e|ing) higher)|stronger inflation|inflation (?:above|hot|sticky))\b/.test(text);
+        const dovish = /\b(dovish|eas(?:e|ing)|rate cut|cut(?:ting)? rates?|hike probability falling|cut probability rising|yields? (?:fall|lower)|slower growth|disinflation)\b/.test(text);
+        if (hawkish === dovish) return null;
+        const strong = /\b(sharp|aggressive|major|fully pric|clear shift|material)\b/.test(text);
+        const magnitude = strong ? 1 : 0.5;
+        const sign = hawkish ? 1 : -1;
+        // Identify the repriced currency from the model's own assets or the declared cause.
+        const bankAsset = centralBankToAsset(input.headline)
+            ?? input.modelAssets.find((asset) => asset.asset !== 'GOLD' && asset.asset !== 'OIL' && asset.score !== 0)?.asset
+            ?? 'USD';
+        const contributions: ClassifiedAsset[] = [catalystAsset(bankAsset as CatalystCurrency, sign * magnitude)];
+        const isUsYield = bankAsset === 'USD' && (/\b(fed|fomc|powell|treasury|us yield|real yield|dollar)\b/.test(text) || eventType === 'YIELD_REPRICING');
+        if (isUsYield) contributions.push(catalystAsset('GOLD', sign * -0.5));
+        return { contributions, family: 'RATE_YIELD_REPRICING' };
+    }
+
+    // (4) China growth / industrial-metals and dairy transmissions (§19, §20).
+    if (eventType === 'CHINA_DEMAND') {
+        const stronger = /\b(stimulus|rebound|upgrade|improv|stronger|surge|recovery|beat)\b/.test(text);
+        const weaker = /\b(downgrade|deteriorat|weak|slump|contraction|miss|crisis|slow)\b/.test(text);
+        if (stronger !== weaker) {
+            const sign = stronger ? 1 : -1;
+            const major = /\b(major|large|strong|sharp|significant)\b/.test(text);
+            return { contributions: [catalystAsset('AUD', sign * (major ? 1 : 0.5)), catalystAsset('NZD', sign * 0.25)], family: 'CHINA_DEMAND' };
+        }
+    }
+    if (eventType === 'DAIRY') {
+        const up = /\b(rise|rises|gains?|surge|higher|up)\b/.test(text);
+        const down = /\b(fall|falls?|drop|plunge|lower|down)\b/.test(text);
+        if (up !== down) return { contributions: [catalystAsset('NZD', up ? 0.5 : -0.5)], family: 'DAIRY' };
+    }
+
+    return null;
+}
+
+/** Generic commodity inventory surprise — any agency wording with Actual/Forecast materiality. */
+export function deriveCommodityInventoryTransmission(input: {
+    headline: string;
+    actual?: string | null;
+    forecast?: string | null;
+    previous?: string | null;
+}): { contributions: ClassifiedAsset[]; family: string } | null {
+    const text = input.headline.toLowerCase();
+    if (!/\b(inventor(?:y|ies)|stockpile|stock change|storage)\b/.test(text)) return null;
+    if (!/\b(crude|oil|petroleum|gasoline|distillate|cushing|wti|brent)\b/.test(text)) return null;
+    const parsed = /\bactual\s+([^\s(]+)\s*\(\s*forecast\s+([^,)]*),\s*previous\s+([^)]*)\)/i.exec(input.headline);
+    const actualRaw = input.actual ?? parsed?.[1] ?? null;
+    const forecastRaw = input.forecast ?? parsed?.[2] ?? null;
+    if (!actualRaw || !forecastRaw || forecastRaw.trim() === '-' || forecastRaw.trim() === '') return null;
+    const actual = Number.parseFloat(String(actualRaw).replace(/[^0-9.+-]/g, ''));
+    const forecast = Number.parseFloat(String(forecastRaw).replace(/[^0-9.+-]/g, ''));
+    if (!Number.isFinite(actual) || !Number.isFinite(forecast)) return null;
+    const surprise = actual - forecast;
+    if (Math.abs(surprise) < 0.01) return null;
+    const build = actual > forecast;
+    const major = Math.abs(surprise) >= Math.max(Math.abs(forecast) * 0.5, 1);
+    const oilScore = build ? (major ? -0.5 : -0.25) : (major ? 0.5 : 0.25);
+    return {
+        family: 'COMMODITY_INVENTORY_SHOCK',
+        contributions: [
+            catalystAsset('OIL', oilScore),
+            catalystAsset('CAD', oilScore > 0 ? (major ? 0.5 : 0.25) : (major ? -0.5 : -0.25)),
+            catalystAsset('JPY', oilScore > 0 ? -0.25 : 0.25),
+            catalystAsset('EUR', oilScore > 0 ? -0.25 : 0.25),
+        ],
+    };
+}
+
+/**
+ * The single systemic geopolitical risk-premium Catalyst driver (client contract §24 + §35). Geo is
+ * a dominant-theme REGIME assessment judged from severity/credibility/persistence — not from a raw
+ * count of escalation vs de-escalation theme labels. The net regime score already embeds bounded
+ * de-escalation deductions from calculateGeopoliticalRisk().
+ */
+export function deriveGeoRiskPremium(input: {
+    score: number;
+    escalationCount: number;
+    deEscalationCount: number;
+    confirmed: boolean;
+    havenConfirmed?: boolean;
+    supportingThemes?: string[];
+    supportingEventIds?: string[];
+    supportingGuids?: string[];
+}): {
+    contributions: ClassifiedAsset[];
+    family: string;
+    provenance: { supportingThemes: string[]; supportingEventIds: string[]; supportingGuids: string[] };
+} | null {
+    if (!input.confirmed || input.score < 0.41) return null;
+    const contributions = [
+        catalystAsset('USD', 0.5),
+        catalystAsset('CHF', 0.5),
+        catalystAsset('EUR', -0.25),
+        catalystAsset('GBP', -0.25),
+        catalystAsset('AUD', -0.5),
+        catalystAsset('NZD', -0.5),
+    ];
+    if (input.havenConfirmed) contributions.push(catalystAsset('JPY', 0.5));
+    return {
+        contributions,
+        family: 'GEO_RISK_PREMIUM',
+        provenance: {
+            supportingThemes: [...new Set(input.supportingThemes ?? [])],
+            supportingEventIds: [...new Set(input.supportingEventIds ?? [])],
+            supportingGuids: [...new Set(input.supportingGuids ?? [])],
+        },
+    };
+}
+
+/** Accepted canonical evidence for the day-level US yield-repricing driver. */
+export type YieldRepricingEvidence = {
+    headline: string;
+    actual?: string | null;
+    previous?: string | null;
+    eventType?: string | null;
+    category?: string | null;
+    contractFamily?: string | null;
+    eventRelation?: string | null;
+    valid?: boolean;
+    catalystEligible?: boolean;
+    status?: string;
+    eventId?: string | null;
+    supportingGuids?: string[];
+};
+
+const YIELD_COMMENTARY_PATTERN = /\b(deutsche bank|goldman|barclays|nomura|analyst|commentary|research note|report says|according to sources|fjelite|stalemate pushes|pushes oil and)\b/i;
+const YIELD_FUNDING_ONLY_PATTERN = /\b(sofr|secured overnight financing|effective fed funds|fed funds rate)\b/i;
+const YIELD_US_BENCHMARK_PATTERN = /\b(us treasury|u\.s\. treasury|treasury yield|ust\b|us\s+\d+\s*(?:yr|year)|10[- ]?year treasury|long[- ]?end yields?|us real yields?|real yields?)\b/i;
+const YIELD_US_RATE_EVENT_TYPES = new Set(['YIELD_REPRICING', 'RATE_REPRICING', 'CENTRAL_BANK']);
+const YIELD_PRINCIPAL_FREE_RELATIONS = new Set(['IRRELEVANT', 'HISTORICAL_COMMENTARY', 'MACRO_RELEASE', 'FORECAST_UPCOMING', 'PRICE_REACTION', 'SAME_EVENT', 'CONFIRMATION']);
+
+function acceptedCanonicalYieldEvidence(item: YieldRepricingEvidence): boolean {
+    if (item.status && item.status !== 'ACTIVE') return false;
+    if (item.valid === false || item.catalystEligible === false) return false;
+    const relation = String(item.eventRelation ?? '').toUpperCase();
+    if (YIELD_PRINCIPAL_FREE_RELATIONS.has(relation)) return false;
+    if (item.category === 'ECONOMIC' || item.category === 'IRRELEVANT') return false;
+    if (item.eventType === 'COMMENTARY' || item.eventType === 'MACRO_RELEASE') return false;
+    if (YIELD_COMMENTARY_PATTERN.test(item.headline)) return false;
+    if (item.contractFamily === 'RATE_YIELD_REPRICING') return true;
+    if (item.eventType && YIELD_US_RATE_EVENT_TYPES.has(item.eventType)) {
+        return YIELD_US_BENCHMARK_PATTERN.test(item.headline)
+            || /\b(fed|fomc|powell|federal reserve)\b/i.test(item.headline);
+    }
+    return false;
+}
+
+/**
+ * The single US rate/yield repricing Catalyst driver (client contract §12, §13, §21, §47).
+ * Derived only from accepted ACTIVE canonical evidence — never from a side-channel scan of every
+ * headline. SOFR/funding-rate wiggles and analyst/bank commentary alone do not qualify.
+ */
+export function deriveYieldRepricingDriver(
+    evidence: YieldRepricingEvidence[],
+    _legacyOptions?: { looseFundingTicks?: boolean; fundingMinBps?: number; benchmarkMinBps?: number },
+): {
+    contributions: ClassifiedAsset[];
+    family: string;
+    direction: 'HAWKISH' | 'DOVISH';
+    reason: string;
+    supportingEventIds: string[];
+    supportingGuids: string[];
+} | null {
+    const benchmarkMinBps = 8;
+    let hawkish = 0;
+    let dovish = 0;
+    const reasons: string[] = [];
+    const supportingEventIds: string[] = [];
+    const supportingGuids: string[] = [];
+    for (const item of evidence.filter(acceptedCanonicalYieldEvidence)) {
+        const text = item.headline;
+        const actual = item.actual != null ? Number.parseFloat(String(item.actual)) : null;
+        const previous = item.previous != null ? Number.parseFloat(String(item.previous)) : null;
+        if (actual != null && previous != null && Number.isFinite(actual) && Number.isFinite(previous)) {
+            const bps = (actual - previous) * (Math.abs(actual) <= 1 && Math.abs(previous) <= 1 ? 100 : 1);
+            if (bps >= benchmarkMinBps) {
+                hawkish += 1;
+                reasons.push(`confirmed US yield print +${bps.toFixed(0)}bps (${actual} vs ${previous})`);
+                if (item.eventId) supportingEventIds.push(item.eventId);
+                supportingGuids.push(...(item.supportingGuids ?? []));
+                continue;
+            }
+            if (bps <= -benchmarkMinBps) {
+                dovish += 1;
+                reasons.push(`confirmed US yield print ${bps.toFixed(0)}bps (${actual} vs ${previous})`);
+                if (item.eventId) supportingEventIds.push(item.eventId);
+                supportingGuids.push(...(item.supportingGuids ?? []));
+                continue;
+            }
+        }
+        // Funding-rate-only prints never qualify — even when canonical.
+        if (YIELD_FUNDING_ONLY_PATTERN.test(text) && !YIELD_US_BENCHMARK_PATTERN.test(text)) continue;
+        if (!YIELD_US_BENCHMARK_PATTERN.test(text) && !/\b(fed|fomc|powell|federal reserve)\b/i.test(text)) continue;
+        const pcts = [...text.matchAll(/(-?\d+(?:\.\d+)?)\s*%/g)].map((m) => Number.parseFloat(m[1]!));
+        if (pcts.length >= 2 && YIELD_US_BENCHMARK_PATTERN.test(text)) {
+            const bps = (pcts[0]! - pcts[1]!) * 100;
+            if (bps >= benchmarkMinBps) {
+                hawkish += 1;
+                reasons.push(`confirmed US benchmark yield +${bps.toFixed(0)}bps: "${text.slice(0, 60)}"`);
+                if (item.eventId) supportingEventIds.push(item.eventId);
+                supportingGuids.push(...(item.supportingGuids ?? []));
+                continue;
+            }
+            if (bps <= -benchmarkMinBps) {
+                dovish += 1;
+                reasons.push(`confirmed US benchmark yield ${bps.toFixed(0)}bps: "${text.slice(0, 60)}"`);
+                if (item.eventId) supportingEventIds.push(item.eventId);
+                supportingGuids.push(...(item.supportingGuids ?? []));
+                continue;
+            }
+        }
+        const hawkText = /\b(hawkish|higher for longer|tighten(?:ing)?|hike(?:s)? (?:odds|probability|bets) (?:rising|up|higher)|cut(?:s)? (?:odds|probability|bets) (?:falling|down|lower)|sticky inflation|hot inflation|inflation (?:above|hotter|surpris\w+ higher)|yields? (?:jump|surge|spike|rise|higher|climb|reprice(?:d|s)? higher))\b/i.test(text);
+        const dovText = /\b(dovish|rate cut(?:s)?|easing|cut(?:s)? (?:odds|probability|bets) (?:rising|up|higher)|hike(?:s)? (?:odds|probability|bets) (?:falling|down|lower)|disinflation|cooling inflation|yields? (?:fall|drop|lower|decline|slide|reprice(?:d|s)? lower))\b/i.test(text);
+        if (hawkText && !dovText) {
+            hawkish += 1;
+            reasons.push(`confirmed US yield repricing: "${text.slice(0, 80)}"`);
+            if (item.eventId) supportingEventIds.push(item.eventId);
+            supportingGuids.push(...(item.supportingGuids ?? []));
+        } else if (dovText && !hawkText) {
+            dovish += 1;
+            reasons.push(`confirmed US yield easing: "${text.slice(0, 80)}"`);
+            if (item.eventId) supportingEventIds.push(item.eventId);
+            supportingGuids.push(...(item.supportingGuids ?? []));
+        }
+    }
+    if (hawkish === dovish) return null;
+    const direction = hawkish > dovish ? 'HAWKISH' : 'DOVISH';
+    const sign = direction === 'HAWKISH' ? 1 : -1;
+    return {
+        contributions: [catalystAsset('USD', sign * 0.5), catalystAsset('GOLD', sign * -0.5)],
+        family: 'RATE_YIELD_REPRICING',
+        direction,
+        reason: reasons.join('; '),
+        supportingEventIds: [...new Set(supportingEventIds)],
+        supportingGuids: [...new Set(supportingGuids)],
+    };
+}
+
 function coerceResult(
     raw: unknown,
     index: number,
     headline: string,
 ): Omit<ClassifiedHeadline, 'duplicateOfExistingId' | 'duplicateOfBatchIndex'> | null {
-    if (!raw || typeof raw !== 'object') return null;
-    const r = raw as Record<string, unknown>;
+    return normalizeAiClassification(raw, index, headline);
+}
 
-    const category = String(r.category ?? '').toUpperCase() as NewsCategory;
-    if (!['ECONOMIC', 'DRIVER', 'GEOPOLITICAL', 'IRRELEVANT'].includes(category)) return null;
-
-    const impactRaw = String(r.impact ?? 'Low').toLowerCase();
-    const impact: NewsImpact = impactRaw.startsWith('high') ? 'High' : impactRaw.startsWith('med') ? 'Medium' : 'Low';
-
-    const assetsIn = Array.isArray(r.assets) ? r.assets : [];
-    const assets: ClassifiedAsset[] = [];
-    for (const a of assetsIn) {
-        if (!a || typeof a !== 'object') continue;
-        const o = a as Record<string, unknown>;
-        const asset = String(o.asset ?? '').toUpperCase().replace('OIL (WTI)', 'OIL').replace('WTI', 'OIL');
-        if (!TRACKED_ASSETS.includes(asset as TrackedAsset)) continue;
-
-        const biasRaw = String(o.bias ?? 'Neutral');
-        const biasGuess: AssetBias = /bull/i.test(biasRaw)
-            ? 'Bullish'
-            : /bear/i.test(biasRaw)
-                ? 'Bearish'
-                : /mix/i.test(biasRaw)
-                    ? 'Mixed'
-                    : 'Neutral';
-
-        let rawScore = Number(o.score);
-        if (!Number.isFinite(rawScore)) rawScore = 0;
-        rawScore = Math.max(-1, Math.min(1, rawScore));
-        rawScore = Math.round(rawScore * 4) / 4;
-
-        const aligned = alignScoreToImpact(impact, biasGuess, rawScore);
-        assets.push({ asset: asset as TrackedAsset, bias: aligned.bias, score: aligned.score });
+async function adjudicateClassifications(
+    rows: Array<{ index: number; headline: string; proposal: ClassifiedHeadline }>,
+    options: { jobId?: string | null; ingestId?: string | null; recordUsage?: boolean },
+): Promise<Map<number, ClassifiedHeadline>> {
+    const out = new Map<number, ClassifiedHeadline>();
+    if (!rows.length) return out;
+    let validationFailure: string | null = null;
+    const response = await requestJson(
+        ADJUDICATION_SYSTEM_PROMPT,
+        rows.map((row, index) => `LOCAL_INDEX=${index}\nHEADLINE: ${row.headline}\nPROPOSED: ${JSON.stringify(row.proposal)}`).join('\n\n'),
+        {
+            operationType: 'semantic_adjudication',
+            jobId: options.jobId,
+            ingestId: options.ingestId,
+            schema: classificationResponseSchema(rows.length),
+            schemaName: 'ffe_semantic_adjudication',
+            // The canonical theme decision is intentionally structured, so reserve enough
+            // output for every row instead of letting a valid response truncate and trigger
+            // an expensive split/fallback cycle.
+            maxOutputTokens: classificationOutputTokens(rows.length),
+            recordUsage: options.recordUsage,
+            validate: (value) => {
+                validationFailure = completeClassificationResponseError(value, rows.length);
+                return validationFailure === null;
+            },
+        },
+    );
+    if (!response) {
+        logger.warn('[AIProvider] Bounded semantic adjudication unavailable', { reason: validationFailure ?? 'provider failure' });
+        return out;
     }
-
-    const sanitized = sanitizeClassification(headline, {
-        category,
-        impact,
-        assets,
-        summary: String(r.summary ?? ''),
-    });
-    const decision = deriveFfeDecision(headline, sanitized.category, sanitized.impact, sanitized.assets);
-
-    return {
-        index,
-        category: sanitized.category,
-        impact: sanitized.impact,
-        assets: sanitized.assets,
-        summary: sanitized.summary,
-        driverTheme: String(r.driverTheme ?? decision.driverTheme ?? inferCausalTheme(headline, sanitized.category) ?? ''),
-        causalThemeId: String(r.causalThemeId ?? decision.causalThemeId ?? ''),
-        geoState: (String(r.geoState ?? decision.geoState ?? inferGeoState(headline)).toUpperCase() as GeoState),
-        semanticDirection: (String(r.semanticDirection ?? decision.semanticDirection ?? 'NEUTRAL').toUpperCase() as SemanticDirection),
-        semanticStrength: (String(r.semanticStrength ?? decision.semanticStrength ?? 'NONE').toUpperCase() as SemanticStrength),
-        directAssetSignals: decision.directAssetSignals,
-        transmittedAssetSignals: decision.transmittedAssetSignals,
-        signValidationStatus: decision.signValidationStatus,
-        catalystVisible: sanitized.catalystVisible,
-    };
+    const parsed = response.parsed;
+    for (const raw of Array.isArray(parsed.results) ? parsed.results : []) {
+        const localIndex = Number((raw as Record<string, unknown>)?.i);
+        const target = rows[localIndex];
+        if (!target) continue;
+        const normalized = normalizeAiClassification(raw, target.index, target.headline);
+        if (!normalized) continue;
+        normalized.decisionSource = 'ai_adjudication';
+        normalized.provider = response.provider;
+        normalized.model = response.model;
+        normalized.needsReview = Number(normalized.confidence ?? 0) < 0.45 || normalized.signValidationStatus === 'FAILED';
+        out.set(target.index, normalized as ClassifiedHeadline);
+    }
+    return out;
 }
 
 /**
@@ -2054,7 +3243,7 @@ function coerceResult(
 export async function classifyHeadlines(
     headlines: Array<string | HeadlineInput>,
     existingTopics: ExistingTopic[] = [],
-    options: { operationType?: AiOperationType; jobId?: string | null; ingestId?: string | null } = {},
+    options: { operationType?: AiOperationType; jobId?: string | null; ingestId?: string | null; recordUsage?: boolean; existingThemes?: ExistingCanonicalTheme[] } = {},
 ): Promise<ClassifiedHeadline[]> {
     if (headlines.length === 0) return [];
 
@@ -2066,10 +3255,34 @@ export async function classifyHeadlines(
           existingTopics.map((t) => formatPromptHeadlineLine(t.id, { text: t.text, publishedAt: t.publishedAt })).join('\n')
         : '\n\nEXISTING topics already stored today: (none yet)';
 
+    const activeThemeCandidates = selectCanonicalThemeCandidates(options.existingThemes, headlineTexts);
+    const activeThemeBlock = activeThemeCandidates.length
+        ? '\n\nACTIVE CANONICAL THEMES (internal ids are code-owned; reference only exact ids):\n' +
+          activeThemeCandidates.map((theme) => {
+              const assets = theme.assets.map((asset) => `${asset.asset}:${asset.score}`).join(',');
+              const updated = theme.lastUpdatedAt ? ` updated=${dubaiHhMm(theme.lastUpdatedAt) ?? ''}` : '';
+              const eventIds = theme.supportingEventIds?.length ? ` events=${theme.supportingEventIds.join(',')}` : '';
+              return `${theme.id} | key=${theme.themeKey} | label=${theme.label} | state=${theme.status} | score=[${assets}]${updated}${eventIds} | ${theme.summary}`;
+          }).join('\n')
+        : '\n\nACTIVE CANONICAL THEMES: (none yet; CREATE_NEW_THEME is allowed)';
+
+    const canonicalEvents = activeThemeCandidates.flatMap((theme) => theme.events ?? [])
+        .filter((event, index, all) => all.findIndex((candidate) => candidate.id === event.id) === index)
+        .sort((a, b) => new Date(String(b.lastSeenAt ?? 0)).getTime() - new Date(String(a.lastSeenAt ?? 0)).getTime());
+    const activeEventBlock = canonicalEvents.length
+        ? '\n\nCANONICAL EVENT STATE (use exact event ids for every non-NEW_EVENT relation):\n' +
+          canonicalEvents.map((event) => {
+              const contributions = event.contributions.map((asset) => `${asset.asset}:${asset.score}/${asset.role ?? 'DIRECT'}`).join(',');
+              const supports = event.supportingGuids?.length ? ` supporting=${event.supportingGuids.join(',')}` : '';
+              const confirms = event.confirmationGuids?.length ? ` confirmations=${event.confirmationGuids.join(',')}` : '';
+              return `${event.id} | theme=${event.themeId ?? 'unclassified'} | relation=${event.relation ?? 'NEW_EVENT'} | state=${event.status} | type=${event.eventType ?? 'OTHER'} | [${dubaiHhMm(event.lastSeenAt) ?? ''}] ${event.headline} | cause=${event.fundamentalCause ?? ''} | reaction=${event.observedMarketReaction ?? ''} | contributions=[${contributions}]${supports}${confirms}`;
+          }).join('\n')
+        : '\n\nCANONICAL EVENT STATE: (none yet; NEW_EVENT is allowed)';
+
     const userContent =
         'Classify these headlines (indices are for THIS batch; times are Asia/Dubai HH:MM when known):\n' +
         normalized.map((h, i) => formatPromptHeadlineLine(i, h)).join('\n') +
-        existingBlock;
+        existingBlock + activeThemeBlock + activeEventBlock;
 
     let validationFailure: string | null = null;
     const response = await requestJson(SYSTEM_PROMPT, userContent, {
@@ -2078,11 +3291,13 @@ export async function classifyHeadlines(
         ingestId: options.ingestId,
         schema: classificationResponseSchema(headlineTexts.length),
         schemaName: 'market_driver_classification',
-        maxOutputTokens: ENV.AI_MAX_OUTPUT_TOKENS,
+        maxOutputTokens: classificationOutputTokens(headlineTexts.length),
+        recordUsage: options.recordUsage,
         // A complete result per input is required. A malformed/partial primary response is sent
         // to the bounded Groq fallback rather than being silently persisted as partial data.
         validate: (value) => {
             validationFailure = completeClassificationResponseError(value, headlineTexts.length);
+            if (validationFailure) logger.warn('[AIProvider] Classification structural validation failed', { reason: validationFailure });
             return validationFailure === null;
         },
     });
@@ -2130,7 +3345,26 @@ export async function classifyHeadlines(
         const idx = Number((raw as Record<string, unknown>)?.i);
         if (!Number.isInteger(idx) || idx < 0 || idx >= headlineTexts.length) continue;
         const coerced = coerceResult(raw, idx, headlineTexts[idx]!);
-        if (coerced) baseByIndex.set(idx, coerced);
+        if (coerced) {
+            coerced.provider = response.provider;
+            coerced.model = response.model;
+            coerced.decisionSource = response.provider === 'groq' ? 'ai_fallback' : 'ai_primary';
+            baseByIndex.set(idx, coerced);
+        }
+    }
+
+    // One bounded adjudication pass handles only low-confidence or internally contradictory AI
+    // decisions. It never recurses and never runs on restart replay or healthy rows.
+    const uncertain = [...baseByIndex.entries()]
+        .map(([index, proposal]) => ({ index, headline: headlineTexts[index]!, proposal: proposal as ClassifiedHeadline }))
+        .filter((row) => Number(row.proposal.confidence ?? 0) < 0.45
+            || row.proposal.signValidationStatus === 'FAILED'
+            || hasAiDecisionContradiction(row.proposal)
+            || hasReasonScoreContradiction(row.proposal)
+            || (row.proposal.themeDecision?.action.endsWith('EXISTING_THEME') && !row.proposal.themeDecision.themeId));
+    if (uncertain.length > 0 && options.operationType !== 'semantic_adjudication') {
+        const adjudicated = await adjudicateClassifications(uncertain, options);
+        for (const [index, value] of adjudicated) baseByIndex.set(index, value);
     }
 
     const batchDuplicateOf = new Map<number, number>();

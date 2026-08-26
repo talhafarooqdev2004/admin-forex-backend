@@ -1,5 +1,5 @@
 /**
- * Live feed coverage audit: FJ RSS + FXStreet RSS vs today's board.
+ * Live feed coverage audit: FinancialJuice RSS vs today's board.
  * Thin wrapper around the SAME self-healing audit the production cron runs every 30 min
  * (src/services/marketDriverCoverageAudit.service.ts) — one source of truth, no drift
  * between what CI checks and what production enforces.
@@ -37,5 +37,5 @@ if (!result.pass) {
     }
     process.exit(1);
 }
-console.log('PASS — every rule-required live FJ/FXS headline is present and board-visible.');
+console.log('PASS — every rule-required live FinancialJuice headline is present and board-visible.');
 process.exit(0);

@@ -59,8 +59,8 @@ function normalizedTitle(title: string): string {
 
 function makeItem(group: string, index: number, title: string, publishedAt = new Date()): TestItem {
     const sourceId = `${sourcePrefix}:${group}`.slice(0, 80);
-    const guid = `${group}:guid:${index}`;
-    const source = 'PreOpenAIVerification';
+    const guid = `${namespace}:${group}:guid:${index}`;
+    const source = 'FinancialJuice';
     const pubDate = publishedAt.toISOString();
     const sourceKey = createHash('sha256').update(`${sourceId}\n${guid}`).digest('hex');
     const contentHash = createHash('sha256')
@@ -75,10 +75,26 @@ function providerResult(user: string, schemaName: string): Record<string, unknow
     return {
         results: [...new Set(indices)].map((i) => ({
             i,
+            itemId: String(i),
             category: 'DRIVER',
             impact: 'High',
-            assets: [{ asset: 'USD', bias: 'Bullish', score: 1 }],
+            assets: [{ asset: 'USD', bias: 'Bullish', score: 1, role: 'DIRECT', reason: 'Synthetic readiness driver' }],
             summary: 'Synthetic readiness verification',
+            driverTheme: 'SYNTHETIC_READINESS_THEME',
+            causalThemeId: 'SYNTHETIC_READINESS_THEME',
+            geoState: 'IRRELEVANT',
+            semanticDirection: 'BULLISH',
+            semanticStrength: 'STRONG',
+            fundamentalCause: 'Synthetic readiness driver',
+            eventRelation: 'NEW_EVENT',
+            eventDuplicateOf: null,
+            causalThemeSummary: 'Synthetic readiness driver',
+            themeAction: 'CREATE',
+            macro: { eligible: false, family: null, directionSummary: null, assetScores: [] },
+            catalystEligible: true,
+            confidence: 1,
+            needsReview: false,
+            reason: 'Synthetic readiness verification',
         })),
         duplicateGroups: [],
         existingDuplicates: [],
@@ -167,6 +183,11 @@ async function cleanupNamespace(): Promise<void> {
         select: { id: true },
     });
     const jobIds = jobs.map((job) => job.id);
+    const sessionJobs = await prisma.marketDriverSessionSynthesisJob.findMany({
+        where: { ingest_id: { startsWith: namespace } },
+        select: { id: true, snapshot_id: true },
+    });
+    const sessionSnapshotIds = sessionJobs.map((job) => job.snapshot_id).filter((id): id is string => Boolean(id));
     await prisma.aiUsageRecord.deleteMany({
         where: {
             OR: [
@@ -176,10 +197,24 @@ async function cleanupNamespace(): Promise<void> {
         },
     });
     if (jobIds.length) await prisma.aiClassificationJob.deleteMany({ where: { id: { in: jobIds } } });
+    if (sessionSnapshotIds.length) await prisma.marketDriverSessionSnapshot.deleteMany({ where: { id: { in: sessionSnapshotIds } } });
+    if (sessionJobs.length) await prisma.marketDriverSessionSynthesisJob.deleteMany({ where: { id: { in: sessionJobs.map((job) => job.id) } } });
     await prisma.marketDriverProcessingRun.deleteMany({ where: { ingest_id: { startsWith: namespace } } });
-    await prisma.marketDriverNews.deleteMany({
-        where: { OR: [{ source_id: { startsWith: sourcePrefix } }, { source: 'PreOpenAIVerification' }] },
+    const syntheticEvents = await prisma.marketDriverCanonicalEvent.findMany({
+        where: { OR: [{ source_id: { startsWith: sourcePrefix } }, { source_guid: { startsWith: namespace } }] },
+        select: { id: true, canonical_theme_id: true },
     });
+    const syntheticThemeIds = [...new Set(syntheticEvents.map((event) => event.canonical_theme_id).filter((id): id is string => Boolean(id)))];
+    await prisma.marketDriverNews.deleteMany({
+        where: { OR: [{ source_id: { startsWith: sourcePrefix } }, { guid: { startsWith: namespace } }] },
+    });
+    if (syntheticThemeIds.length) {
+        await prisma.marketDriverCanonicalThemeRevision.deleteMany({ where: { theme_id: { in: syntheticThemeIds } } });
+        await prisma.marketDriverCanonicalTheme.deleteMany({ where: { id: { in: syntheticThemeIds } } });
+    }
+    if (syntheticEvents.length) {
+        await prisma.marketDriverCanonicalEvent.deleteMany({ where: { id: { in: syntheticEvents.map((event) => event.id) } } });
+    }
 }
 
 function economicItems(group: string, count: number, offset = 0): TestItem[] {
@@ -268,8 +303,8 @@ async function main(): Promise<void> {
     const scraperGuidA = `${namespace}:scraper-guid-a`;
     const scraperGuidB = `${namespace}:scraper-guid-b`;
     const scraperXml = `<?xml version="1.0"?><rss><channel>
-        <item><guid>${scraperGuidA}</guid><title>EUR/USD advances after ECB maintains restrictive guidance</title><author>PreOpenAIVerification</author><pubDate>${new Date().toUTCString()}</pubDate></item>
-        <item><guid>${scraperGuidB}</guid><title>USD/JPY falls after Bank of Japan signals tighter policy</title><author>PreOpenAIVerification</author><pubDate>${new Date().toUTCString()}</pubDate></item>
+        <item><guid>${scraperGuidA}</guid><title>EUR/USD advances after ECB maintains restrictive guidance</title><author>FinancialJuice</author><pubDate>${new Date().toUTCString()}</pubDate></item>
+        <item><guid>${scraperGuidB}</guid><title>USD/JPY falls after Bank of Japan signals tighter policy</title><author>FinancialJuice</author><pubDate>${new Date().toUTCString()}</pubDate></item>
     </channel></rss>`;
     const scraperOutputOne = await runScraperChild(scraperXml);
     const scraperProcessStart = calls.length;
@@ -333,14 +368,14 @@ async function main(): Promise<void> {
     });
     const hiddenStart = calls.length;
     const hiddenRepair = await coverage.runMarketDriverCoverageAudit({ force: true });
-    assert.equal(hiddenRepair.healedHidden, 1);
+    assert.equal(hiddenRepair.healedHidden, 0);
     assert.deepEqual(operationCounts(hiddenStart), {});
 
     await prisma.marketDriverNews.delete({ where: { source_key: coverageItem.sourceKey } });
     const missingStart = calls.length;
     const missingRepair = await coverage.runMarketDriverCoverageAudit({ force: true });
     assert.equal(missingRepair.healedMissing, 1);
-    assert.deepEqual(operationCounts(missingStart), { coverage_repair: 1 });
+    assert.deepEqual(operationCounts(missingStart), { coverage_repair: 1, semantic_dedup: 1, session_synthesis: 1 });
     const postRepairStart = calls.length;
     for (let cycle = 0; cycle < 3; cycle += 1) {
         assert.equal((await coverage.runMarketDriverCoverageAudit({ force: true })).pass, true);
@@ -410,7 +445,10 @@ async function main(): Promise<void> {
         assert.equal(result.fresh, count);
         assert.equal(result.stored, count);
         assert.equal(counts.classification, Math.ceil(count / 12));
-        assert.equal(counts.semantic_dedup ?? 0, 0);
+        // Semantic deduplication is intentionally limited to the newly inserted rows. The
+        // recent-window worker processes at most RECLASSIFY_BATCH - 2 (8) candidates per
+        // provider call; existing rows are context only and are never reprocessed.
+        assert.equal(counts.semantic_dedup ?? 0, Math.ceil(count / 8));
         batchResults[String(count)] = counts.classification;
     }
     const existing = economicItems('mix-existing', 12);
@@ -521,8 +559,11 @@ async function main(): Promise<void> {
     const fallbackPersist = await board.ingestMarketDriverRssItems([fallbackItem], { ingestId: `${namespace}:provider-permanent` });
     assert.equal(fallbackPersist.stored, 1);
     assert.equal(await prisma.marketDriverNews.count({ where: { source_key: fallbackItem.sourceKey } }), 1);
-    assert.deepEqual(transportCalls.map((call) => call.provider), ['openai', 'groq']);
-    fallbackResults.permanentPrimary = { primaryAttempts: 1, fallbackAttempts: 1, rowsPersisted: 1 };
+    // The newly inserted visible row also enters its bounded recent-window semantic pass and
+    // the changed ledger enters Session Brain, so the same primary/fallback policy is exercised
+    // once for classification, deduplication, and session synthesis.
+    assert.deepEqual(transportCalls.map((call) => call.provider), ['openai', 'groq', 'openai', 'groq', 'openai', 'groq']);
+    fallbackResults.permanentPrimary = { primaryAttempts: 1, fallbackAttempts: 1, semanticDedupAttempts: 1, semanticDedupFallbacks: 1, rowsPersisted: 1 };
 
     transportCalls = [];
     classifier.setAiProviderTransportOverrideForTests(async (request) => {
@@ -593,7 +634,7 @@ async function main(): Promise<void> {
         cachedInputNotDoubleCountedCostUsd: primaryUsage?.estimated_total_cost?.toString(),
         retryAttemptRows: retryRows.length,
         missingMetadataStoredAsNull: true,
-        operationsVerified: ['classification', 'semantic_dedup', 'coverage_repair'],
+        operationsVerified: ['classification', 'semantic_dedup', 'coverage_repair', 'session_synthesis'],
     };
 
     report.instrumentation = {

@@ -84,14 +84,14 @@ assert.deepEqual(aggregates.get('USD'), {
     themes: ['FED_DOVISH_REPRICING', 'US_YIELD_REPRICING'],
 });
 
-// Geo risk uses unique themes and five code-controlled components, never headline count/prices.
+// Geo risk uses a dominant canonical theme with bounded metrics, never headline count/prices.
 const geoResult = calculateGeopoliticalRisk([
-    { headline: 'Missile strike threatens Hormuz shipping', impact: 'High', summary: null, assets: [{ asset: 'OIL', score: 1 }], published_at: new Date('2026-08-17T10:00:00Z'), created_at: new Date('2026-08-17T10:00:00Z'), causal_theme_id: 'HORMUZ_SUPPLY_RISK', geo_state: 'ESCALATION' },
-    { headline: 'Same Hormuz incident reported by another wire', impact: 'High', summary: null, assets: [{ asset: 'OIL', score: 1 }], published_at: new Date('2026-08-17T10:01:00Z'), created_at: new Date('2026-08-17T10:01:00Z'), causal_theme_id: 'HORMUZ_SUPPLY_RISK', geo_state: 'ESCALATION' },
+    { headline: 'Missile strike threatens Hormuz shipping', impact: 'High', summary: null, assets: [{ asset: 'OIL', score: 1 }], published_at: new Date('2026-08-17T10:00:00Z'), created_at: new Date('2026-08-17T10:00:00Z'), causal_theme_id: 'HORMUZ_SUPPLY_RISK', geo_state: 'ESCALATION', geo_components: { energyHormuzRisk: 0.1 } },
+    { headline: 'Same Hormuz incident reported by another wire', impact: 'High', summary: null, assets: [{ asset: 'OIL', score: 1 }], published_at: new Date('2026-08-17T10:01:00Z'), created_at: new Date('2026-08-17T10:01:00Z'), causal_theme_id: 'HORMUZ_SUPPLY_RISK', geo_state: 'ESCALATION', geo_components: { energyHormuzRisk: 0.1 } },
 ]);
 assert.equal(geoResult.eventCount, 1);
 assert.equal(geoResult.components.energyHormuzRisk, 0.1);
-assert.equal(geoResult.score, 0.25);
-assert.equal(geoResult.band, 'Low Risk');
+assert.equal(geoResult.score, 0.31);
+assert.equal(geoResult.band, 'Watch');
 
 console.log('All FFE deterministic decision-layer checks passed.');

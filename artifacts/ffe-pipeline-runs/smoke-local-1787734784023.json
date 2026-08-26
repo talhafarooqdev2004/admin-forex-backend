@@ -1,0 +1,27 @@
+{
+  "payload": {
+    "run_id": "smoke-local-1787734784023",
+    "business_day": "2026-08-26",
+    "input_hash": "smoke-local-webhook-test",
+    "source_units": [
+      {
+        "guid": "smoke00001",
+        "time": "26/08/2026, 12:00",
+        "headline": "Local webhook smoke test — no ChatGPT",
+        "source_label": "FinancialJuice"
+      }
+    ],
+    "pipeline_status": "failed",
+    "failed_stage": "RSS_FAILED",
+    "error": "local webhook smoke test only"
+  },
+  "result": {
+    "run_id": "smoke-local-1787734784023",
+    "business_day": "2026-08-26",
+    "input_hash": "smoke-local-webhook-test",
+    "final_status": "RSS_FAILED",
+    "parse_status": "not_attempted",
+    "persistence_status": "not_attempted",
+    "message": "local webhook smoke test only"
+  }
+}

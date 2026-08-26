@@ -45,6 +45,9 @@ function normalizedItems(items: Array<DeferredMarketDriverItem | null | undefine
     const out: DeferredMarketDriverItem[] = [];
     for (const item of items) {
         if (!item || !item.guid || !item.title || !item.pubDate) continue;
+        // Queue recovery is a processing boundary too. Historical non-authoritative jobs may
+        // remain in the database, but they must never reach classification or semantic AI.
+        if (String(item.source ?? '').trim().toLowerCase() !== ENV.MARKET_DRIVER_SOURCE) continue;
         const identity = item.sourceKey || `${item.sourceId || 'unknown'}:${item.guid}`;
         if (seen.has(identity)) continue;
         seen.add(identity);

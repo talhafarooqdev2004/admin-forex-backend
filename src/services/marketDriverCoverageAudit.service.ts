@@ -4,24 +4,22 @@ import { prisma } from '../lib/prisma.js';
 import { logger } from '../utils/logger.util.js';
 import {
     isBoardVisibleClassification,
-    sanitizeClassification,
 } from './groqClassifier.service.js';
 import {
+    FFE_NEWS_SOURCE,
     getMarketDriverIngestIdleMs,
     ingestMarketDriverRssItems,
     isMarketDriverIngestRunning,
     marketDayKey,
 } from './marketDriverBoard.service.js';
+import { evaluateAndCacheGeopoliticalRisk } from './geopoliticalRisk.service.js';
 
 /**
  * Self-healing coverage audit — the automation that replaces the user's manual daily check.
  *
- * Every run: fetch FJ + FXStreet feeds → compute which live-day items the doc rules REQUIRE to
- * be board-visible (same `sanitizeClassification` families the ingest pipeline uses — one source
- * of truth) → verify each against `market_driver_news` → and for any gap, heal it in place:
- *   MISSING row            → ingest through the normal pipeline (classify + sanitize + store + lock)
- *   HIDDEN (misclassified) → apply the rule-recovered classification and LOCK (an ADD)
- *   HIDDEN (bad duplicate) → promote + lock when no locked principal covers the story
+ * Every run: fetch the FinancialJuice feed → verify exact/source identities against
+ * `market_driver_news` → send genuine missing identities through the normal durable AI
+ * classification pipeline. The audit never invents semantic decisions or rewrites an existing row.
  * Locked rows are never rewritten — once shown on News Headline they stay for the UAE day.
  * Then re-verify. Only gaps that survive healing are reported as failures (ERROR log + status).
  *
@@ -36,13 +34,8 @@ const COVERAGE_AUDIT_COOLDOWN_MS = 2 * 60 * 1000;
 /** Same feeds + guid prefixes as forex-scraping's marketDriverRss.service.js — a healed MISSING
  *  item stores under the guid the scraper would later send, so no double-ingest. */
 const AUDIT_FEEDS = [
-    { name: 'FJ_RSS', url: 'https://www.financialjuice.com/feed.ashx?xml=RSS', source: 'FinancialJuice', sourceId: 'financialjuice:rss', guidPrefix: '' },
-    { name: 'FXS_news', url: 'https://www.fxstreet.com/rss/news', source: 'FXStreet', sourceId: 'fxstreet:news', guidPrefix: 'fxs-news:' },
-    { name: 'FXS_main', url: 'https://www.fxstreet.com/rss', source: 'FXStreet', sourceId: 'fxstreet:root', guidPrefix: 'fxs:' },
-    { name: 'FXS_crypto', url: 'https://www.fxstreet.com/rss/crypto', source: 'FXStreet', sourceId: 'fxstreet:crypto', guidPrefix: 'fxs-crypto:' },
+    { name: 'FJ_RSS', url: 'https://www.financialjuice.com/feed.ashx?xml=RSS', source: FFE_NEWS_SOURCE, sourceId: 'financialjuice:rss', guidPrefix: '' },
 ] as const;
-
-const FEED_PRIORITY: Record<string, number> = { FJ_RSS: 0, FXS_news: 1, FXS_main: 2, FXS_crypto: 3 };
 const FETCH_TIMEOUT_MS = 20000;
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
@@ -100,7 +93,6 @@ const rssParser = new XMLParser({ ignoreAttributes: false, trimValues: true });
 function stripSourcePrefix(title: string): string {
     return title
         .replace(/^FinancialJuice:\s*/i, '')
-        .replace(/^FXStreet:\s*/i, '')
         .trim();
 }
 
@@ -146,17 +138,16 @@ async function fetchFeed(feed: (typeof AUDIT_FEEDS)[number]): Promise<FeedItem[]
             const it = raw as Record<string, unknown>;
             const title = stripSourcePrefix(String(it.title ?? '').trim());
             if (!title) continue;
-            const author = it.author ? String(it.author).trim() : feed.source;
             const pubDate = it.pubDate ? String(it.pubDate).trim() : null;
             const rawGuid = extractGuid(it);
             const stableId = rawGuid || createHash('sha256')
-                .update(`${feed.sourceId}\n${author || feed.source}\n${pubDate || ''}\n${normalizeTitle(title)}`)
+                .update(`${feed.sourceId}\n${feed.source}\n${pubDate || ''}\n${normalizeTitle(title)}`)
                 .digest('hex');
             out.push({
                 guid: `${feed.guidPrefix}${stableId}`.slice(0, 500),
                 sourceId: feed.sourceId,
                 title,
-                source: author || feed.source,
+                source: feed.source,
                 feedName: feed.name,
                 pubDate,
                 norm: normalizeTitle(title),
@@ -171,12 +162,16 @@ async function fetchFeed(feed: (typeof AUDIT_FEEDS)[number]): Promise<FeedItem[]
 /** Rule-required = the universal families say this item must be board-visible even if the
  *  classifier had labeled it IRRELEVANT/Low — identical recovery semantics to the pipeline. */
 function ruleRecovery(title: string) {
-    return sanitizeClassification(title, {
-        category: 'IRRELEVANT',
-        impact: 'Low',
+    // Coverage repair is mechanical only. A missing row is re-ingested through the normal
+    // durable AI classification job; this audit must not invent semantic decisions from text.
+    void title;
+    return {
+        category: 'IRRELEVANT' as const,
+        impact: 'Low' as const,
         assets: [],
         summary: '',
-    });
+        catalystEligible: false,
+    };
 }
 
 function feedItemMustShowOnBoard(title: string): boolean {
@@ -218,7 +213,7 @@ function coveredByVisiblePrincipal(item: FeedItem, dbRows: DbRow[]): boolean {
 
 async function loadDayRows(liveDay: string): Promise<DbRow[]> {
     const rows = await prisma.marketDriverNews.findMany({
-        where: { day_key: liveDay },
+        where: { day_key: liveDay, source: FFE_NEWS_SOURCE },
         select: {
             id: true,
             headline: true,
@@ -333,9 +328,9 @@ async function runAuditOnce(now: Date, ingestId?: string): Promise<CoverageAudit
         }
     }
 
-    // Unique by normalized title, preferring FJ over FXS mirrors of the same story.
+    // The authoritative feed is already source-scoped; normalize duplicate titles within it.
     const byNorm = new Map<string, FeedItem>();
-    for (const it of all.sort((a, b) => (FEED_PRIORITY[a.feedName] ?? 9) - (FEED_PRIORITY[b.feedName] ?? 9))) {
+    for (const it of all) {
         if (!byNorm.has(it.norm)) byNorm.set(it.norm, it);
     }
     const live = [...byNorm.values()].filter((i) => {
@@ -343,7 +338,10 @@ async function runAuditOnce(now: Date, ingestId?: string): Promise<CoverageAudit
         const d = new Date(i.pubDate);
         return !Number.isNaN(d.getTime()) && marketDayKey(d) === liveDay;
     });
-    const required = live.filter((i) => feedItemMustShowOnBoard(i.title));
+    // Every current feed identity is checked for durable coverage. Whether it is a Catalyst,
+    // Macro item, or irrelevant is decided by the AI classifier; this audit does not pre-filter by
+    // headline semantics.
+    const required = live;
 
     let dbRows = await loadDayRows(liveDay);
 
@@ -388,23 +386,21 @@ async function runAuditOnce(now: Date, ingestId?: string): Promise<CoverageAudit
         }
     }
 
-    for (const a of hidden) {
-        if (!a.row) continue;
-        // Never rewrite a locked (already-shown) row — stability guarantee.
-        if (a.row.board_locked) continue;
-        try {
-            const promote = Boolean(a.row.duplicate_of);
-            await healHiddenRow(a.row, a.item.title, promote);
-            healedHidden += 1;
-        } catch (error) {
-            logger.error(`[CoverageAudit] Heal-hidden failed for "${a.item.title.slice(0, 60)}": ${(error as Error).message}`);
-        }
-    }
+    // Existing hidden rows are not rewritten by the audit. An explicit AI reprocess action is
+    // required to change a completed decision; restart/coverage ticks must remain read-only.
 
     // ── Re-verify ──────────────────────────────────────────────────────────
     if (missing.length > 0 || hidden.length > 0) {
         dbRows = await loadDayRows(liveDay);
         assessments = assess(dbRows);
+    }
+
+    // Geo AI is bounded and cache-keyed by the unique AI causal-theme set. It is invoked from the
+    // ingest/audit path only; Daily Market View reads the cache and never triggers an AI call.
+    try {
+        await evaluateAndCacheGeopoliticalRisk(liveDay, { ingestId });
+    } catch (error) {
+        logger.warn(`[CoverageAudit] Geo AI evaluation deferred: ${(error as Error).message}`);
     }
 
     const residualGaps: CoverageGap[] = assessments
