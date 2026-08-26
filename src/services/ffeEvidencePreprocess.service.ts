@@ -291,6 +291,77 @@ export function fingerprintFinancialJuiceSourceUnit(input: FinancialJuiceSourceU
     })).digest('hex');
 }
 
+export function snapshotTimeToEpoch(value: string | null | undefined): number {
+    return Date.parse(String(value).replace(
+        /^(\d{2})\/(\d{2})\/(\d{4}),\s+(\d{2}):(\d{2})$/,
+        '$3-$2-$1T$4:$5:00+04:00',
+    ));
+}
+
+export type ChronologicalSourceUnitInput = {
+    guid?: string;
+    time?: string | null;
+    source?: string;
+    source_label?: string;
+    headline?: string;
+    body?: string;
+    supporting_lines?: string[];
+    actual?: string | null;
+    forecast?: string | null;
+    previous?: string | null;
+};
+
+export type ChronologicalSourceUnit = ChronologicalSourceUnitInput & {
+    guid: string;
+    source: string;
+    source_label: string;
+    headline: string;
+    body: string;
+    supporting_lines: string[];
+    actual: string | null;
+    forecast: string | null;
+    previous: string | null;
+    original_order: number;
+    source_unit_hash: string;
+};
+
+export function chronologicalSourceUnits(
+    units: ChronologicalSourceUnitInput[],
+    { guidPrefix = 'unit' }: { guidPrefix?: string } = {},
+): ChronologicalSourceUnit[] {
+    return [...units]
+        .sort((a, b) => snapshotTimeToEpoch(a.time) - snapshotTimeToEpoch(b.time))
+        .map((unit, index) => {
+            const guid = unit.guid || `${guidPrefix}${String(index + 1).padStart(5, '0')}`;
+            const source_label = unit.source || unit.source_label || 'FinancialJuice';
+            const row: ChronologicalSourceUnit = {
+                time: unit.time,
+                source: source_label,
+                source_label,
+                guid,
+                headline: String(unit.headline || ''),
+                body: unit.body || '',
+                supporting_lines: unit.supporting_lines || [],
+                actual: unit.actual ?? null,
+                forecast: unit.forecast ?? null,
+                previous: unit.previous ?? null,
+                original_order: index + 1,
+                source_unit_hash: '',
+            };
+            row.source_unit_hash = fingerprintFinancialJuiceSourceUnit({
+                guid: row.guid,
+                time: String(row.time || ''),
+                headline: row.headline,
+                body: row.body,
+                actual: row.actual,
+                forecast: row.forecast,
+                previous: row.previous,
+                source_label: row.source_label,
+            });
+            return row;
+        });
+}
+
 function looksLikeNewsHeadline(line: string): boolean {
     if (/\bActual\b/i.test(line) && /\b(Forecast|Previous)\b/i.test(line)) return true;
     const words = line.split(/\s+/).filter(Boolean);

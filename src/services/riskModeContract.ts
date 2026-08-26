@@ -28,6 +28,20 @@ export function clampRiskModeScore(score: number): number {
     return Math.max(MIN_SCORE, Math.min(MAX_SCORE, score));
 }
 
+/**
+ * Babypips RORO meter publishes 0 (max risk-off) … 100 (max risk-on) into B13.
+ * Daily Market thresholds apply on the signed −100…100 axis, so non-negative 0…100
+ * sheet values are normalized once at the source boundary. Already-signed negatives
+ * pass through unchanged.
+ */
+export function normalizeRiskModeNumericSource(value: number): number {
+    const clamped = clampRiskModeScore(value);
+    if (clamped >= 0 && clamped <= 100) {
+        return clampRiskModeScore((clamped * 2) - 100);
+    }
+    return clamped;
+}
+
 export function riskModeStateFromScore(score: number): RiskModeState {
     if (score < RISK_OFF_MAX) return 'RISK_OFF';
     if (score >= RISK_ON_MIN) return 'RISK_ON';
@@ -47,12 +61,12 @@ function parseExplicitMode(value: string): RiskModeState | null {
 }
 
 function parseNumeric(value: unknown): number | null {
-    if (typeof value === 'number') return Number.isFinite(value) ? clampRiskModeScore(value) : null;
+    if (typeof value === 'number') return Number.isFinite(value) ? normalizeRiskModeNumericSource(value) : null;
     if (typeof value !== 'string') return null;
     const text = value.trim().replace(/[–—−]/g, '-');
     if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(text)) return null;
     const parsed = Number(text);
-    return Number.isFinite(parsed) ? clampRiskModeScore(parsed) : null;
+    return Number.isFinite(parsed) ? normalizeRiskModeNumericSource(parsed) : null;
 }
 
 /**

@@ -1,6 +1,4 @@
-import fs from 'fs/promises';
-import path from 'path';
-import { pathToFileURL } from 'url';
+import { fetchLiveRssInspectionSnapshot } from './adminRssFeed.service.js';
 
 export type AdminRssNewsItem = {
     guid: string;
@@ -15,7 +13,7 @@ export type AdminRssNewsItem = {
 export type AdminRssNewsResponse = {
     business_day: string;
     fetched_at: string | null;
-    data_source: 'live' | 'snapshot' | null;
+    data_source: 'live' | null;
     available: boolean;
     message?: string;
     total: number;
@@ -34,10 +32,6 @@ type SourceUnit = {
     original_order?: number;
     source_unit_hash?: string;
 };
-
-const SCRAPER_ROOT = path.resolve(process.cwd(), '../forex-scraping');
-const SCRAPER_SNAPSHOT_MODULE = path.join(SCRAPER_ROOT, 'src/services/ffeRssSnapshot.service.js');
-const FFE_DAILY_RUNS_DIR = path.join(SCRAPER_ROOT, 'artifacts/ffe-daily-runs');
 
 function todayUtcDayKey(): string {
     return new Date().toISOString().slice(0, 10);
@@ -76,47 +70,6 @@ function countBySource(items: AdminRssNewsItem[]) {
     };
 }
 
-async function fetchLiveInspectionSnapshot() {
-    const moduleUrl = pathToFileURL(SCRAPER_SNAPSHOT_MODULE).href;
-    const rssModule = await import(moduleUrl) as {
-        fetchLiveRssInspectionSnapshot: (options?: { logLabel?: string }) => Promise<{
-            fetched_at: string;
-            source_units: SourceUnit[];
-            financialjuice_count: number;
-            fxstreet_count: number;
-        }>;
-    };
-    return rssModule.fetchLiveRssInspectionSnapshot({ logLabel: 'AdminRssNews' });
-}
-
-async function loadLocalSnapshotForBusinessDay(businessDay: string) {
-    let entries: string[] = [];
-    try {
-        entries = await fs.readdir(FFE_DAILY_RUNS_DIR);
-    } catch {
-        return null;
-    }
-
-    let best: { snapshot: Record<string, unknown>; sortKey: string } | null = null;
-
-    for (const entry of entries) {
-        const snapshotPath = path.join(FFE_DAILY_RUNS_DIR, entry, 'ffe-snapshot.json');
-        try {
-            const raw = await fs.readFile(snapshotPath, 'utf8');
-            const snapshot = JSON.parse(raw) as Record<string, unknown>;
-            if (snapshot.business_day !== businessDay) continue;
-            const sortKey = String(snapshot.created_at || (snapshot.raw as { fetched_at?: string } | undefined)?.fetched_at || entry);
-            if (!best || sortKey > best.sortKey) {
-                best = { snapshot, sortKey };
-            }
-        } catch {
-            // skip unreadable runs
-        }
-    }
-
-    return best?.snapshot ?? null;
-}
-
 function buildUnavailableResponse(businessDay: string, message: string): AdminRssNewsResponse {
     return {
         business_day: businessDay,
@@ -137,55 +90,24 @@ export async function getAdminRssNews(businessDayInput?: string): Promise<AdminR
         : todayUtcDayKey();
 
     let fetchedAt: string | null = null;
-    let dataSource: 'live' | 'snapshot' | null = null;
     let filteredUnits: SourceUnit[] = [];
 
     try {
-        const live = await fetchLiveInspectionSnapshot();
+        const live = await fetchLiveRssInspectionSnapshot({ logLabel: 'AdminRssNews' });
         fetchedAt = live.fetched_at;
-        dataSource = 'live';
         filteredUnits = filterUnitsByBusinessDay(live.source_units, businessDay);
     } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        const snapshot = await loadLocalSnapshotForBusinessDay(businessDay);
-        if (snapshot && Array.isArray(snapshot.source_units)) {
-            filteredUnits = filterUnitsByBusinessDay(snapshot.source_units as SourceUnit[], businessDay);
-            if (filteredUnits.length > 0) {
-                fetchedAt = String(
-                    (snapshot.raw as { fetched_at?: string } | undefined)?.fetched_at
-                    || snapshot.created_at
-                    || null,
-                );
-                dataSource = 'snapshot';
-            }
-        }
-        if (filteredUnits.length === 0) {
-            return buildUnavailableResponse(
-                businessDay,
-                `Live RSS fetch failed: ${message}`,
-            );
-        }
-    }
-
-    if (filteredUnits.length === 0) {
-        const snapshot = await loadLocalSnapshotForBusinessDay(businessDay);
-        if (snapshot && Array.isArray(snapshot.source_units)) {
-            filteredUnits = filterUnitsByBusinessDay(snapshot.source_units as SourceUnit[], businessDay);
-            if (filteredUnits.length > 0) {
-                fetchedAt = String(
-                    (snapshot.raw as { fetched_at?: string } | undefined)?.fetched_at
-                    || snapshot.created_at
-                    || fetchedAt,
-                );
-                dataSource = 'snapshot';
-            }
-        }
+        return buildUnavailableResponse(
+            businessDay,
+            `Live RSS fetch failed: ${message}`,
+        );
     }
 
     if (filteredUnits.length === 0) {
         return buildUnavailableResponse(
             businessDay,
-            `No RSS news is available for ${businessDay}. The live feed did not contain items for this day and no local snapshot was found.`,
+            `No RSS news is available for ${businessDay}. The live feed did not contain items for this day.`,
         );
     }
 
@@ -197,7 +119,7 @@ export async function getAdminRssNews(businessDayInput?: string): Promise<AdminR
     return {
         business_day: businessDay,
         fetched_at: fetchedAt,
-        data_source: dataSource,
+        data_source: 'live',
         available: true,
         total: items.length,
         financialjuice_count: counts.financialjuice_count,

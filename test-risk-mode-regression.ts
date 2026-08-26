@@ -5,24 +5,30 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+    normalizeRiskModeNumericSource,
     parseRiskModeSourceValue,
     resolveRiskModeContract,
     riskModeStateFromScore,
     unavailableRiskModeContract,
 } from './src/services/riskModeContract.js';
 
-test('the old label-to-number path reproduces Risk-Off -> Neutral', () => {
+test('the old signed misread of Babypips 0-100 values reproduced Risk-Off as Neutral', () => {
     const legacyScore = Number(String('Risk-Off').replace(/[^0-9.+-]/g, ''));
     assert.ok(Number.isNaN(legacyScore));
-    // The pre-fix reader then fell back to a stale numeric DB row (26), which
-    // is exactly how the valid source state became Neutral in the snapshot.
+    // Before normalization, a Babypips 26 in B13 was treated as signed +26 → NEUTRAL.
     assert.equal(riskModeStateFromScore(26), 'NEUTRAL');
+    assert.deepEqual(parseRiskModeSourceValue(26), { mode: 'RISK_OFF', score: -48, sourceKind: 'numeric' });
 });
 
-test('numeric source values produce canonical Risk-Off, Neutral, and Risk-On states', () => {
+test('Babypips 0-100 sheet values normalize to signed thresholds', () => {
+    assert.equal(normalizeRiskModeNumericSource(-70), -70);
+    assert.equal(normalizeRiskModeNumericSource(0), -100);
+    assert.equal(normalizeRiskModeNumericSource(50), 0);
+    assert.equal(normalizeRiskModeNumericSource(83), 66);
     assert.deepEqual(parseRiskModeSourceValue(-70), { mode: 'RISK_OFF', score: -70, sourceKind: 'numeric' });
-    assert.deepEqual(parseRiskModeSourceValue(0), { mode: 'NEUTRAL', score: 0, sourceKind: 'numeric' });
-    assert.deepEqual(parseRiskModeSourceValue(80), { mode: 'RISK_ON', score: 80, sourceKind: 'numeric' });
+    assert.deepEqual(parseRiskModeSourceValue(0), { mode: 'RISK_OFF', score: -100, sourceKind: 'numeric' });
+    assert.deepEqual(parseRiskModeSourceValue(50), { mode: 'NEUTRAL', score: 0, sourceKind: 'numeric' });
+    assert.deepEqual(parseRiskModeSourceValue(83), { mode: 'RISK_ON', score: 66, sourceKind: 'numeric' });
 });
 
 test('label source values remain states even when no numeric score is present', () => {
