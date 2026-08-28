@@ -6,6 +6,7 @@ import { TRACKED_ASSETS } from './groqClassifier.service.js';
 import type { GptFirstAnalysisOutput, GptFirstSessionInput } from './ffeGptFirstAnalysis.service.js';
 
 export const ALLOWED_SCORES = new Set([-1, -0.5, -0.25, 0, 0.25, 0.5, 1]);
+export const ALLOWED_DRIVER_CONTRIBUTION_VALUES = [...ALLOWED_SCORES] as const;
 export const CATALYST_ASSETS = [...TRACKED_ASSETS] as const;
 export const MACRO_ASSETS = ['USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD', 'NZD'] as const;
 export const GEO_BANDS = ['LOW', 'WATCH', 'ELEVATED', 'HIGH', 'EXTREME'] as const;
@@ -88,8 +89,142 @@ export type ValidationResult = {
     arithmeticProof: Array<{ asset: string; terms: number[]; sum: number; displayed: number; exact: boolean }>;
 };
 
+export function isAllowedIndividualDriverContribution(score: unknown): boolean {
+    const num = Number(score);
+    return Number.isFinite(num) && ALLOWED_SCORES.has(num);
+}
+
 function isQuarterStep(score: number): boolean {
-    return ALLOWED_SCORES.has(score);
+    return isAllowedIndividualDriverContribution(score);
+}
+
+function pushIllegalContribution(
+    issues: ValidationIssue[],
+    location: string,
+    value: unknown,
+): void {
+    if (value == null) return;
+    const num = Number(value);
+    if (!Number.isFinite(num)) {
+        issues.push({
+            code: 'INVALID_DRIVER_CONTRIBUTION',
+            message: `${location}: non-numeric contribution ${String(value)}`,
+        });
+        return;
+    }
+    if (!isAllowedIndividualDriverContribution(num)) {
+        issues.push({
+            code: 'ILLEGAL_DRIVER_CONTRIBUTION',
+            message: `${location}: contribution ${num} is not one of {-1, -0.5, -0.25, 0, +0.25, +0.5, +1}`,
+        });
+    }
+}
+
+/**
+ * Validate individual driver contributions in the raw ChatGPT JSON transport shape.
+ * Aggregate board/decomposition/regime totals are intentionally excluded.
+ */
+export function validateChatGptRawDriverContributions(raw: Record<string, unknown>): Pick<ValidationResult, 'valid' | 'issues'> {
+    const issues: ValidationIssue[] = [];
+
+    const catalystBoard = raw.catalyst_board;
+    if (catalystBoard && typeof catalystBoard === 'object' && !Array.isArray(catalystBoard)) {
+        for (const [asset, row] of Object.entries(catalystBoard as Record<string, unknown>)) {
+            if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
+            const drivers = (row as Record<string, unknown>).active_independent_drivers;
+            if (!Array.isArray(drivers)) continue;
+            drivers.forEach((driver, index) => {
+                if (!driver || typeof driver !== 'object' || Array.isArray(driver)) return;
+                pushIllegalContribution(
+                    issues,
+                    `catalyst_board.${asset}.active_independent_drivers[${index}].contribution`,
+                    (driver as Record<string, unknown>).contribution,
+                );
+            });
+        }
+    }
+
+    const ledger = Array.isArray(raw.canonical_driver_ledger) ? raw.canonical_driver_ledger : [];
+    for (const [index, entry] of ledger.entries()) {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+        const driver = entry as Record<string, unknown>;
+        const driverId = String(driver.driver_id ?? driver.theme ?? index);
+        const contributions = driver.contribution_per_asset;
+        if (!contributions || typeof contributions !== 'object' || Array.isArray(contributions)) continue;
+        for (const [asset, value] of Object.entries(contributions as Record<string, unknown>)) {
+            pushIllegalContribution(
+                issues,
+                `canonical_driver_ledger.${driverId}.contribution_per_asset.${asset}`,
+                value,
+            );
+        }
+    }
+
+    const goldDecomposition = raw.gold_decomposition;
+    if (goldDecomposition && typeof goldDecomposition === 'object' && !Array.isArray(goldDecomposition)) {
+        const channels = (goldDecomposition as Record<string, unknown>).channels;
+        if (Array.isArray(channels)) {
+            channels.forEach((channel, index) => {
+                if (!channel || typeof channel !== 'object' || Array.isArray(channel)) return;
+                const row = channel as Record<string, unknown>;
+                const label = String(row.channel ?? index);
+                pushIllegalContribution(
+                    issues,
+                    `gold_decomposition.channels[${index}](${label}).score`,
+                    row.score,
+                );
+            });
+        }
+    }
+
+    if (Array.isArray(raw.oil_audit)) {
+        raw.oil_audit.forEach((entry, index) => {
+            if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return;
+            const row = entry as Record<string, unknown>;
+            pushIllegalContribution(issues, `oil_audit[${index}].magnitude`, row.magnitude);
+        });
+    }
+
+    const oilAggregate = raw.oil_aggregate_state;
+    if (oilAggregate && typeof oilAggregate === 'object' && !Array.isArray(oilAggregate)) {
+        const downstream = (oilAggregate as Record<string, unknown>).downstream_transmission;
+        if (downstream && typeof downstream === 'object' && !Array.isArray(downstream)) {
+            for (const [asset, entry] of Object.entries(downstream as Record<string, unknown>)) {
+                if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+                const row = entry as Record<string, unknown>;
+                const value = row.magnitude ?? row.contribution;
+                if (value != null) {
+                    pushIllegalContribution(
+                        issues,
+                        `oil_aggregate_state.downstream_transmission.${asset}`,
+                        value,
+                    );
+                }
+            }
+        }
+    }
+
+    if (Array.isArray(raw.drivers)) {
+        raw.drivers.forEach((driver, driverIndex) => {
+            if (!driver || typeof driver !== 'object' || Array.isArray(driver)) return;
+            const row = driver as Record<string, unknown>;
+            const driverId = String(row.driver_id ?? driverIndex);
+            const contributions = row.contributions;
+            if (!Array.isArray(contributions)) return;
+            contributions.forEach((contrib, contribIndex) => {
+                if (!contrib || typeof contrib !== 'object' || Array.isArray(contrib)) return;
+                const item = contrib as Record<string, unknown>;
+                const asset = String(item.asset ?? '?');
+                pushIllegalContribution(
+                    issues,
+                    `drivers[${driverId}].contributions[${contribIndex}].${asset}`,
+                    item.score ?? item.contribution,
+                );
+            });
+        });
+    }
+
+    return { valid: issues.length === 0, issues };
 }
 
 export function validateGptFirstAnalysis(output: GptFirstAnalysisOutput, input: GptFirstSessionInput): ValidationResult {

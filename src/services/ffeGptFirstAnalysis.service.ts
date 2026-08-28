@@ -849,6 +849,14 @@ function extractCatalystDriverRefs(entry: Record<string, unknown>): string[] {
 
 function catalystBoardObjectToArray(board: Record<string, unknown>): Record<string, unknown>[] {
     return Object.entries(board).map(([assetKey, value]) => {
+        if (typeof value === 'number' && Number.isFinite(value)) {
+            return {
+                asset: assetKey.toUpperCase(),
+                score: value,
+                driver_refs: [],
+                explanation: '',
+            };
+        }
         const row = value && typeof value === 'object' && !Array.isArray(value)
             ? value as Record<string, unknown>
             : {};
@@ -856,7 +864,7 @@ function catalystBoardObjectToArray(board: Record<string, unknown>): Record<stri
             asset: assetKey.toUpperCase(),
             score: row.raw_catalyst_score ?? row.raw_score ?? row.score,
             driver_refs: extractCatalystDriverRefs(row),
-            explanation: row.explanation ?? '',
+            explanation: row.explanation ?? row.causal_explanation ?? '',
         };
     });
 }
@@ -865,14 +873,18 @@ function resolveFinalBoardSource(raw: Record<string, unknown>): Record<string, u
     if (Array.isArray(raw.final_board) && raw.final_board.length > 0) {
         return raw.final_board as Record<string, unknown>[];
     }
-    const objectBoard = (
-        raw.final_board && typeof raw.final_board === 'object' && !Array.isArray(raw.final_board)
-            ? raw.final_board
-            : raw.catalyst_board && typeof raw.catalyst_board === 'object' && !Array.isArray(raw.catalyst_board)
-                ? raw.catalyst_board
-                : null
-    ) as Record<string, unknown> | null;
-    if (objectBoard) return catalystBoardObjectToArray(objectBoard);
+    const catalystBoard = raw.catalyst_board && typeof raw.catalyst_board === 'object' && !Array.isArray(raw.catalyst_board)
+        ? raw.catalyst_board as Record<string, unknown>
+        : null;
+    if (catalystBoard) {
+        return catalystBoardObjectToArray(catalystBoard);
+    }
+    const finalBoard = raw.final_board && typeof raw.final_board === 'object' && !Array.isArray(raw.final_board)
+        ? raw.final_board as Record<string, unknown>
+        : null;
+    if (finalBoard) {
+        return catalystBoardObjectToArray(finalBoard);
+    }
     return Array.isArray(raw.final_board) ? raw.final_board as Record<string, unknown>[] : [];
 }
 

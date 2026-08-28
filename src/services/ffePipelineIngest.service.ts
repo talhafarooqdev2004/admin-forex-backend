@@ -23,6 +23,10 @@ import {
     GPT_FIRST_SOURCE,
     persistGptFirstAnalysis,
 } from './ffeGptFirstProduction.service.js';
+import {
+    validateChatGptRawDriverContributions,
+    validateGptFirstAnalysis,
+} from './ffeGptFirstValidation.service.js';
 import { websocketService } from './websocket.service.js';
 
 export const FFE_PIPELINE_RUN_STATUSES = [
@@ -101,7 +105,7 @@ export type FfePipelineIngestResult = {
     validation_valid?: boolean;
     validation_issues?: Array<{ code: string; message: string }>;
     snapshot_version?: number;
-    observability_status?: 'JSON_PARSED' | 'CHATGPT_RESPONSE_INVALID' | 'PARSE_FAILED' | 'PERSIST_FAILED';
+    observability_status?: 'JSON_PARSED' | 'CHATGPT_RESPONSE_INVALID' | 'PARSE_FAILED' | 'PERSIST_FAILED' | 'VALIDATION_FAILED';
     failed_field?: string;
     parse_strategy?: string | null;
     message: string;
@@ -254,8 +258,42 @@ export async function ingestFfePipelineResult(payload: FfePipelineIngestPayload)
     }
 
     const sessionInput = buildGptFirstSessionInputFromSnapshot(payload);
+    const rawDriverValidation = validateChatGptRawDriverContributions(parsed.parsed);
     let output = normalizeGptFirstOutput(parsed.parsed, sessionInput);
-    const validation = { valid: true, issues: [], arithmeticProof: [] as const };
+    const normalizedValidation = validateGptFirstAnalysis(output, sessionInput);
+    const validationIssues = [
+        ...rawDriverValidation.issues,
+        ...normalizedValidation.issues,
+    ];
+    const validation = {
+        valid: validationIssues.length === 0,
+        issues: validationIssues,
+        arithmeticProof: normalizedValidation.arithmeticProof,
+    };
+
+    if (!validation.valid) {
+        const firstIssue = validation.issues[0];
+        const result: FfePipelineIngestResult = {
+            ...base,
+            final_status: 'VALIDATION_FAILED',
+            parse_status: 'ok',
+            persistence_status: 'rejected',
+            validation_valid: false,
+            validation_issues: validation.issues,
+            observability_status: 'VALIDATION_FAILED',
+            failed_field: firstIssue?.code || 'validation',
+            parse_strategy: parsed.strategy,
+            message: `VALIDATION_FAILED: ${firstIssue?.message || 'illegal individual driver contribution'}`,
+        };
+        await writeRunArtifact(payload.run_id, { payload, result, validation, parse: parsed });
+        logger.warn('[FfePipeline] Validation rejected ChatGPT JSON before persistence', {
+            run_id: payload.run_id,
+            business_day: payload.business_day,
+            issue_count: validation.issues.length,
+            first_issue: firstIssue?.code,
+        });
+        return result;
+    }
 
     output = attachChatGptProvenance(output, sessionInput);
 

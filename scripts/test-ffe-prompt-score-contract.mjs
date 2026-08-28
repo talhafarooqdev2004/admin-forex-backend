@@ -13,6 +13,8 @@ const REQUIRED = [
     'CONTRIBUTION SCORE CONTRACT — HARD CONSTRAINT',
     'the ONLY legal values are:',
     '-1, -0.5, -0.25, 0, +0.25, +0.5, +1',
+    'Continuous -1.00 to +1.00 values are allowed ONLY for aggregate board/decomposition/regime totals',
+    'Every individual driver contribution must use ONLY {-1, -0.5, -0.25, 0, +0.25, +0.5, +1}',
     'Specifically FORBIDDEN on individual contributions: +0.75, -0.75',
     'EVENT-STAGE REPLACEMENT (critical)',
     'NEW_EVENT → CONFIRMATION → STRENGTHENING',
@@ -35,8 +37,8 @@ async function main() {
     const prompt = buildGptFirstSystemPrompt();
     assert.equal(
         FFE_GPT_FIRST_PROMPT_VERSION,
-        'ffe-gpt-first-v2.9.2-score-contract-hard-constraint',
-        'prompt version must be bumped for score-contract enforcement',
+        'ffe-gpt-first-v2.9.3-aggregate-driver-distinction',
+        'prompt version must be bumped for aggregate vs driver distinction',
     );
 
     for (const needle of REQUIRED) {

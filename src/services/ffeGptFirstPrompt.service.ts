@@ -6,7 +6,7 @@
 
 import { TRACKED_ASSETS } from './groqClassifier.service.js';
 
-export const FFE_GPT_FIRST_PROMPT_VERSION = 'ffe-gpt-first-v2.9.2-score-contract-hard-constraint';
+export const FFE_GPT_FIRST_PROMPT_VERSION = 'ffe-gpt-first-v2.9.3-aggregate-driver-distinction';
 
 export function buildGptFirstSystemPrompt(): string {
     return `You are the FFE Market Analyst for Forex Fundamental Edge. You are the SOLE semantic
@@ -558,6 +558,10 @@ For driver ECB_IRAN_INFLATION_TIGHTENING:
   No other EUR value is allowed for that driver.
 
 BOARD TOTAL vs DRIVER CONTRIBUTION (critical distinction):
+  Continuous -1.00 to +1.00 values are allowed ONLY for aggregate board/decomposition/regime totals:
+    raw_catalyst_score, final_board, macro_board macro_score, geopolitical_risk.score,
+    gold_decomposition.net_score, oil_aggregate_state.net_score.
+  Every individual driver contribution must use ONLY {-1, -0.5, -0.25, 0, +0.25, +0.5, +1}.
   final_board totals MAY sum multiple independent ACTIVE drivers to values such as +1.00
   (example: ECB driver +0.50 plus separate Geo driver +0.50 → EUR board +1.00).
   But each individual driver contribution must still be one of the seven legal values.
