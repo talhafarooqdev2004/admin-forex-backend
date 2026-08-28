@@ -41,6 +41,8 @@
     "test:ffe-prompt-score-contract": "node --import tsx/esm scripts/test-ffe-prompt-score-contract.mjs",
     "test:ffe-prose-parser-replay": "node --import tsx/esm scripts/test-ffe-prose-parser-replay.mjs",
     "test:ffe-json-transport": "node --import tsx/esm scripts/test-ffe-json-transport.mjs",
+    "test:ffe-catalyst-field-mapping": "node --import tsx/esm scripts/test-ffe-catalyst-field-mapping.mjs",
+    "reingest:ffe-artifact": "node --import tsx/esm scripts/reingest-ffe-artifact.mjs",
     "test:ffe-replay-provenance-offline": "node --import tsx/esm test-ffe-replay-provenance-offline.ts",
     "test:ffe-semantic-generalization": "node --import tsx/esm test-ffe-semantic-generalization.ts",
     "reconstruct:ffe-replay-offline": "node --import tsx/esm scripts/reconstruct-ffe-replay-offline.ts",

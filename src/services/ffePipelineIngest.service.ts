@@ -87,6 +87,8 @@ export type FfePipelineIngestPayload = {
     pipeline_status?: string;
     failed_stage?: string | null;
     error?: string | null;
+    /** Re-run normalize/persist for an existing business_day + input_hash (no ChatGPT/RSS). */
+    force_reingest?: boolean;
 };
 
 export type FfePipelineIngestResult = {
@@ -185,7 +187,11 @@ export async function ingestFfePipelineResult(payload: FfePipelineIngestPayload)
     }
 
     const existing = await getLatestGptFirstAnalysis(payload.business_day);
-    if (existing?.accepted && existing.inputHash === payload.input_hash.slice(0, 64)) {
+    if (
+        !payload.force_reingest
+        && existing?.accepted
+        && existing.inputHash === payload.input_hash.slice(0, 64)
+    ) {
         const result: FfePipelineIngestResult = {
             ...base,
             final_status: 'SKIPPED_DUPLICATE',

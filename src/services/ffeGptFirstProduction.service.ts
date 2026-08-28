@@ -97,7 +97,41 @@ export async function persistGptFirstAnalysis(
     }
 
     const inputHash = result.output.session.input_hash;
+    const fingerprint = inputHash.slice(0, 64);
     const catalystBoard = gptFirstOutputToCatalystBoard(result.output);
+    const snapshotData = {
+        status: result.accepted ? 'VALID' : 'REJECTED',
+        as_of: new Date(),
+        prompt_version: result.promptVersion,
+        provider: result.provider,
+        model: result.model,
+        snapshot: result.output as object,
+        catalyst_board: catalystBoard,
+        macro_board: result.output.macro,
+        driver_clusters: result.output.drivers,
+        geo_state: result.output.geo,
+        confidence: result.output.quality.model_confidence,
+        needs_review: result.needsReview || !result.accepted || result.output.quality.warnings.length > 0,
+        input_event_count: result.output.session.input_count,
+        input_theme_count: result.output.drivers.length,
+    };
+
+    const existingByFingerprint = await prisma.marketDriverSessionSnapshot.findFirst({
+        where: { day_key: dayKey, source: GPT_FIRST_SOURCE, ledger_fingerprint: fingerprint },
+        select: { id: true },
+    });
+    if (existingByFingerprint) {
+        await prisma.marketDriverSessionSnapshot.update({
+            where: { id: existingByFingerprint.id },
+            data: snapshotData,
+        });
+        logger.info('[GptFirst] Updated existing snapshot for business_day + input_hash', {
+            dayKey,
+            fingerprint: fingerprint.slice(0, 12),
+        });
+        return;
+    }
+
     const latest = await prisma.marketDriverSessionSnapshot.findFirst({
         where: { day_key: dayKey, source: GPT_FIRST_SOURCE },
         orderBy: { version: 'desc' },
@@ -109,22 +143,9 @@ export async function persistGptFirstAnalysis(
         data: {
             day_key: dayKey,
             source: GPT_FIRST_SOURCE,
-            ledger_fingerprint: inputHash.slice(0, 64),
+            ledger_fingerprint: fingerprint,
             version,
-            status: result.accepted ? 'VALID' : 'REJECTED',
-            as_of: new Date(),
-            prompt_version: result.promptVersion,
-            provider: result.provider,
-            model: result.model,
-            snapshot: result.output as object,
-            catalyst_board: catalystBoard,
-            macro_board: result.output.macro,
-            driver_clusters: result.output.drivers,
-            geo_state: result.output.geo,
-            confidence: result.output.quality.model_confidence,
-            needs_review: result.needsReview || !result.accepted || result.output.quality.warnings.length > 0,
-            input_event_count: result.output.session.input_count,
-            input_theme_count: result.output.drivers.length,
+            ...snapshotData,
         },
     });
 }

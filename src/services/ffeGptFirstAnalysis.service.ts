@@ -854,7 +854,7 @@ function catalystBoardObjectToArray(board: Record<string, unknown>): Record<stri
             : {};
         return {
             asset: assetKey.toUpperCase(),
-            score: row.raw_score ?? row.score,
+            score: row.raw_catalyst_score ?? row.raw_score ?? row.score,
             driver_refs: extractCatalystDriverRefs(row),
             explanation: row.explanation ?? '',
         };
