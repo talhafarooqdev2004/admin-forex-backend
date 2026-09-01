@@ -367,6 +367,7 @@ function mapFailedStage(stage: string | null | undefined): FfePipelineRunStatus 
     if (value.includes('SUBMISSION') || value.includes('CLIPBOARD') || value.includes('INPUT_VERIFICATION')) return 'SUBMISSION_FAILED';
     if (value.includes('HYDRATION') || value.includes('BRANCH')) return 'HYDRATION_FAILED';
     if (value.includes('GENERATION') || value.includes('CAPTURE')) return 'GENERATION_FAILED';
+    if (value.includes('FINAL_RESPONSE_NOT_JSON')) return 'CHATGPT_RESPONSE_INVALID';
     if (value.includes('CHATGPT_RESPONSE_INVALID') || value.includes('RESPONSE_INVALID')) return 'CHATGPT_RESPONSE_INVALID';
     if (value.includes('PARSE')) return 'PARSE_FAILED';
     if (value.includes('VALIDATION')) return 'VALIDATION_FAILED';

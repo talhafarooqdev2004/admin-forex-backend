@@ -43,6 +43,7 @@
     "test:ffe-json-transport": "node --import tsx/esm scripts/test-ffe-json-transport.mjs",
     "test:ffe-catalyst-field-mapping": "node --import tsx/esm scripts/test-ffe-catalyst-field-mapping.mjs",
     "test:ffe-catalyst-scalar-final-board": "node --import tsx/esm scripts/test-ffe-catalyst-scalar-final-board.mjs",
+    "test:ffe-geo-band-normalization": "node --import tsx/esm scripts/test-ffe-geo-band-normalization.mjs",
     "test:ffe-driver-contribution-contract": "node --import tsx/esm scripts/test-ffe-driver-contribution-contract.mjs",
     "reingest:ffe-artifact": "node --import tsx/esm scripts/reingest-ffe-artifact.mjs",
     "test:ffe-replay-provenance-offline": "node --import tsx/esm test-ffe-replay-provenance-offline.ts",

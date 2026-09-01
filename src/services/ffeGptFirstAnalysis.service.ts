@@ -12,7 +12,7 @@ import {
     resetAiEvaluationTelemetry,
     getAiEvaluationTelemetry,
 } from './groqClassifier.service.js';
-import { validateGptFirstAnalysis, GEO_BANDS, EVIDENCE_DISPOSITIONS, collectCitedGuids, expectedGeoBand, type ValidationIssue } from './ffeGptFirstValidation.service.js';
+import { validateGptFirstAnalysis, GEO_BANDS, EVIDENCE_DISPOSITIONS, collectCitedGuids, expectedGeoBand, type GeoBand, type ValidationIssue } from './ffeGptFirstValidation.service.js';
 import { buildGptFirstSystemPrompt, FFE_GPT_FIRST_PROMPT_VERSION } from './ffeGptFirstPrompt.service.js';
 import {
     assembleFinancialJuiceEvidenceUnit,
@@ -888,6 +888,47 @@ function resolveFinalBoardSource(raw: Record<string, unknown>): Record<string, u
     return Array.isArray(raw.final_board) ? raw.final_board as Record<string, unknown>[] : [];
 }
 
+const GEO_BAND_ALIASES: Record<string, GeoBand> = {
+    LOW: 'LOW',
+    WATCH: 'WATCH',
+    ELEVATED: 'ELEVATED',
+    HIGH: 'HIGH',
+    EXTREME: 'EXTREME',
+    'LOW RISK': 'LOW',
+    LOW_RISK: 'LOW',
+    'HIGH RISK': 'HIGH',
+    HIGH_RISK: 'HIGH',
+    'EXTREME RISK': 'EXTREME',
+    EXTREME_RISK: 'EXTREME',
+};
+
+function parseRawGeoScore(geoRaw: Record<string, unknown>): number | null {
+    const raw = geoRaw.score ?? geoRaw.geo_score;
+    if (raw === undefined || raw === null || raw === '') return null;
+    const n = typeof raw === 'number' ? raw : Number(String(raw).trim());
+    return Number.isFinite(n) ? n : null;
+}
+
+function canonicalizeGeoBand(raw: unknown): GeoBand | null {
+    const token = String(raw ?? '').replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim().toUpperCase();
+    if (!token) return null;
+    if ((GEO_BANDS as readonly string[]).includes(token)) return token as GeoBand;
+    return GEO_BAND_ALIASES[token] ?? GEO_BAND_ALIASES[token.replace(/ /g, '_')] ?? null;
+}
+
+function normalizeGeoScoreAndBand(geoRaw: Record<string, unknown>): { score: number; band: string } {
+    const parsedScore = parseRawGeoScore(geoRaw);
+    const canonicalBand = canonicalizeGeoBand(geoRaw.band);
+    if (canonicalBand) {
+        return { score: parsedScore ?? 0, band: canonicalBand };
+    }
+    if (parsedScore != null) {
+        const derived = expectedGeoBand(parsedScore);
+        return { score: parsedScore, band: derived ?? '' };
+    }
+    return { score: 0, band: '' };
+}
+
 function normalizeOutput(raw: Record<string, unknown>, input: GptFirstSessionInput): GptFirstAnalysisOutput {
     const text = (v: unknown, max = 2000) => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
     const score = (v: unknown) => {
@@ -955,6 +996,7 @@ function normalizeOutput(raw: Record<string, unknown>, input: GptFirstSessionInp
     const oilRaw = (raw.oil_audit ?? {}) as Record<string, unknown>;
     const qualityRaw = (raw.quality ?? {}) as Record<string, unknown>;
     const sessionRaw = (raw.session ?? {}) as Record<string, unknown>;
+    const geoNormalized = normalizeGeoScoreAndBand(geoRaw);
 
     return {
         session: {
@@ -977,8 +1019,8 @@ function normalizeOutput(raw: Record<string, unknown>, input: GptFirstSessionInp
         drivers,
         geo: {
             dominant_theme: text(geoRaw.dominant_theme, 200),
-            score: score(geoRaw.score),
-            band: text(geoRaw.band, 40),
+            score: geoNormalized.score,
+            band: geoNormalized.band,
             state: text(geoRaw.state, 40),
             escalation_evidence: (Array.isArray(geoRaw.escalation_evidence) ? geoRaw.escalation_evidence : []).map(String),
             de_escalation_evidence: (Array.isArray(geoRaw.de_escalation_evidence) ? geoRaw.de_escalation_evidence : []).map(String),
