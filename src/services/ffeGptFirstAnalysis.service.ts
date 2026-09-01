@@ -12,7 +12,7 @@ import {
     resetAiEvaluationTelemetry,
     getAiEvaluationTelemetry,
 } from './groqClassifier.service.js';
-import { validateGptFirstAnalysis, GEO_BANDS, EVIDENCE_DISPOSITIONS, collectCitedGuids, expectedGeoBand, type GeoBand, type ValidationIssue } from './ffeGptFirstValidation.service.js';
+import { validateGptFirstAnalysis, GEO_BANDS, MACRO_ASSETS, EVIDENCE_DISPOSITIONS, collectCitedGuids, expectedGeoBand, type GeoBand, type ValidationIssue } from './ffeGptFirstValidation.service.js';
 import { buildGptFirstSystemPrompt, FFE_GPT_FIRST_PROMPT_VERSION } from './ffeGptFirstPrompt.service.js';
 import {
     assembleFinancialJuiceEvidenceUnit,
@@ -869,6 +869,38 @@ function catalystBoardObjectToArray(board: Record<string, unknown>): Record<stri
     });
 }
 
+function parseNumericScore(value: unknown): number | null {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && value.trim()) {
+        const n = Number(value.trim());
+        return Number.isFinite(n) ? n : null;
+    }
+    return null;
+}
+
+function macroBoardToArray(raw: Record<string, unknown>): Record<string, unknown>[] {
+    const source = raw.macro ?? raw.macro_board;
+    if (Array.isArray(source)) return source as Record<string, unknown>[];
+    if (!source || typeof source !== 'object') return [];
+    const board = source as Record<string, unknown>;
+    return MACRO_ASSETS.map((asset) => {
+        const value = board[asset] ?? board[asset.toLowerCase()];
+        if (typeof value === 'number' && Number.isFinite(value)) {
+            return { asset, score: value, health: '', reasoning: '', supporting_releases: [] };
+        }
+        const row = value && typeof value === 'object' && !Array.isArray(value)
+            ? value as Record<string, unknown>
+            : {};
+        return {
+            asset,
+            score: parseNumericScore(row.macro_score ?? row.score) ?? 0,
+            health: row.health ?? '',
+            reasoning: row.reasoning ?? '',
+            supporting_releases: Array.isArray(row.supporting_releases) ? row.supporting_releases : [],
+        };
+    });
+}
+
 function resolveFinalBoardSource(raw: Record<string, unknown>): Record<string, unknown>[] {
     if (Array.isArray(raw.final_board) && raw.final_board.length > 0) {
         return raw.final_board as Record<string, unknown>[];
@@ -1001,12 +1033,12 @@ function normalizeOutput(raw: Record<string, unknown>, input: GptFirstSessionInp
     return {
         session: {
             source: text(sessionRaw.source || input.source, 40),
-            business_day: text(sessionRaw.business_day || input.business_day, 20),
-            cutoff: text(sessionRaw.cutoff || input.cutoff, 40),
+            business_day: text(sessionRaw.business_day || raw.business_day || input.business_day, 20),
+            cutoff: text(sessionRaw.cutoff || raw.cutoff || input.cutoff, 40),
             input_count: Number(sessionRaw.input_count ?? input.items.length),
             input_hash: text(sessionRaw.input_hash || sessionInputHash(input.items), 80),
         },
-        macro: (Array.isArray(raw.macro) ? raw.macro : []).map((value) => {
+        macro: macroBoardToArray(raw).map((value) => {
             const row = value as Record<string, unknown>;
             return {
                 asset: text(row.asset, 12).toUpperCase(),

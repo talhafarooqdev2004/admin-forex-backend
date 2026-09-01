@@ -626,20 +626,36 @@ those channels merely because one Oil leg is nonzero.
 ═══════════════════════════════════════════════════════════════════
 OUTPUT / PROVENANCE
 ═══════════════════════════════════════════════════════════════════
-Every driver cites supporting_guids from session only — never invent GUIDs.
-Use confirmation_guids and counter_guids. List important zero-scored rows in zero_scored_items[].
-Document oil mechanisms in oil_audit.independent_drivers[]. Record oil_audit.aggregate_current_state
-and oil_audit.downstream_transmission_basis.
-Include compact evidence_dispositions[] (guid, disposition, driver_id, reason) covering cited GUIDs
-and other material retained headlines. Do not duplicate full headline text.
-geo.escalation_evidence and geo.de_escalation_evidence must contain ONLY exact session GUID strings
-from the supplied evidence. Human-readable summaries belong in geo.escalation_evidence_notes and
-geo.de_escalation_evidence_notes. Do NOT put descriptive labels like "72: headline..." in the GUID arrays.
-Include all 10 Catalyst assets in final_board with driver_refs and explanations.
-Each ACTIVE driver must include: fundamental_cause, observed_market_reaction, event_relation,
-status, why_independent, applicable_transmission_channels, channel_evaluations (evaluated with
-APPLIED/NOT_APPLIED), applied_channels, rejected_channels, contributions, magnitude_reason,
-supporting_guids, confirmation_guids, counter_guids.
+Apply the full FFE methodology internally (event identity, driver ledger, oil/gold audits,
+evidence disposition, channel evaluations). Do NOT emit those internals in the response.
+
+The application consumes ONLY the final scored state. Return ONE compact JSON object:
+
+{
+  "business_day": "...",
+  "cutoff": "...",
+  "catalyst_board": {
+    "USD": 0, "EUR": 0, "GBP": 0, "JPY": 0, "CHF": 0,
+    "CAD": 0, "AUD": 0, "NZD": 0, "GOLD": 0, "OIL": 0
+  },
+  "macro_board": {
+    "USD": 0, "EUR": 0, "GBP": 0, "JPY": 0, "CHF": 0, "CAD": 0, "AUD": 0, "NZD": 0
+  },
+  "geopolitical_risk": { "score": 0, "band": "LOW" }
+}
+
+Canonical geo bands: LOW | WATCH | ELEVATED | HIGH | EXTREME.
+Return approximately 15–25 JSON lines. Do NOT include explanations, evidence lists,
+canonical_driver_ledger, evidence_disposition, transmission_channels, oil_audit,
+gold_decomposition, important_zero_decisions, or narrative summaries.
+Do not repeat the news packet. Individual driver contributions still use only
+{-1, -0.5, -0.25, 0, +0.25, +0.5, +1} internally; aggregate board/geo scores may be continuous.
+
+If the complete compact JSON cannot be produced in one response, return ONLY:
+{
+  "status": "INCOMPLETE",
+  "reason": "FULL_JSON_RESPONSE_NOT_POSSIBLE_IN_ONE_MESSAGE"
+}
 
 Return strict JSON matching the schema.`;
 }

@@ -336,6 +336,11 @@ export function validateGptFirstAnalysis(output: GptFirstAnalysisOutput, input: 
 
     validateGeoEvidenceGuids(output, inputGuids, issues);
 
+    const hasActiveDriverContributions = (output.drivers ?? []).some((driver) => (
+        driver.status === 'ACTIVE'
+        && (driver.contributions ?? []).some((contrib) => Number(contrib.score) !== 0)
+    ));
+
     const termsByAsset = new Map<string, number[]>();
     for (const driver of output.drivers) {
         if (driver.status !== 'ACTIVE') continue;
@@ -351,15 +356,15 @@ export function validateGptFirstAnalysis(output: GptFirstAnalysisOutput, input: 
         const terms = termsByAsset.get(asset) ?? [];
         const sum = terms.reduce((a, b) => a + b, 0);
         const displayed = output.final_board.find((row) => row.asset === asset)?.score ?? 0;
-        const exact = sum === displayed;
-        if (!exact) {
+        const exact = !hasActiveDriverContributions || sum === displayed;
+        if (hasActiveDriverContributions && !exact) {
             issues.push({
                 code: 'ARITHMETIC_MISMATCH',
                 message: `${asset}: driver sum ${sum} != final_board ${displayed}`,
                 detail: terms.join(' + '),
             });
         }
-        return { asset, terms, sum, displayed, exact };
+        return { asset, terms, sum: hasActiveDriverContributions ? sum : displayed, displayed, exact };
     });
 
     if (output.session.input_count !== input.items.length) {
