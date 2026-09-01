@@ -186,6 +186,11 @@ function main() {
         items: MINIMAL_ITEMS,
     });
     assert.equal(dailyPromptContainsMethodology(daily), false);
+    assert.match(daily, /^TASK SCOPE — ABSOLUTE/m);
+    assert.match(daily, /Do NOT generate an image\./);
+    assert.match(daily, /Do NOT use image-generation tools\./);
+    assert.ok(daily.indexOf('TASK SCOPE — ABSOLUTE') < daily.indexOf('Analyze the supplied FFE news'));
+    assert.match(daily, /Analyze the supplied FFE news using the existing Project methodology internally\./);
     assert.match(daily, /"catalyst_board"/);
     assert.match(daily, /"macro_board"/);
     assert.match(daily, /"geopolitical_risk"/);
