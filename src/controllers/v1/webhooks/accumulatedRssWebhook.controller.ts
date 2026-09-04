@@ -4,7 +4,7 @@ import { HTTP_STATUS } from '../../../config/constants.js';
 import { ApiError } from '../../../exceptions/ApiError.js';
 import { successResponse } from '../../../utils/response.util.js';
 import { logger } from '../../../utils/logger.util.js';
-import { syncAccumulatedFinancialJuiceFeed } from '../../../services/accumulatedRssFeed.service.js';
+import { syncAccumulatedFinancialJuiceFeed as persistAccumulatedFinancialJuiceFeed } from '../../../services/accumulatedRssFeed.service.js';
 
 const WEBHOOK_HEADER = 'x-scraper-webhook-key';
 
@@ -12,7 +12,7 @@ const WEBHOOK_HEADER = 'x-scraper-webhook-key';
  * Receives accumulated FinancialJuice RSS data from forex-scraping and persists it
  * for GET /api/feeds/financialjuice/accumulated.
  */
-export const syncAccumulatedFinancialJuiceFeed = async (
+export const ingestAccumulatedFinancialJuiceFeed = async (
     req: Request,
     res: Response,
     next: NextFunction,
@@ -35,7 +35,7 @@ export const syncAccumulatedFinancialJuiceFeed = async (
             throw new ApiError(HTTP_STATUS.BAD_REQUEST, 'items array is required');
         }
 
-        const result = syncAccumulatedFinancialJuiceFeed({
+        const result = persistAccumulatedFinancialJuiceFeed({
             business_day: businessDay,
             count: Number(req.body?.count),
             earliest_timestamp: req.body?.earliest_timestamp ?? null,

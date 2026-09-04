@@ -19,6 +19,6 @@ router.post('/edge-tools/sync-from-sheets', edgeToolsWebhookController.syncEdgeT
 router.post('/cot-data-analysis/sync-from-sheets', cotDataAnalysisWebhookController.syncCotDataAnalysisFromSheetsWebhook);
 router.post('/ffe/daily-pipeline', ffePipelineWebhookController.ingestFfeDailyPipeline);
 router.post('/economic-calendar/ingest', economicCalendarWebhookController.ingestEconomicCalendar);
-router.post('/financialjuice/accumulated/sync', accumulatedRssWebhookController.syncAccumulatedFinancialJuiceFeed);
+router.post('/financialjuice/accumulated/sync', accumulatedRssWebhookController.ingestAccumulatedFinancialJuiceFeed);
 
 export default router;
