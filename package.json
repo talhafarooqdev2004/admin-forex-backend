@@ -52,7 +52,7 @@
     "reconstruct:ffe-replay-offline": "node --import tsx/esm scripts/reconstruct-ffe-replay-offline.ts",
     "replay:ffe-session": "node --import tsx/esm scripts/run-ffe-session-replay.ts",
     "replay:ffe-session-revalidate": "node --import tsx/esm scripts/revalidate-ffe-session-final.ts",
-    "test:accumulated-rss-feed": "node scripts/test-accumulated-rss-feed.mjs"
+    "test:accumulated-rss-feed": "node --import tsx/esm scripts/test-accumulated-rss-feed.mjs"
   },
   "keywords": [
     "forex",

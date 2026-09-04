@@ -7,6 +7,7 @@ import * as edgeToolsWebhookController from '../controllers/v1/webhooks/edgeTool
 import * as cotDataAnalysisWebhookController from '../controllers/v1/webhooks/cotDataAnalysisWebhook.controller.js';
 import * as ffePipelineWebhookController from '../controllers/v1/webhooks/ffePipelineWebhook.controller.js';
 import * as economicCalendarWebhookController from '../controllers/v1/webhooks/economicCalendarWebhook.controller.js';
+import * as accumulatedRssWebhookController from '../controllers/v1/webhooks/accumulatedRssWebhook.controller.js';
 
 const router = express.Router();
 
@@ -18,5 +19,6 @@ router.post('/edge-tools/sync-from-sheets', edgeToolsWebhookController.syncEdgeT
 router.post('/cot-data-analysis/sync-from-sheets', cotDataAnalysisWebhookController.syncCotDataAnalysisFromSheetsWebhook);
 router.post('/ffe/daily-pipeline', ffePipelineWebhookController.ingestFfeDailyPipeline);
 router.post('/economic-calendar/ingest', economicCalendarWebhookController.ingestEconomicCalendar);
+router.post('/financialjuice/accumulated/sync', accumulatedRssWebhookController.syncAccumulatedFinancialJuiceFeed);
 
 export default router;

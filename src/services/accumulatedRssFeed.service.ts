@@ -1,6 +1,8 @@
-import path from 'path';
-import { fileURLToPath, pathToFileURL } from 'url';
-import { ENV } from '../config/env.js';
+import {
+    applyAccumulatedRssSync,
+    getPersistedAccumulatedFeedForActiveBusinessDay,
+    type AccumulatedRssSyncPayload,
+} from './accumulatedRssPersist.service.js';
 
 export type AccumulatedRssNewsItem = {
     guid: string;
@@ -25,37 +27,17 @@ export type AccumulatedRssNewsResponse = {
     items: AccumulatedRssNewsItem[];
 };
 
-type ScrapingAccumulatorModule = {
-    getAccumulatedFeedForActiveBusinessDay: (options?: {
-        now?: Date;
-        accumulatorDir?: string;
-    }) => Promise<AccumulatedRssNewsResponse>;
-};
-
-const DEFAULT_ACCUMULATOR_DIR = ENV.FOREX_SCRAPING_ACCUMULATOR_DIR
-    || path.join(ENV.FOREX_SCRAPING_ROOT, 'artifacts', 'financialjuice-rss-accumulator');
-
-let accumulatorModulePromise: Promise<ScrapingAccumulatorModule> | null = null;
-
-async function loadAccumulatorModule(): Promise<ScrapingAccumulatorModule> {
-    if (!accumulatorModulePromise) {
-        const modulePath = path.join(
-            ENV.FOREX_SCRAPING_ROOT,
-            'src/services/financialJuiceRssAccumulator.service.js',
-        );
-        accumulatorModulePromise = import(pathToFileURL(modulePath).href) as Promise<ScrapingAccumulatorModule>;
-    }
-    return accumulatorModulePromise;
-}
-
 export async function getAccumulatedFinancialJuiceFeed(
     now: Date = new Date(),
 ): Promise<AccumulatedRssNewsResponse> {
-    const { getAccumulatedFeedForActiveBusinessDay } = await loadAccumulatorModule();
-    return getAccumulatedFeedForActiveBusinessDay({
-        now,
-        accumulatorDir: DEFAULT_ACCUMULATOR_DIR,
-    });
+    return getPersistedAccumulatedFeedForActiveBusinessDay(now);
+}
+
+export function syncAccumulatedFinancialJuiceFeed(
+    payload: AccumulatedRssSyncPayload,
+    now: Date = new Date(),
+) {
+    return applyAccumulatedRssSync(payload, now);
 }
 
 export function formatAccumulatedRssNewsCopyText(

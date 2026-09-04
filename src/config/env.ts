@@ -195,7 +195,4 @@ export const ENV = {
     DISCORD_BRAND_LOGO_PATH: process.env.DISCORD_BRAND_LOGO_PATH || '',
     TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
     TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '',
-    /** Monorepo sibling used for read-only accumulated RSS state from forex-scraping. */
-    FOREX_SCRAPING_ROOT: process.env.FOREX_SCRAPING_ROOT || path.resolve(process.cwd(), '../forex-scraping'),
-    FOREX_SCRAPING_ACCUMULATOR_DIR: process.env.FOREX_SCRAPING_ACCUMULATOR_DIR || '',
 };
