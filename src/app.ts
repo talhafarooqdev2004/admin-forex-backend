@@ -7,6 +7,7 @@ import { errorMiddleware } from './middlewares/error.middleware.js';
 import { loggerMiddleware } from './middlewares/logger.middleware.js';
 import session from 'express-session';
 import path from 'path';
+import feedsRoutes from './routes/feeds.routes.js';
 
 const app = express();
 
@@ -51,6 +52,8 @@ app.use(loggerMiddleware);
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
+
+app.use('/api/feeds', feedsRoutes);
 
 app.use('/api/v1', routes);
 
